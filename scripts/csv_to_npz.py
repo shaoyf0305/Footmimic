@@ -35,6 +35,8 @@ parser.add_argument(
 parser.add_argument("--output_name", type=str, required=False, help="The name of the motion npz file. If omitted, will use the input filename without extension.")
 parser.add_argument("--output_dir", type=str, default="./motions", help="Directory to store generated npz files.")
 parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion.")
+parser.add_argument("--kick_leg", type=str, choices=["left", "right"], default=None,
+                    help="Which foot kicks the ball. If omitted, auto-detected from output filename suffix (_left/_right).")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -226,7 +228,8 @@ def run_simulator(sim: sim_utils.SimulationContext,
                   output_dir: Path,
                   output_name: str,
                   joint_names: list[str],
-                  MotionLoaderCls=MotionLoader):
+                  MotionLoaderCls=MotionLoader,
+                  kick_leg: str | None = None):
     """Runs the simulation loop."""
     # Load motion
     motion = MotionLoaderCls(
@@ -315,6 +318,17 @@ def run_simulator(sim: sim_utils.SimulationContext,
             ):
                 log[k] = np.stack(log[k], axis=0)
 
+            # Determine kick_leg: CLI arg > filename suffix > omit.
+            resolved_kick_leg = kick_leg
+            if resolved_kick_leg is None:
+                name_lower = output_name.lower()
+                if name_lower.endswith("_right"):
+                    resolved_kick_leg = "right"
+                elif name_lower.endswith("_left"):
+                    resolved_kick_leg = "left"
+            if resolved_kick_leg is not None:
+                log["kick_leg"] = resolved_kick_leg
+
             output_dir.mkdir(parents=True, exist_ok=True)
             output_path = output_dir / f"{output_name}.npz"
             np.savez(output_path, **log)
@@ -402,6 +416,7 @@ def main():
                 "right_wrist_pitch_joint",
                 "right_wrist_yaw_joint",
             ],
+            kick_leg=args_cli.kick_leg,
         )
 
 

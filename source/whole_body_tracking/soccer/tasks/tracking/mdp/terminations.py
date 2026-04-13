@@ -63,3 +63,90 @@ def motion_finished(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
     last_step = (command.motion_length - 1).clamp(min=0)
     return command.time_steps >= last_step
+
+
+def ball_lost_dribbling(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    max_distance: float = 1.0,
+    max_vel_divergence: float = 2.0,
+    grace_steps: int = 50,
+) -> torch.Tensor:
+    """Terminate the episode if the ball is lost during dribbling.
+
+    The ball is considered "lost" when EITHER:
+    - The XY distance between ball and pelvis exceeds ``max_distance`` (m), OR
+    - The XY velocity difference between ball and pelvis exceeds
+      ``max_vel_divergence`` (m/s).
+
+    A ``grace_steps`` warm-up period is provided at the start of each episode
+    so the robot has time to approach the ball before termination kicks in.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+
+    # XY distance between ball and pelvis
+    ball_pos_xy = soccer_ball.data.root_pos_w[:, :2]
+    pelvis_pos_xy = command.robot_pelvis_pos_w[:, :2]
+    dist_xy = torch.norm(ball_pos_xy - pelvis_pos_xy, dim=-1)
+
+    # XY velocity divergence
+    ball_vel_xy = soccer_ball.data.root_lin_vel_w[:, :2]
+    pelvis_vel_xy = command.robot_anchor_lin_vel_w[:, :2]
+    vel_diff = torch.norm(ball_vel_xy - pelvis_vel_xy, dim=-1)
+
+    # Grace period: don't terminate during the first N steps
+    step_buf = getattr(env, "episode_length_buf", torch.zeros(env.num_envs, device=env.device))
+    past_grace = step_buf > grace_steps
+
+    lost = past_grace & ((dist_xy > max_distance) | (vel_diff > max_vel_divergence))
+    return lost
+
+
+def contact_phase_violation(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+) -> torch.Tensor:
+    """Terminate if the robot touches the ball outside the kick window.
+
+    Uses the Segmented Contact Graph:
+      - Phase 1 (frame 0 → kick_start_frame): NO contact allowed → terminate
+      - Phase 2 (kick_start_frame → kick_end_frame): contact allowed (no termination)
+      - Phase 3 (kick_end_frame → end): NO contact allowed → terminate
+
+    Motions WITHOUT contact graph annotations (kick_start_frame == -1)
+    are NEVER terminated by this function, ensuring full backward
+    compatibility with MoCap data.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+
+    kick_start = command.kick_start_frame   # [num_envs], -1 = not annotated
+    kick_end = command.kick_end_frame       # [num_envs], -1 = not annotated
+
+    # Only enforce on envs that have BOTH annotations.
+    has_graph = (kick_start >= 0) & (kick_end >= 0)
+    if not torch.any(has_graph):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    t = command.time_steps  # [num_envs] current frame
+    in_phase1 = t < kick_start
+    in_phase3 = t > kick_end
+    outside_window = (in_phase1 | in_phase3) & has_graph
+
+    if not torch.any(outside_window):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    # Detect robot-ball contact using horizontal forces only.
+    # Ground contact is vertical (Z-axis) and must be excluded.
+    ball_sensor = env.scene.sensors[ball_sensor_name]
+    forces = ball_sensor.data.net_forces_w  # [num_envs, num_bodies, 3]
+    if forces is None or forces.numel() == 0:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    # Horizontal (XY) force indicates robot-ball contact, not ground.
+    force_horizontal = torch.norm(forces[..., :2], dim=-1)  # [num_envs, num_bodies]
+    has_contact = torch.any(force_horizontal > 5.0, dim=-1)  # [num_envs]
+
+    # Terminate: outside kick window AND robot-ball contact detected.
+    return outside_window & has_contact

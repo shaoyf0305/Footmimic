@@ -48,6 +48,8 @@ class MultiMotionLoader:
         body_lin_vel_w_list = []
         body_ang_vel_w_list = []
         kick_leg_labels = []
+        kick_frame_list = []
+        kick_end_frame_list = []
 
         self.fps_list = []
 
@@ -86,6 +88,26 @@ class MultiMotionLoader:
                     label_value = label_str
             kick_leg_labels.append(label_value)
 
+            # Read kick_frame metadata (0-indexed frame where kick contact begins).
+            kf_value: int = -1  # -1 means "not annotated" → no gating
+            if "kick_frame" in data.files:
+                raw_kf = data["kick_frame"]
+                try:
+                    kf_value = int(np.asarray(raw_kf).flat[0])
+                except Exception:
+                    kf_value = -1
+            kick_frame_list.append(kf_value)
+
+            # Read kick_end_frame metadata (0-indexed frame where kick contact ends).
+            kef_value: int = -1
+            if "kick_end_frame" in data.files:
+                raw_kef = data["kick_end_frame"]
+                try:
+                    kef_value = int(np.asarray(raw_kef).flat[0])
+                except Exception:
+                    kef_value = -1
+            kick_end_frame_list.append(kef_value)
+
             max_T = max(max_T, jp.shape[0])
 
         # Pad all files to max_T and stack into tensors.
@@ -112,6 +134,8 @@ class MultiMotionLoader:
                                          device=self.device)
         self.fps = self.fps_list[0]  # Can be adjusted if needed.
         self._kick_leg_labels = tuple(kick_leg_labels)
+        self._kick_frames = torch.tensor(kick_frame_list, dtype=torch.long, device=self.device)
+        self._kick_end_frames = torch.tensor(kick_end_frame_list, dtype=torch.long, device=self.device)
 
     @property
     def body_pos_w(self) -> torch.Tensor:
@@ -132,11 +156,28 @@ class MultiMotionLoader:
     @property
     def kick_leg_labels(self) -> tuple[str | None, ...]:
         return self._kick_leg_labels
+
+    @property
+    def kick_frames(self) -> torch.Tensor:
+        """Per-motion kick start frame indices. -1 means not annotated."""
+        return self._kick_frames
+
+    @property
+    def kick_end_frames(self) -> torch.Tensor:
+        """Per-motion kick end frame indices. -1 means not annotated."""
+        return self._kick_end_frames
     
     def get_last_frame_anchor_pos(self, motion_idx: int, anchor_body_idx: int, motion_length: int) -> torch.Tensor:
         """Get the anchor position at the last frame of the specified motion."""
         last_frame_idx = motion_length - 1
         return self._body_pos_w[motion_idx, last_frame_idx, anchor_body_idx]
+
+    def get_kick_frame_anchor_pos(self, motion_idx: int, anchor_body_idx: int) -> torch.Tensor | None:
+        """Get the anchor position at the kick frame. Returns None if not annotated."""
+        kf = int(self._kick_frames[motion_idx].item())
+        if kf < 0:
+            return None
+        return self._body_pos_w[motion_idx, kf, anchor_body_idx]
 
     def get_first_frame_anchor_pos(self, motion_idx: int, anchor_body_idx: int) -> torch.Tensor:
         """Get the anchor position at the first frame of the specified motion."""
@@ -378,6 +419,21 @@ class MotionCommand(CommandTerm):
     def kick_leg_name(self) -> list[str]:
         ids = self.motion_kick_leg[self.motion_idx].tolist()
         return [self._kick_leg_id_to_name.get(i, "unknown") for i in ids]
+
+    @property
+    def kick_frame(self) -> torch.Tensor:
+        """Per-env kick start frame index. -1 means not annotated (no gating)."""
+        return self.motion.kick_frames[self.motion_idx]
+
+    @property
+    def kick_start_frame(self) -> torch.Tensor:
+        """Alias for kick_frame. Per-env kick start frame."""
+        return self.kick_frame
+
+    @property
+    def kick_end_frame(self) -> torch.Tensor:
+        """Per-env kick end frame index. -1 means not annotated."""
+        return self.motion.kick_end_frames[self.motion_idx]
 
     def _to_env_id_tensor(self, env_ids: Sequence[int] | torch.Tensor) -> torch.Tensor:
         if isinstance(env_ids, torch.Tensor):

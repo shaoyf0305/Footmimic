@@ -330,6 +330,18 @@ class G1FlatKickEnvCfg(G1FlatProximityEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
+        # Segmented Contact Graph: terminate if ball is touched outside the
+        # annotated kick window.  DISABLED: ball placement is too close for
+        # Phase 1 enforcement — robot can't avoid contact during approach.
+        # Re-enable after implementing ball distance curriculum.
+        # self.terminations.contact_phase = DoneTerm(
+        #     func=mdp.contact_phase_violation,
+        #     params={
+        #         "command_name": "motion",
+        #         "ball_sensor_name": "soccer_ball_contact",
+        #     },
+        # )
+
         self.rewards.target_point_contact = RewTerm(
             func=mdp.target_point_contact,
             weight=50.0,

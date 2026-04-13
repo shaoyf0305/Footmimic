@@ -1,3 +1,53 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:d72f7d2d4f12217245798d8f4ea5aaec7eb48f6c890ceff6b73ad21320efdd0d
-size 1642
+#usda 1.0
+(
+    defaultPrim = "SoccerBall"
+    doc = "弹性球体，半径0.11m，质量0.4kg"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "SoccerBall" (
+    prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+)
+{
+    matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1) )
+    uniform token[] xformOpOrder = ["xformOp:transform"]
+    
+    # 刚体属性
+    uniform bool physics:rigidBodyEnabled = 1
+    bool physics:kinematicEnabled = 0
+    bool physics:disableGravity = 0
+    
+    # 球体几何
+    def Sphere "BallGeom" (
+        prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        double radius = 0.11
+        float physics:mass = 0.4
+        
+        # 关键：碰撞和物理材质设置
+        uniform token physics:collisionEnabled = "on"
+        
+        # 弹性属性 - 必须设置
+        float physics:restitution = 1.0      # 弹性系数
+        float physics:dynamicFriction = 0.1  # 动态摩擦
+        float physics:staticFriction = 0.1   # 静态摩擦
+        
+        # 外观
+        color3f[] primvars:displayColor = [(0.2, 0.6, 0.9)]
+        
+        def Material "BallMaterial"
+        {
+            token outputs:surface.connect = </SoccerBall/BallGeom/BallMaterial/PBRShader.outputs:surface>
+            def Shader "PBRShader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.2, 0.6, 0.9)
+                float inputs:roughness = 0.3
+                token outputs:surface
+            }
+        }
+        rel material:binding = </SoccerBall/BallGeom/BallMaterial>
+    }
+}

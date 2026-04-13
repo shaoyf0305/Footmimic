@@ -119,7 +119,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     motion_files = get_motion_files(args_cli.motion_path)
 
-    env_cfg.commands.motion.motion_files = motion_files
+    # For state-machine environments: auto-split approach/strike files.
+    # Files named *_approach.npz → approach bank (motion_files).
+    # Files named *_strike.npz  → strike bank (strike_motion_files).
+    approach_files = [f for f in motion_files if f.endswith("_approach.npz")]
+    strike_files = [f for f in motion_files if f.endswith("_strike.npz")]
+
+    if approach_files and strike_files:
+        # State-machine mode: explicit split.
+        env_cfg.commands.motion.motion_files = approach_files
+        if hasattr(env_cfg.commands.motion, "strike_motion_files"):
+            env_cfg.commands.motion.strike_motion_files = strike_files
+            print(f"[INFO] State-machine mode: {len(approach_files)} approach + {len(strike_files)} strike files")
+        else:
+            # Non-SM env: just use all files.
+            env_cfg.commands.motion.motion_files = motion_files
+    else:
+        # Standard mode: all files go to motion_files.
+        env_cfg.commands.motion.motion_files = motion_files
+        # If SM env but no split files, set strike = motion (fallback).
+        if hasattr(env_cfg.commands.motion, "strike_motion_files"):
+            env_cfg.commands.motion.strike_motion_files = motion_files
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)

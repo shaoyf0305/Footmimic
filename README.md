@@ -96,6 +96,13 @@ python scripts/rsl_rl/play_multi.py --task Tracking-Flat-G1-SoccerDestination-RN
     --num_envs 1  
 ```
 
+## Visualize Motions
+You can visualize the converted npz motion files using the `replay_npz.py` script:
+```bash
+python scripts/replay_npz.py --motion_path motions/soccer-standard/soccer-standard-001_right.npz
+python scripts/replay_npz.py --motion_path motions/pkl/hmr4d_4_unitree_g1_compatible.pkl
+```
+
 ##
 
 ## TODO

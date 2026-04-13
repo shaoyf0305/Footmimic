@@ -129,7 +129,8 @@ def main():
                           "right_wrist_pitch_joint",
                           "right_wrist_yaw_joint",
                       ],
-                      MotionLoaderCls=PKLMotionLoader)
+                      MotionLoaderCls=PKLMotionLoader,
+                      kick_leg=args_cli.kick_leg)
 
 
 if __name__ == "__main__":

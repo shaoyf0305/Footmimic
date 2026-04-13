@@ -91,3 +91,52 @@ def randomize_rigid_body_com(
 
     # Set the new coms
     asset.root_physx_view.set_coms(coms, env_ids)
+
+
+def apply_random_ankle_torque(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg,
+    torque_range: tuple[float, float] = (-15.0, 15.0),
+):
+    """Apply extreme random torques to specified ankle joints every interval step.
+
+    This teaches the robot that its kicking-leg ankle is an uncontrollable
+    variable, forcing it to stabilize purely through the trunk and support leg.
+
+    The torques are sampled uniformly from ``torque_range`` and applied as
+    external joint efforts on the specified joints.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    if env_ids is None:
+        env_ids = torch.arange(env.scene.num_envs, device=asset.device)
+
+    # Resolve joint indices from the config
+    if asset_cfg.joint_ids == slice(None):
+        joint_ids = torch.arange(asset.num_joints, device=asset.device, dtype=torch.long)
+    else:
+        joint_ids = torch.tensor(asset_cfg.joint_ids, device=asset.device, dtype=torch.long)
+
+    num_envs = len(env_ids)
+    num_joints = len(joint_ids)
+
+    # Sample random torques
+    low, high = torque_range
+    random_torques = torch.empty(num_envs, num_joints, device=asset.device).uniform_(low, high)
+
+    # Build full-joint effort tensor (zeros elsewhere)
+    efforts = torch.zeros(num_envs, asset.num_joints, device=asset.device)
+    efforts[:, joint_ids] = random_torques
+
+    # Apply as external joint efforts
+    asset.set_external_force_and_torque(
+        torch.zeros(num_envs, asset.num_bodies, 3, device=asset.device),
+        torch.zeros(num_envs, asset.num_bodies, 3, device=asset.device),
+        env_ids=env_ids,
+    )
+    # Use joint effort API to inject disturbance torques
+    current_efforts = asset.data.applied_torque.clone()
+    current_efforts[env_ids[:, None], joint_ids[None, :]] += random_torques
+    asset.set_joint_effort_target(current_efforts, env_ids=env_ids)
+

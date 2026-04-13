@@ -153,7 +153,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         else:
             raise ValueError("Either --motion_file or --motion_path must be specified.")
         
-        env_cfg.commands.motion.motion_files = motion_files
+        # For state-machine environments: auto-split approach/strike files.
+        approach_files = [f for f in motion_files if f.endswith("_approach.npz")]
+        strike_files = [f for f in motion_files if f.endswith("_strike.npz")]
+
+        if approach_files and strike_files:
+            env_cfg.commands.motion.motion_files = approach_files
+            if hasattr(env_cfg.commands.motion, "strike_motion_files"):
+                env_cfg.commands.motion.strike_motion_files = strike_files
+                print(f"[INFO] State-machine mode: {len(approach_files)} approach + {len(strike_files)} strike files")
+            else:
+                env_cfg.commands.motion.motion_files = motion_files
+        else:
+            env_cfg.commands.motion.motion_files = motion_files
+            if hasattr(env_cfg.commands.motion, "strike_motion_files"):
+                env_cfg.commands.motion.strike_motion_files = motion_files
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")

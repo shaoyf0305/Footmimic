@@ -7,14 +7,16 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 EXPERIMENT_DIR="${REPO_ROOT}/logs/rsl_rl/g1_flat"
 
 RUN_NAME="${1:-test}"
+DEVICE="${2:-cuda:0}"
 
 cd "${REPO_ROOT}"
 
 python scripts/rsl_rl/train_multi.py --task Tracking-Terrain-G1-RNN-v0 \
-    --motion_path motions/soccer-standard \
+    --motion_path motions/Video \
     --run_name "${RUN_NAME}" \
-    --num_envs 8192 \
-    --max_iterations 4000 \
+    --num_envs 2048 \
+    --max_iterations 7000 \
+    --device "${DEVICE}" \
     --headless
 
 LOAD_RUN="$(find "${EXPERIMENT_DIR}" -maxdepth 1 -mindepth 1 -type d -name "*_${RUN_NAME}" | sort | tail -n 1 | xargs -r basename)"
@@ -27,9 +29,10 @@ fi
 echo "Resolved load_run=${LOAD_RUN}"
 
 python scripts/rsl_rl/train_multi.py --task Tracking-Flat-G1-SoccerDestination-RNN-v0 \
-    --motion_path motions/soccer-standard \
+    --motion_path motions/Video \
     --load_run "${LOAD_RUN}" \
     --run_name "${RUN_NAME}_resume" \
-    --num_envs 8192 \
+    --num_envs 2048 \
     --resume True \
+    --device "${DEVICE}" \
     --headless

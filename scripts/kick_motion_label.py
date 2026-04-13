@@ -95,7 +95,10 @@ def build_output_path(path: str, label: str) -> str:
 	return f"{base}_{label}{ext}"
 
 
-def update_label(path: str, label: str, *, dry_run: bool, overwrite: bool) -> tuple[str, str]:
+def update_label(path: str, label: str, *,
+				 kick_start_frame: int | None = None,
+				 kick_end_frame: int | None = None,
+				 dry_run: bool, overwrite: bool) -> tuple[str, str]:
 	"""Write the labeled copy for *path*. Returns status and output path."""
 
 	payload, prior_label = load_npz_payload(path)
@@ -109,6 +112,10 @@ def update_label(path: str, label: str, *, dry_run: bool, overwrite: bool) -> tu
 		return f"skip (existing label: {prior_label})", output_path
 
 	payload[LABEL_KEY] = np.array(label)
+	if kick_start_frame is not None:
+		payload["kick_frame"] = np.array(kick_start_frame, dtype=np.int32)
+	if kick_end_frame is not None:
+		payload["kick_end_frame"] = np.array(kick_end_frame, dtype=np.int32)
 
 	if dry_run:
 		return "dry-run", output_path
@@ -142,6 +149,18 @@ def parse_args() -> argparse.Namespace:
 		help="Only report the changes that would be applied without touching any files.",
 	)
 	parser.add_argument(
+		"--kick_start_frame",
+		type=int,
+		default=None,
+		help="0-indexed frame where kick contact BEGINS. Written as 'kick_frame' in npz.",
+	)
+	parser.add_argument(
+		"--kick_end_frame",
+		type=int,
+		default=None,
+		help="0-indexed frame where kick contact ENDS. Written as 'kick_end_frame' in npz.",
+	)
+	parser.add_argument(
 		"--overwrite",
 		action="store_true",
 		help="Allow overwriting existing labeled copies or conflicting labels.",
@@ -164,7 +183,12 @@ def main() -> None:
 		print("[INFO] Running in dry-run mode; no files will be modified.")
 
 	for path in files:
-		status, output_path = update_label(path, args.label, dry_run=args.dry_run, overwrite=args.overwrite)
+		status, output_path = update_label(
+			path, args.label,
+			kick_start_frame=args.kick_start_frame,
+			kick_end_frame=args.kick_end_frame,
+			dry_run=args.dry_run, overwrite=args.overwrite,
+		)
 		print(f"  - {path} -> {output_path}: {status}")
 
 
