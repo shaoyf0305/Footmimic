@@ -3,9 +3,10 @@
 This module defines standalone dribbling task environments that inherit
 from the proximity-level configuration but replace all kick-specific
 rewards with dribbling-specific ones:
-  - velocity tracking (ball velocity aligned with pelvis velocity)
-  - dynamic proximity (ball kept in a [0.2m, 0.5m] safe zone ahead)
-  - micro-contact filter (penalise foot-ball impacts > 20 N)
+  - velocity tracking (ball velocity aligned with pelvis velocity; optional speed gates)
+  - dynamic proximity (ball kept in a [0.2m, 0.5m] safe zone ahead; optional speed gate)
+  - legal-foot touch / micro-contact / undesired-contact terms
+  - ``ball_lost`` and ``dribbling_no_contact`` terminations
 """
 
 import math
@@ -42,6 +43,12 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             params={
                 "command_name": "motion",
                 "std": 1.0,
+                # Anti–zero-velocity exploit: no full score when the pelvis barely moves.
+                "pelvis_speed_min": 0.12,
+                "ball_speed_min": 0.0,
+                "require_contact": False,
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
             },
         )
 
@@ -54,6 +61,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "near_dist": 0.2,
                 "far_dist": 0.5,
                 "penalty_std": 0.15,
+                "pelvis_speed_min": 0.12,
             },
         )
 
@@ -117,6 +125,17 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "max_distance": 1.0,          # ball > 1m away → episode over
                 "max_vel_divergence": 2.0,     # ball-pelvis vel diff > 2 m/s → over
                 "grace_steps": 50,             # 1 second warm-up (50 Hz)
+            },
+        )
+
+        # No robot–ball contact for too long after warm-up (curriculum: tune steps).
+        self.terminations.dribbling_no_contact = DoneTerm(
+            func=mdp.dribbling_no_ball_contact_timeout,
+            params={
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "grace_steps": 50,
+                "max_steps_without_contact": 125,
             },
         )
 

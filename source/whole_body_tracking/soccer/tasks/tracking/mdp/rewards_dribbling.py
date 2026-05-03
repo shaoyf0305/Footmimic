@@ -20,19 +20,87 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Shared: net contact force on the ball (world frame)
+# ---------------------------------------------------------------------------
+
+
+def soccer_ball_contact_net_force_w(
+    env: ManagerBasedRLEnv,
+    ball_sensor_name: str = "soccer_ball_contact",
+) -> torch.Tensor:
+    """Net contact force on the soccer ball body, shape ``(num_envs, 3)``.
+
+    Zeros are returned when the sensor has no usable data (same convention as
+    ``_identify_contact_body``).
+    """
+    device = env.device
+    num_envs = env.num_envs
+    zero = torch.zeros(num_envs, 3, device=device, dtype=torch.float32)
+
+    contact_sensor: ContactSensor = env.scene.sensors[ball_sensor_name]
+    forces_data = contact_sensor.data
+
+    forces = None
+    if hasattr(forces_data, "net_forces_w_history"):
+        fh = forces_data.net_forces_w_history
+        if fh is not None and fh.numel() > 0:
+            forces = fh.to(device)
+            if forces.ndim >= 4:
+                forces = forces.max(dim=1).values
+    if forces is None:
+        if hasattr(forces_data, "net_forces_w"):
+            f = forces_data.net_forces_w
+            if f is not None and f.numel() > 0:
+                forces = f.to(device)
+
+    if forces is None or forces.ndim < 2:
+        return zero
+
+    if forces.ndim == 3:
+        return forces[:, 0, :]
+    if forces.shape[-1] >= 3:
+        return forces[:, :3]
+    return zero
+
+
+def soccer_ball_contact_force_magnitude(
+    env: ManagerBasedRLEnv,
+    ball_sensor_name: str = "soccer_ball_contact",
+) -> torch.Tensor:
+    """Scalar force magnitude on the ball, shape ``(num_envs,)``."""
+    f = soccer_ball_contact_net_force_w(env, ball_sensor_name)
+    return torch.norm(f, dim=-1)
+
+
+# ---------------------------------------------------------------------------
 # 1) Velocity Tracking  — ball vel aligned with pelvis vel
 # ---------------------------------------------------------------------------
+
 
 def dribbling_velocity_tracking(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
     std: float = 1.0,
+    pelvis_speed_min: float = 0.0,
+    ball_speed_min: float = 0.0,
+    require_contact: bool = False,
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
 ) -> torch.Tensor:
     """Reward alignment between the soccer ball velocity and the robot pelvis velocity.
 
     A cosine-similarity style reward: when the ball moves in the same direction
     and at a similar speed as the robot, the reward is maximised.
-    Returns a value in [0, 1] per environment.
+
+    Optional **anti-cheese gates** (defaults preserve legacy behaviour):
+
+    - ``pelvis_speed_min`` / ``ball_speed_min``: multiply the reward by
+      ``clamp(|v_xy| / min, max=1)`` so near-zero speeds do not yield a full
+      score from ``exp(0)==1``.
+    - ``require_contact``: multiply by 1 only when ball contact force exceeds
+      ``contact_force_threshold`` (same scale as dribbling touch rewards).
+
+    Returns a value in ``[0, 1]`` per environment.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
@@ -46,7 +114,22 @@ def dribbling_velocity_tracking(
     vel_diff = ball_vel_xy - pelvis_vel_xy
     error = torch.sum(vel_diff * vel_diff, dim=-1)  # (N,)
 
-    return torch.exp(-error / (std ** 2))
+    base = torch.exp(-error / (std ** 2))
+
+    pelvis_sp = torch.norm(pelvis_vel_xy, dim=-1)
+    ball_sp = torch.norm(ball_vel_xy, dim=-1)
+
+    gate = torch.ones_like(base)
+    if pelvis_speed_min > 0.0:
+        gate = gate * torch.clamp(pelvis_sp / pelvis_speed_min, max=1.0)
+    if ball_speed_min > 0.0:
+        gate = gate * torch.clamp(ball_sp / ball_speed_min, max=1.0)
+
+    if require_contact:
+        fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
+        gate = gate * (fmag > contact_force_threshold).to(torch.float32)
+
+    return base * gate
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +142,7 @@ def dribbling_dynamic_proximity(
     near_dist: float = 0.2,
     far_dist: float = 0.5,
     penalty_std: float = 0.15,
+    pelvis_speed_min: float = 0.0,
 ) -> torch.Tensor:
     """Reward keeping the ball inside a longitudinal safe-zone in front of the robot.
 
@@ -68,6 +152,10 @@ def dribbling_dynamic_proximity(
 
     Lateral deviation (|y_local|) is also penalised with the same decay to
     encourage straight-ahead dribbling.
+
+    If ``pelvis_speed_min > 0``, the reward is multiplied by
+    ``clamp(|v_pelvis_xy| / pelvis_speed_min, max=1)`` so standing still in the
+    safe zone is not a local optimum.
 
     Returns a value in [0, 1] per environment.
     """
@@ -102,7 +190,14 @@ def dribbling_dynamic_proximity(
     y_error = torch.abs(y_local)
 
     total_error = x_error ** 2 + y_error ** 2
-    return torch.exp(-total_error / (penalty_std ** 2))
+    proximity_reward = torch.exp(-total_error / (penalty_std ** 2))
+
+    if pelvis_speed_min > 0.0:
+        pelvis_vel_xy = command.robot_anchor_lin_vel_w[:, :2]
+        pelvis_sp = torch.norm(pelvis_vel_xy, dim=-1)
+        proximity_reward = proximity_reward * torch.clamp(pelvis_sp / pelvis_speed_min, max=1.0)
+
+    return proximity_reward
 
 
 # ---------------------------------------------------------------------------
@@ -128,35 +223,10 @@ def _identify_contact_body(
 
     # Default outputs
     has_contact = torch.zeros(num_envs, dtype=torch.bool, device=device)
-    contact_force_mag = torch.zeros(num_envs, dtype=torch.float32, device=device)
     closest_body_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
 
-    # Get contact force on the ball
-    contact_sensor: ContactSensor = env.scene.sensors[ball_sensor_name]
-    forces_data = contact_sensor.data
-
-    forces = None
-    if hasattr(forces_data, "net_forces_w_history"):
-        fh = forces_data.net_forces_w_history
-        if fh is not None and fh.numel() > 0:
-            forces = fh.to(device)
-            if forces.ndim >= 4:
-                forces = forces.max(dim=1).values
-    if forces is None:
-        if hasattr(forces_data, "net_forces_w"):
-            f = forces_data.net_forces_w
-            if f is not None and f.numel() > 0:
-                forces = f.to(device)
-
-    if forces is None or forces.ndim < 2:
-        return has_contact, contact_force_mag, closest_body_idx
-
-    # Force magnitude on ball body (index 0)
-    if forces.ndim == 3:
-        force_vec = forces[:, 0, :]  # (N, 3)
-    else:
-        force_vec = forces[:, :3] if forces.shape[-1] >= 3 else forces
-    force_mag = torch.norm(force_vec, dim=-1)  # (N,)
+    force_vec = soccer_ball_contact_net_force_w(env, ball_sensor_name)
+    force_mag = torch.norm(force_vec, dim=-1)
     has_contact = force_mag > 1.0  # minimal threshold to filter noise
     contact_force_mag = force_mag
 
