@@ -2,6 +2,7 @@
 
 Inherits proximity-level tracking and adds dribbling-specific rewards:
   - velocity / proximity gates (anti static exploit); velocity match requires contact
+  - forward-progress reward: ball must move forward in pelvis-local frame
   - dense foot–ball approach when not in contact (stronger weight, lower speed gate)
   - pelvis orientation vs motion reference (anti lean-back / arched torso)
   - ball horizontal speed excess penalty
@@ -131,6 +132,21 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             params={
                 "speed_cap": 4.2,
                 "linear_scale": 1.5,
+            },
+        )
+
+        self.rewards.dribbling_ball_forward_progress = RewTerm(
+            func=mdp.dribbling_ball_forward_progress_reward,
+            weight=4.0,
+            params={
+                "command_name": "motion",
+                "min_forward_speed": 0.20,
+                "speed_scale": 0.25,
+                "pelvis_speed_min": 0.06,
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 0.5,
+                "require_recent_contact": True,
+                "recent_contact_window": 10,
             },
         )
 

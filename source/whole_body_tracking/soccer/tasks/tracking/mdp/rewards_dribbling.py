@@ -422,7 +422,69 @@ def dribbling_ball_xy_speed_excess_penalty(
 
 
 # ---------------------------------------------------------------------------
-# 2e) Anti-orbit penalty — discourage circling around the ball without touch
+# 2e) Ball forward progress reward — encourage actual dribble advancement
+# ---------------------------------------------------------------------------
+
+
+def dribbling_ball_forward_progress_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    min_forward_speed: float = 0.2,
+    speed_scale: float = 0.25,
+    pelvis_speed_min: float = 0.06,
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 0.5,
+    require_recent_contact: bool = True,
+    recent_contact_window: int = 10,
+) -> torch.Tensor:
+    """Reward forward ball velocity in pelvis-local frame.
+
+    This term rewards positive local-X ball speed (ball moving in front of the
+    robot), and can optionally be gated by recent contact to avoid standing
+    exploits where the policy does not engage the ball.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+
+    ball_vel_w = soccer_ball.data.root_lin_vel_w[:, :3]
+    pelvis_quat_w = command.robot_pelvis_quat_w
+    ball_vel_local = quat_apply(quat_inv(pelvis_quat_w), ball_vel_w)
+    forward_speed = torch.clamp(ball_vel_local[:, 0], min=0.0)
+
+    # Smooth ramp around the target forward speed.
+    base = torch.clamp((forward_speed - min_forward_speed) / max(speed_scale, 1e-6), min=0.0, max=1.0)
+
+    pelvis_speed = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
+    gate = torch.clamp(pelvis_speed / max(pelvis_speed_min, 1e-6), max=1.0)
+
+    if require_recent_contact:
+        step_buf = getattr(env, "episode_length_buf", None)
+        if step_buf is None:
+            step_buf = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+
+        fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
+        has_contact = fmag > contact_force_threshold
+        reset_mask = step_buf == 0
+
+        cnt_name = "_dribbling_steps_since_contact"
+        cnt = getattr(env, cnt_name, None)
+        if cnt is None or cnt.shape[0] != env.num_envs:
+            cnt = torch.full((env.num_envs,), fill_value=recent_contact_window + 1, device=env.device, dtype=torch.int32)
+
+        cnt = torch.where(
+            reset_mask,
+            torch.full_like(cnt, recent_contact_window + 1),
+            torch.where(has_contact, torch.zeros_like(cnt), cnt + 1),
+        )
+        setattr(env, cnt_name, cnt)
+        recent = cnt <= int(recent_contact_window)
+        gate = gate * recent.to(torch.float32)
+
+    return base * gate
+
+
+# ---------------------------------------------------------------------------
+# 2f) Anti-orbit penalty — discourage circling around the ball without touch
 # ---------------------------------------------------------------------------
 
 
