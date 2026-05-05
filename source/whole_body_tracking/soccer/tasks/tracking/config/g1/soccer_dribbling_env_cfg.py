@@ -1,12 +1,14 @@
 """Dribbling environment configurations for the G1 robot.
 
 Inherits proximity-level tracking and adds dribbling-specific rewards:
-  - gated velocity / proximity (anti static exploit)
-  - dense foot–ball approach when not in contact
+  - velocity / proximity gates (anti static exploit); velocity match requires contact
+  - dense foot–ball approach when not in contact (stronger weight, lower speed gate)
   - pelvis orientation vs motion reference (anti lean-back / arched torso)
   - ball horizontal speed excess penalty
   - ankle-based gentle touch / hard-hit EMA / non-ankle contact penalty (no ``kick_leg``)
-  - ``ball_lost`` and ``dribbling_no_contact`` terminations
+  - anti-orbit penalty; proximity damped in forward corridor without contact; stall penalty
+  - slightly relaxed imitation weights to favour reaching the ball
+  - ``ball_lost`` and tighter ``dribbling_no_contact`` termination
 """
 
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -25,6 +27,13 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # Slightly relax imitation so the policy can deviate toward the ball while
+        # keeping torso/gait reference (touch-related rewards provide the main ball signal).
+        if hasattr(self.rewards, "motion_body_pos"):
+            self.rewards.motion_body_pos.weight = 0.72
+        if hasattr(self.rewards, "motion_foot_pos"):
+            self.rewards.motion_foot_pos.weight = 0.65
 
         # Stronger upright / anti-arch than generic proximity alone
         if hasattr(self.rewards, "pelvis_orientation"):
@@ -55,9 +64,11 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             params={
                 "command_name": "motion",
                 "std": 1.0,
-                "pelvis_speed_min": 0.12,
+                "pelvis_speed_min": 0.14,
                 "ball_speed_min": 0.0,
-                "require_contact": False,
+                # Ball–pelvis velocity match only counts after real contact (forces touches
+                # instead of orbiting with a static ball).
+                "require_contact": True,
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
             },
@@ -71,20 +82,37 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "near_dist": 0.2,
                 "far_dist": 0.5,
                 "penalty_std": 0.15,
-                "pelvis_speed_min": 0.12,
+                "pelvis_speed_min": 0.14,
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                # In the "ball in front" corridor, do not pay full proximity without a touch.
+                "no_contact_zone_damping": 0.28,
+                "zone_lateral_abs_max": 0.18,
+            },
+        )
+
+        self.rewards.dribbling_stall_no_touch_penalty = RewTerm(
+            func=mdp.dribbling_stall_no_touch_penalty,
+            weight=-5.5,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "max_xy_dist": 0.52,
+                "pelvis_speed_max": 0.16,
             },
         )
 
         self.rewards.dribbling_approach_foot_ball = RewTerm(
             func=mdp.dribbling_approach_foot_ball_distance,
-            weight=5.0,
+            weight=7.0,
             params={
                 "command_name": "motion",
                 "foot_cfg": _foot_cfg,
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
                 "std": 0.22,
-                "pelvis_speed_min": 0.08,
+                "pelvis_speed_min": 0.05,
             },
         )
 
@@ -108,7 +136,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_orbiting_penalty = RewTerm(
             func=mdp.dribbling_orbiting_penalty,
-            weight=-4.0,
+            weight=-6.0,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
@@ -121,7 +149,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_legal_foot_touch = RewTerm(
             func=mdp.dribbling_legal_foot_touch,
-            weight=5.0,
+            weight=9.0,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
@@ -133,7 +161,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_micro_contact_filter = RewTerm(
             func=mdp.dribbling_micro_contact_filter,
-            weight=-4.5,
+            weight=-4.0,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
@@ -172,7 +200,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
                 "grace_steps": 50,
-                "max_steps_without_contact": 75,
+                "max_steps_without_contact": 40,
             },
         )
 

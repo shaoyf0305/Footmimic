@@ -145,6 +145,10 @@ def dribbling_dynamic_proximity(
     far_dist: float = 0.5,
     penalty_std: float = 0.15,
     pelvis_speed_min: float = 0.0,
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    no_contact_zone_damping: float = 1.0,
+    zone_lateral_abs_max: float = 0.18,
 ) -> torch.Tensor:
     """Reward keeping the ball inside a longitudinal safe-zone in front of the robot.
 
@@ -158,6 +162,11 @@ def dribbling_dynamic_proximity(
     If ``pelvis_speed_min > 0``, the reward is multiplied by
     ``clamp(|v_pelvis_xy| / pelvis_speed_min, max=1)`` so standing still in the
     safe zone is not a local optimum.
+
+    If ``no_contact_zone_damping < 1``, when the ball sits in the forward corridor
+    (longitudinal band + ``|y_local| <= zone_lateral_abs_max``) but the ball
+    sensor reports no contact, the proximity reward is scaled by that factor.
+    This reduces the \"park in front of the ball and wiggle\" optimum.
 
     Returns a value in [0, 1] per environment.
     """
@@ -199,7 +208,59 @@ def dribbling_dynamic_proximity(
         pelvis_sp = torch.norm(pelvis_vel_xy, dim=-1)
         proximity_reward = proximity_reward * torch.clamp(pelvis_sp / pelvis_speed_min, max=1.0)
 
+    if no_contact_zone_damping < 1.0 - 1e-6:
+        in_corridor = (
+            (x_local >= near_dist)
+            & (x_local <= far_dist)
+            & (torch.abs(y_local) <= zone_lateral_abs_max)
+        )
+        fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
+        no_touch = fmag <= contact_force_threshold
+        damp = torch.where(
+            in_corridor & no_touch,
+            torch.full_like(proximity_reward, no_contact_zone_damping),
+            torch.ones_like(proximity_reward),
+        )
+        proximity_reward = proximity_reward * damp
+
     return proximity_reward
+
+
+# ---------------------------------------------------------------------------
+# 2a) Stall in front of ball without touching — kills "back up, then freeze"
+# ---------------------------------------------------------------------------
+
+
+def dribbling_stall_no_touch_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    max_xy_dist: float = 0.52,
+    pelvis_speed_max: float = 0.16,
+) -> torch.Tensor:
+    """Penalty in ``[0, 1]`` when the ball is close in XY but pelvis is nearly static and there is no contact.
+
+    Targets the local optimum: robot brings the ball into a comfortable pose in
+    front of the body, then stops or only sways without registering foot-ball
+    contact on the ball sensor.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+
+    pelvis_pos_xy = command.robot_pelvis_pos_w[:, :2]
+    ball_pos_xy = soccer_ball.data.root_pos_w[:, :2]
+    dist_xy = torch.norm(ball_pos_xy - pelvis_pos_xy, dim=-1)
+
+    pelvis_vel_xy = command.robot_anchor_lin_vel_w[:, :2]
+    pelvis_sp = torch.norm(pelvis_vel_xy, dim=-1)
+
+    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
+    no_touch = fmag <= contact_force_threshold
+
+    near = dist_xy <= max_xy_dist
+    slow = pelvis_sp <= pelvis_speed_max
+    return (near & slow & no_touch).to(torch.float32)
 
 
 # ---------------------------------------------------------------------------
