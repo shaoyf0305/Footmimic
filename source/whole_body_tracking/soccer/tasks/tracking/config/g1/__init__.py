@@ -199,6 +199,19 @@ gym.register(
     },
 )
 
+# CG progressive Stage 1: basic motion pretrain with the same anchor_ball_polar
+# observation as G1FlatCGDribblingEnvCfg, so its checkpoint can be resumed by
+# Tracking-CG-G1-Dribbling-RNN-v0.
+gym.register(
+    id="Tracking-CG-G1-Motion-RNN-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatMotionCGPretrainEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
+    },
+)
+
 gym.register(
     id="Tracking-CG-Heuristic-G1-Dribbling-RNN-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",

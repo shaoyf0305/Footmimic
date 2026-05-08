@@ -22,7 +22,7 @@ from isaaclab.utils import configclass
 from soccer.tasks.tracking import mdp
 from soccer.tasks.tracking.mdp import observations_anchor as obs_anchor
 from soccer.tasks.tracking.mdp.commands_dribble_cg import DribbleCGMotionCommand
-from .soccer_flat_env_cfg import G1FlatProximityEnvCfg
+from .soccer_flat_env_cfg import G1FlatMotionEnvCfg, G1FlatProximityEnvCfg
 
 
 @configclass
@@ -365,4 +365,33 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
                 "ball_sensor_name": "soccer_ball_contact",
                 "all_body_cfg": cg_body_cfg,
             },
+        )
+
+
+@configclass
+class G1FlatMotionCGPretrainEnvCfg(G1FlatMotionEnvCfg):
+    """Stage-1 basic-motion pretraining env, obs-compatible with the CG dribble env.
+
+    Mirrors :class:`~soccer.tasks.tracking.config.g1.soccer_flat_env_cfg.G1FlatMotionEnvCfg`
+    in every respect (rewards / terminations / commands / scene), only adding the
+    ``anchor_ball_polar`` observation that
+    :class:`G1FlatCGDribblingEnvCfg` also adds. Keeping the observation layout
+    identical lets a checkpoint trained here be resumed by
+    ``Tracking-CG-G1-Dribbling-RNN-v0`` via the standard rsl_rl ``--resume`` flow.
+
+    Use this for the Stage-1 pretrain when running CG progressive training.
+    The original :class:`G1FlatMotionEnvCfg` (``Tracking-Flat-G1-Motion-RNN-v0``)
+    is left untouched so existing non-CG checkpoints stay loadable.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.anchor_ball_polar = ObsTerm(
+            func=obs_anchor.anchor_ball_polar,
+            params={"command_name": "motion"},
+        )
+        self.observations.critic.anchor_ball_polar = ObsTerm(
+            func=obs_anchor.anchor_ball_polar,
+            params={"command_name": "motion"},
         )

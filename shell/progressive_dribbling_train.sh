@@ -3,11 +3,17 @@
 # Progressive Dribbling (2-Stage) — dribble motion + flat motion pretrain
 #
 # Stage 1: Motion tracking on **flat** ground (same ball/target obs as dribble MDP)
-#   - Default:  Tracking-Flat-G1-Motion-RNN-v0
-#   - --ankle-disturb: Tracking-Flat-G1-Dribbling-AnkleDisturb-RNN-v0
+#   - Default:           Tracking-Flat-G1-Motion-RNN-v0
+#   - --cg:              Tracking-CG-G1-Motion-RNN-v0
+#                        (adds anchor_ball_polar so its checkpoint is
+#                         obs-compatible with the CG dribble Stage 2)
+#   - --ankle-disturb:   Tracking-Flat-G1-Dribbling-AnkleDisturb-RNN-v0
+#                        (ignored when --cg is also set)
 #
 # Stage 2: Dribbling stage-2 task (baseline or CG variant, resume from Stage 1 run)
-#   - --cg  → Tracking-CG-G1-Dribbling-RNN-v0 (annotated CG + demo ball_pos_w stitching)
+#   - Default: Tracking-Flat-G1-Dribbling-RNN-v0
+#   - --cg:    Tracking-CG-G1-Dribbling-RNN-v0
+#              (annotated CG + demo ball_pos_w stitching)
 #   - Heuristic-only CG (no labels): pass task explicitly, e.g.
 #       --task Tracking-CG-Heuristic-G1-Dribbling-RNN-v0
 #
@@ -39,18 +45,23 @@ for arg in "$@"; do
     fi
 done
 
-if [[ "${ANKLE_DISTURB}" == "true" ]]; then
+if [[ "${USE_CG}" == "true" ]]; then
+    # CG dribble (Stage 2) adds `anchor_ball_polar` to the policy/critic obs,
+    # so Stage 1 must use the obs-compatible CG-pretrain motion env.
+    STAGE1_TASK="Tracking-CG-G1-Motion-RNN-v0"
+    STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-v0"
+    if [[ "${ANKLE_DISTURB}" == "true" ]]; then
+        echo ">>> Warning: --ankle-disturb is ignored under --cg (no CG-compatible ankle-disturb Stage 1 env). <<<"
+    fi
+    echo ">>> CG motion pretrain Stage 1 (obs-compatible with CG dribble) <<<"
+elif [[ "${ANKLE_DISTURB}" == "true" ]]; then
     STAGE1_TASK="Tracking-Flat-G1-Dribbling-AnkleDisturb-RNN-v0"
+    STAGE2_TASK="Tracking-Flat-G1-Dribbling-RNN-v0"
     echo ">>> Ankle disturbance Stage 1 <<<"
 else
     STAGE1_TASK="Tracking-Flat-G1-Motion-RNN-v0"
-    echo ">>> Flat motion tracking Stage 1 <<<"
-fi
-
-if [[ "${USE_CG}" == "true" ]]; then
-    STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-v0"
-else
     STAGE2_TASK="Tracking-Flat-G1-Dribbling-RNN-v0"
+    echo ">>> Flat motion tracking Stage 1 <<<"
 fi
 
 cd "${REPO_ROOT}"
@@ -94,10 +105,10 @@ python scripts/rsl_rl/train_multi.py --task "${STAGE2_TASK}" \
 
 echo ""
 echo "Play checkpoints (logs live under logs/rsl_rl/g1_dribbling/):"
-echo "  Stage 2 dribbling policy — task defaults to g1_dribbling, no extra flag:"
-echo "    python scripts/rsl_rl/play_multi.py --task Tracking-Flat-G1-Dribbling-RNN-v0 \\"
+echo "  Stage 2 dribbling policy:"
+echo "    python scripts/rsl_rl/play_multi.py --task ${STAGE2_TASK} \\"
 echo "      --motion_path \"${MOTION_PATH}\" --load_run \"<RUN_DIR>_dribble\" --checkpoint model_XXXX.pt ..."
-echo "  Stage 1 motion policy — task still uses g1_flat name; add --experiment_name g1_dribbling:"
-echo "    python scripts/rsl_rl/play_multi.py --task Tracking-Flat-G1-Motion-RNN-v0 \\"
+echo "  Stage 1 motion policy — add --experiment_name g1_dribbling:"
+echo "    python scripts/rsl_rl/play_multi.py --task ${STAGE1_TASK} \\"
 echo "      --experiment_name g1_dribbling --motion_path \"${MOTION_PATH}\" \\"
 echo "      --load_run \"${LOAD_RUN}\" --checkpoint model_XXXX.pt ..."
