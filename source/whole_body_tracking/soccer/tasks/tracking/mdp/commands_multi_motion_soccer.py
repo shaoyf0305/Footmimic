@@ -51,6 +51,11 @@ class MultiMotionLoader:
         kick_frame_list = []
         kick_end_frame_list = []
 
+        ball_pos_w_list: list[torch.Tensor] = []
+        dribble_cg_contact_list: list[torch.Tensor] = []
+        dribble_cg_foot_list: list[torch.Tensor] = []
+        motion_has_ball_demo_list: list[bool] = []
+
         self.fps_list = []
 
         max_T = 0  # Track maximum frame count.
@@ -108,6 +113,39 @@ class MultiMotionLoader:
                     kef_value = -1
             kick_end_frame_list.append(kef_value)
 
+            T = int(jp.shape[0])
+
+            if "ball_pos_w" in data.files:
+                ba = np.asarray(data["ball_pos_w"], dtype=np.float32)
+                if ba.shape[0] != T:
+                    raise ValueError(
+                        f"{motion_file}: ball_pos_w length {ba.shape[0]} != joint_pos length {T}"
+                    )
+                ball_pos_w_list.append(torch.tensor(ba, dtype=torch.float32, device=device))
+                motion_has_ball_demo_list.append(True)
+            else:
+                ball_pos_w_list.append(torch.zeros((T, 3), dtype=torch.float32, device=device))
+                motion_has_ball_demo_list.append(False)
+
+            cg_contact = torch.zeros(T, dtype=torch.int8, device=device)
+            cg_foot = torch.full((T,), -1, dtype=torch.int8, device=device)
+            if "dribble_cg_contact" in data.files:
+                cc = np.asarray(data["dribble_cg_contact"]).reshape(-1).astype(np.int8)[:T]
+                cg_contact[: cc.shape[0]] = torch.as_tensor(cc, device=device, dtype=torch.int8)
+            elif kf_value >= 0 and kef_value >= kf_value:
+                cg_contact[kf_value : kef_value + 1] = 1
+                if label_value == "left":
+                    cg_foot[kf_value : kef_value + 1] = 0
+                elif label_value == "right":
+                    cg_foot[kf_value : kef_value + 1] = 1
+
+            if "dribble_cg_foot" in data.files:
+                cf = np.asarray(data["dribble_cg_foot"]).reshape(-1).astype(np.int8)[:T]
+                cg_foot[: cf.shape[0]] = torch.as_tensor(cf, device=device, dtype=torch.int8)
+
+            dribble_cg_contact_list.append(cg_contact)
+            dribble_cg_foot_list.append(cg_foot)
+
             max_T = max(max_T, jp.shape[0])
 
         # Pad all files to max_T and stack into tensors.
@@ -120,6 +158,17 @@ class MultiMotionLoader:
                 # pad_tensor = torch.cat([t, torch.full([*pad_size], pad_value, device=self.device, dtype=t.dtype)], dim=0)
                 padded.append(pad_tensor)
             return torch.stack(padded, dim=0)  # shape: (num_files, max_T, ...)
+
+        def pad_1d_int8(tensor_list: list[torch.Tensor], pad_value: int) -> torch.Tensor:
+            padded = []
+            for t in tensor_list:
+                T = int(t.shape[0])
+                pad_size = max_T - T
+                pad_tensor = torch.cat(
+                    [t, torch.full((pad_size,), pad_value, device=self.device, dtype=torch.int8)], dim=0
+                )
+                padded.append(pad_tensor)
+            return torch.stack(padded, dim=0)
 
         self.joint_pos = pad_tensor_list(joint_pos_list)
         self.joint_vel = pad_tensor_list(joint_vel_list)
@@ -136,6 +185,12 @@ class MultiMotionLoader:
         self._kick_leg_labels = tuple(kick_leg_labels)
         self._kick_frames = torch.tensor(kick_frame_list, dtype=torch.long, device=self.device)
         self._kick_end_frames = torch.tensor(kick_end_frame_list, dtype=torch.long, device=self.device)
+
+        self._ball_pos_w = pad_tensor_list(ball_pos_w_list, pad_value=0.0)
+        self._dribble_cg_contact = pad_1d_int8(dribble_cg_contact_list, pad_value=0)
+        self._dribble_cg_foot = pad_1d_int8(dribble_cg_foot_list, pad_value=-1)
+        self.motion_has_ball_demo = torch.tensor(motion_has_ball_demo_list, dtype=torch.bool, device=self.device)
+        self.motion_has_dribble_cg = torch.any(self._dribble_cg_contact > 0, dim=1)
 
     @property
     def body_pos_w(self) -> torch.Tensor:
@@ -166,7 +221,22 @@ class MultiMotionLoader:
     def kick_end_frames(self) -> torch.Tensor:
         """Per-motion kick end frame indices. -1 means not annotated."""
         return self._kick_end_frames
-    
+
+    @property
+    def ball_pos_w(self) -> torch.Tensor:
+        """Demo ball positions from motion files ``[num_files, T, 3]`` (padded)."""
+        return self._ball_pos_w
+
+    @property
+    def dribble_cg_contact(self) -> torch.Tensor:
+        """Per-frame contact annotation ``[num_files, T]`` (0/1, padded with 0)."""
+        return self._dribble_cg_contact
+
+    @property
+    def dribble_cg_foot(self) -> torch.Tensor:
+        """Per-frame foot id: -1 unknown/none, 0 left, 1 right (padded with -1)."""
+        return self._dribble_cg_foot
+
     def get_last_frame_anchor_pos(self, motion_idx: int, anchor_body_idx: int, motion_length: int) -> torch.Tensor:
         """Get the anchor position at the last frame of the specified motion."""
         last_frame_idx = motion_length - 1
@@ -434,6 +504,28 @@ class MotionCommand(CommandTerm):
     def kick_end_frame(self) -> torch.Tensor:
         """Per-env kick end frame index. -1 means not annotated."""
         return self.motion.kick_end_frames[self.motion_idx]
+
+    @property
+    def dribble_cg_contact_ref(self) -> torch.Tensor:
+        """Annotated contact (0/1) at current motion time, shape ``(num_envs,)``."""
+        return self.motion.dribble_cg_contact[self.motion_idx, self.time_steps].to(torch.bool)
+
+    @property
+    def dribble_cg_foot_ref(self) -> torch.Tensor:
+        """Annotated foot id (-1 none, 0 left, 1 right), shape ``(num_envs,)``."""
+        return self.motion.dribble_cg_foot[self.motion_idx, self.time_steps].to(torch.int64)
+
+    @property
+    def motion_has_dribble_cg_label(self) -> torch.Tensor:
+        """Whether the loaded motion clip has any CG contact labels, shape ``(num_envs,)``."""
+        return self.motion.motion_has_dribble_cg[self.motion_idx]
+
+    def get_dribble_demo_ball_goal_world(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Optional demo ball goal in world frame for dribbling CG rewards.
+
+        Returns ``(goal_pos_w, has_demo_mask)`` or ``(None, None)`` when not implemented.
+        """
+        return None, None
 
     def _to_env_id_tensor(self, env_ids: Sequence[int] | torch.Tensor) -> torch.Tensor:
         if isinstance(env_ids, torch.Tensor):

@@ -13,18 +13,27 @@ Inherits proximity-level tracking and adds dribbling-specific rewards:
 """
 
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
 from soccer.tasks.tracking import mdp
+from soccer.tasks.tracking.mdp import observations_anchor as obs_anchor
+from soccer.tasks.tracking.mdp.commands_dribble_cg import DribbleCGMotionCommand
 from .soccer_flat_env_cfg import G1FlatProximityEnvCfg
 
 
 @configclass
 class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
     """Flat-ground dribbling environment."""
+
+    # Legal ankle contact mode for dribbling:
+    # - "right": only right ankle is legal
+    # - "left": only left ankle is legal
+    # - "both": both ankles are legal
+    dribble_contact_mode: str = "right"
 
     def __post_init__(self):
         super().__post_init__()
@@ -40,24 +49,38 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
         if hasattr(self.rewards, "pelvis_orientation"):
             self.rewards.pelvis_orientation.weight = -2.5
 
-        _foot_cfg = SceneEntityCfg(
-            "robot",
-            body_names=["right_ankle_roll_link", "left_ankle_roll_link"],
-        )
+        mode = str(self.dribble_contact_mode).lower().strip()
+        if mode not in {"right", "left", "both"}:
+            raise ValueError(
+                f"Unsupported dribble_contact_mode={self.dribble_contact_mode}. "
+                "Expected one of: right, left, both."
+            )
 
-        # Ankles **must** be the first ``num_ankle_links`` entries for contact logic.
+        if mode == "right":
+            legal_ankles = ["right_ankle_roll_link"]
+            other_ankles = ["left_ankle_roll_link"]
+        elif mode == "left":
+            legal_ankles = ["left_ankle_roll_link"]
+            other_ankles = ["right_ankle_roll_link"]
+        else:
+            legal_ankles = ["right_ankle_roll_link", "left_ankle_roll_link"]
+            other_ankles = []
+
+        _foot_cfg = SceneEntityCfg("robot", body_names=legal_ankles)
+
+        # Legal ankles must appear first for num_ankle_links gating.
         _contact_body_cfg = SceneEntityCfg(
             "robot",
             body_names=[
-                "right_ankle_roll_link",
-                "left_ankle_roll_link",
+                *legal_ankles,
+                *other_ankles,
                 "right_knee_link",
                 "left_knee_link",
                 "right_wrist_yaw_link",
                 "left_wrist_yaw_link",
             ],
         )
-        _num_ankle_links = 2
+        _num_ankle_links = len(legal_ankles)
 
         self.rewards.dribbling_velocity_tracking = RewTerm(
             func=mdp.dribbling_velocity_tracking,
@@ -137,10 +160,10 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_ball_forward_progress = RewTerm(
             func=mdp.dribbling_ball_forward_progress_reward,
-            weight=4.0,
+            weight=5.5,
             params={
                 "command_name": "motion",
-                "min_forward_speed": 0.20,
+                "min_forward_speed": 0.24,
                 "speed_scale": 0.25,
                 "pelvis_speed_min": 0.06,
                 "ball_sensor_name": "soccer_ball_contact",
@@ -245,5 +268,101 @@ class G1TerrainDribblingAnkleDisturbEnvCfg(G1FlatDribblingEnvCfg):
                     ],
                 ),
                 "torque_range": (-15.0, 15.0),
+            },
+        )
+
+
+@configclass
+class G1FlatDribblingCGHeuristicEnvCfg(G1FlatDribblingEnvCfg):
+    """Legacy CG shaping: heuristic approach/interact phases (no motion labels)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.rewards.dribbling_phase_graph_alignment = RewTerm(
+            func=mdp.dribbling_phase_graph_alignment,
+            weight=6.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 0.5,
+                "approach_xy_dist": 0.55,
+                "approach_dist_std": 0.20,
+                "push_speed_threshold": 0.22,
+            },
+        )
+
+
+@configclass
+class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
+    """Dribbling with annotated contact graph + stitched demo ``ball_pos_w``.
+
+    Uses :class:`~soccer.tasks.tracking.mdp.commands_dribble_cg.DribbleCGMotionCommand`
+    to optionally drive the sim ball along the demo trajectory (anchor-relative),
+    and rewards that align sensor contact / foot side with ``dribble_cg_*`` labels.
+
+    For the previous distance-only heuristic CG, use
+    :class:`G1FlatDribblingCGHeuristicEnvCfg` / gym id
+    ``Tracking-CG-Heuristic-G1-Dribbling-RNN-v0``.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.motion.class_type = DribbleCGMotionCommand
+        setattr(self.commands.motion, "dribble_cg_snap_mode", "full")
+
+        self.observations.policy.anchor_ball_polar = ObsTerm(
+            func=obs_anchor.anchor_ball_polar,
+            params={"command_name": "motion"},
+        )
+        self.observations.critic.anchor_ball_polar = ObsTerm(
+            func=obs_anchor.anchor_ball_polar,
+            params={"command_name": "motion"},
+        )
+
+        mode = str(self.dribble_contact_mode).lower().strip()
+        if mode == "right":
+            legal_ankles = ["right_ankle_roll_link"]
+            other_ankles = ["left_ankle_roll_link"]
+        elif mode == "left":
+            legal_ankles = ["left_ankle_roll_link"]
+            other_ankles = ["right_ankle_roll_link"]
+        else:
+            legal_ankles = ["right_ankle_roll_link", "left_ankle_roll_link"]
+            other_ankles = []
+        cg_body_cfg = SceneEntityCfg(
+            "robot",
+            body_names=[
+                *legal_ankles,
+                *other_ankles,
+                "right_knee_link",
+                "left_knee_link",
+                "right_wrist_yaw_link",
+                "left_wrist_yaw_link",
+            ],
+        )
+
+        self.rewards.dribbling_cg_demo_ball_tracking = RewTerm(
+            func=mdp.dribbling_cg_demo_ball_tracking_exp,
+            weight=4.0,
+            params={"command_name": "motion", "std": 0.32},
+        )
+        self.rewards.dribbling_cg_contact_consistency = RewTerm(
+            func=mdp.dribbling_cg_contact_consistency,
+            weight=5.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+            },
+        )
+        self.rewards.dribbling_cg_foot_consistency = RewTerm(
+            func=mdp.dribbling_cg_foot_consistency,
+            weight=4.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "all_body_cfg": cg_body_cfg,
             },
         )

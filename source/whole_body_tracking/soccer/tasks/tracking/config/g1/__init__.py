@@ -189,6 +189,26 @@ gym.register(
     },
 )
 
+gym.register(
+    id="Tracking-CG-G1-Dribbling-RNN-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatCGDribblingEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-CG-Heuristic-G1-Dribbling-RNN-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatDribblingCGHeuristicEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
+    },
+)
+
 # Dribbling Stage 1: ankle disturbance mode
 gym.register(
     id="Tracking-Flat-G1-Dribbling-AnkleDisturb-v0",

@@ -6,13 +6,18 @@
 #   - Default:  Tracking-Flat-G1-Motion-RNN-v0
 #   - --ankle-disturb: Tracking-Flat-G1-Dribbling-AnkleDisturb-RNN-v0
 #
-# Stage 2: Tracking-Flat-G1-Dribbling-RNN-v0 (resume from Stage 1 run)
+# Stage 2: Dribbling stage-2 task (baseline or CG variant, resume from Stage 1 run)
+#   - --cg  → Tracking-CG-G1-Dribbling-RNN-v0 (annotated CG + demo ball_pos_w stitching)
+#   - Heuristic-only CG (no labels): pass task explicitly, e.g.
+#       --task Tracking-CG-Heuristic-G1-Dribbling-RNN-v0
 #
 # Motion directory: set DRIBBLE_MOTION_PATH to your folder of dribble .npz files
-# (defaults to motions/dribble).
+# (defaults to motions/dribble). CG training expects ``ball_pos_w`` in each .npz
+# (or merged from a sidecar) plus ``dribble_cg_contact`` / ``dribble_cg_foot``
+# from dribble_label_tool apply (or kick_frame/kick_end/kick_leg fallback).
 #
 # Usage:
-#   DRIBBLE_MOTION_PATH=motions/my_dribble bash shell/progressive_dribbling_train.sh [RUN_NAME] [--ankle-disturb]
+#   DRIBBLE_MOTION_PATH=motions/my_dribble bash shell/progressive_dribbling_train.sh [RUN_NAME] [--ankle-disturb] [--cg]
 #
 
 set -euo pipefail
@@ -25,9 +30,12 @@ MOTION_PATH="${DRIBBLE_MOTION_PATH:-motions/dribble}"
 
 RUN_NAME="${1:-dribbling}"
 ANKLE_DISTURB=false
+USE_CG=false
 for arg in "$@"; do
     if [[ "${arg}" == "--ankle-disturb" ]]; then
         ANKLE_DISTURB=true
+    elif [[ "${arg}" == "--cg" ]]; then
+        USE_CG=true
     fi
 done
 
@@ -37,6 +45,12 @@ if [[ "${ANKLE_DISTURB}" == "true" ]]; then
 else
     STAGE1_TASK="Tracking-Flat-G1-Motion-RNN-v0"
     echo ">>> Flat motion tracking Stage 1 <<<"
+fi
+
+if [[ "${USE_CG}" == "true" ]]; then
+    STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-v0"
+else
+    STAGE2_TASK="Tracking-Flat-G1-Dribbling-RNN-v0"
 fi
 
 cd "${REPO_ROOT}"
@@ -64,12 +78,12 @@ fi
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"
-echo " Stage 2: Tracking-Flat-G1-Dribbling-RNN-v0"
+echo " Stage 2: ${STAGE2_TASK}"
 echo " resume: ${LOAD_RUN}"
 echo " motion_path: ${MOTION_PATH}"
 echo "════════════════════════════════════════════════════════════════"
 
-python scripts/rsl_rl/train_multi.py --task Tracking-Flat-G1-Dribbling-RNN-v0 \
+python scripts/rsl_rl/train_multi.py --task "${STAGE2_TASK}" \
     --motion_path "${MOTION_PATH}" \
     --load_run "${LOAD_RUN}" \
     --run_name "${RUN_NAME}_dribble" \

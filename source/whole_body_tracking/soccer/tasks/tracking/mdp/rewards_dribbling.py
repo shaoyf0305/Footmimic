@@ -484,7 +484,55 @@ def dribbling_ball_forward_progress_reward(
 
 
 # ---------------------------------------------------------------------------
-# 2f) Anti-orbit penalty — discourage circling around the ball without touch
+# 2f) Contact-graph style phase alignment (approach -> control/push)
+# ---------------------------------------------------------------------------
+
+
+def dribbling_phase_graph_alignment(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 0.5,
+    approach_xy_dist: float = 0.55,
+    approach_dist_std: float = 0.20,
+    push_speed_threshold: float = 0.22,
+) -> torch.Tensor:
+    """Phase-style shaping without explicit per-frame labels.
+
+    - ``approach`` phase (ball far): reward getting closer while avoiding contact.
+    - ``control/push`` phase (ball near): reward contact, and reward stronger when
+      ball moves forward in pelvis-local frame (push over static trapping).
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+
+    pelvis_pos_xy = command.robot_pelvis_pos_w[:, :2]
+    ball_pos_xy = soccer_ball.data.root_pos_w[:, :2]
+    dist_xy = torch.norm(ball_pos_xy - pelvis_pos_xy, dim=-1)
+
+    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
+    has_contact = fmag > contact_force_threshold
+
+    ball_vel_w = soccer_ball.data.root_lin_vel_w[:, :3]
+    ball_vel_local = quat_apply(quat_inv(command.robot_pelvis_quat_w), ball_vel_w)
+    forward_speed = torch.clamp(ball_vel_local[:, 0], min=0.0)
+
+    phase_approach = dist_xy > approach_xy_dist
+    phase_interact = ~phase_approach
+
+    # Approach: closer is better, but do not touch too early.
+    approach_core = torch.exp(-((dist_xy - approach_xy_dist).clamp(min=0.0) ** 2) / (approach_dist_std ** 2))
+    approach_reward = approach_core * (~has_contact).to(torch.float32)
+
+    # Interact: contact is required; encourage push speed on top of stable contact.
+    push_gain = torch.clamp(forward_speed / max(push_speed_threshold, 1e-6), min=0.0, max=1.0)
+    interact_reward = has_contact.to(torch.float32) * (0.55 + 0.45 * push_gain)
+
+    return torch.where(phase_approach, approach_reward, interact_reward)
+
+
+# ---------------------------------------------------------------------------
+# 2g) Anti-orbit penalty — discourage circling around the ball without touch
 # ---------------------------------------------------------------------------
 
 
@@ -630,5 +678,81 @@ def dribbling_undesired_contact_penalty(
 
     return penalty
 
+
+# ---------------------------------------------------------------------------
+# 4) Annotated contact-graph (dribbling) — demo ball + label consistency
+# ---------------------------------------------------------------------------
+
+
+def dribbling_cg_demo_ball_tracking_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    std: float = 0.32,
+) -> torch.Tensor:
+    """Shaped tracking of the simulated ball toward the stitched demo trajectory."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    goal_w, mask = command.get_dribble_demo_ball_goal_world()
+    if goal_w is None or mask is None:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+    ball = env.scene["soccer_ball"].data.root_pos_w[:, :3]
+    err = torch.norm(ball - goal_w, dim=-1)
+    rew = torch.exp(-err / max(std, 1e-6))
+    return rew * mask.to(torch.float32)
+
+
+def dribbling_cg_contact_consistency(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """1.0 when sim contact presence matches the annotated CG contact bit."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    labeled = command.motion_has_dribble_cg_label
+    if not torch.any(labeled):
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    ref = command.dribble_cg_contact_ref
+    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
+    sim_c = fmag > contact_force_threshold
+    agree = (ref == sim_c).to(torch.float32)
+    return agree * labeled.to(torch.float32)
+
+
+def dribbling_cg_foot_consistency(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    all_body_cfg: SceneEntityCfg | None = None,
+    left_ankle_body_name: str = "left_ankle_roll_link",
+    right_ankle_body_name: str = "right_ankle_roll_link",
+) -> torch.Tensor:
+    """When the label specifies a foot during contact, reward matching closest ankle."""
+    if all_body_cfg is None:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    labeled = command.motion_has_dribble_cg_label
+    if not torch.any(labeled):
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    ref_c = command.dribble_cg_contact_ref
+    ref_f = command.dribble_cg_foot_ref
+    active = labeled & ref_c & (ref_f >= 0)
+
+    has_contact, _fm, closest = _identify_contact_body(env, command, ball_sensor_name, all_body_cfg)
+    names = list(all_body_cfg.body_names)
+    try:
+        li = names.index(left_ankle_body_name)
+        ri = names.index(right_ankle_body_name)
+    except ValueError:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    expected = torch.full((env.num_envs,), -1, device=env.device, dtype=torch.long)
+    expected[ref_f == 0] = li
+    expected[ref_f == 1] = ri
+
+    match = (closest == expected) & has_contact & active
+    return match.to(torch.float32)
 
 
