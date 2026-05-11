@@ -32,9 +32,15 @@ if TYPE_CHECKING:
 class DribbleCGMotionCommand(MotionCommand):
     """Soccer motion command + demo ball sync for dribbling CG."""
 
+    def _use_demo_ball(self) -> bool:
+        return bool(getattr(self.cfg, "dribble_cg_use_demo_ball", True))
+
     def get_dribble_demo_ball_goal_world(self) -> tuple[torch.Tensor, torch.Tensor]:
         env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
-        mask = self.motion.motion_has_ball_demo[self.motion_idx]
+        if not self._use_demo_ball():
+            mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        else:
+            mask = self.motion.motion_has_ball_demo[self.motion_idx]
         goal = self._demo_ball_world(env_ids)
         return goal, mask
 
@@ -72,6 +78,8 @@ class DribbleCGMotionCommand(MotionCommand):
 
     def _should_snap_demo_ball(self, env_ids: torch.Tensor) -> torch.Tensor:
         """Per-env bool: write sim ball from demo this step."""
+        if not self._use_demo_ball():
+            return torch.zeros(env_ids.numel(), device=self.device, dtype=torch.bool)
         mi = self.motion_idx[env_ids]
         has_demo = self.motion.motion_has_ball_demo[mi]
         mode = str(getattr(self.cfg, "dribble_cg_snap_mode", "full")).lower().strip()
@@ -79,6 +87,29 @@ class DribbleCGMotionCommand(MotionCommand):
             in_ref_contact = self.motion.dribble_cg_contact[mi, self.time_steps[env_ids]] > 0
             return has_demo & ~in_ref_contact
         return has_demo
+
+    def _front_ball_positions(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Env-local ball positions in front of the motion's starting anchor."""
+        mi = self.motion_idx[env_ids]
+        first_anchor = self.motion._body_pos_w[mi, 0, self.motion_anchor_body_index]
+        first_quat = self.motion._body_quat_w[mi, 0, self.motion_anchor_body_index]
+
+        forward = quat_apply(
+            yaw_quat(first_quat),
+            torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=first_anchor.dtype).expand(env_ids.numel(), -1),
+        )
+        lateral = quat_apply(
+            yaw_quat(first_quat),
+            torch.tensor([0.0, 1.0, 0.0], device=self.device, dtype=first_anchor.dtype).expand(env_ids.numel(), -1),
+        )
+
+        distance = float(getattr(self.cfg, "dribble_cg_front_ball_distance", 0.45))
+        lateral_offset = float(getattr(self.cfg, "dribble_cg_front_ball_lateral_offset", 0.0))
+        height = float(getattr(self.cfg, "dribble_cg_front_ball_height", self._target_height))
+
+        ball_pos = first_anchor + distance * forward + lateral_offset * lateral
+        ball_pos[:, 2] = height
+        return ball_pos
 
     def _compute_soccer_ball_positions(self, env_ids: Sequence[int] | torch.Tensor):
         ids = self._to_env_id_tensor(env_ids)
@@ -90,7 +121,11 @@ class DribbleCGMotionCommand(MotionCommand):
         fallback_ids = ids[~has_demo]
 
         if fallback_ids.numel() > 0:
-            super()._compute_soccer_ball_positions(fallback_ids)
+            fallback_mode = str(getattr(self.cfg, "dribble_cg_fallback_ball_mode", "arc_endpoint")).lower().strip()
+            if fallback_mode == "front":
+                self.soccer_ball_pos[fallback_ids] = self._front_ball_positions(fallback_ids)
+            else:
+                super()._compute_soccer_ball_positions(fallback_ids)
         if demo_ids.numel() > 0:
             env_origins = self._env.scene.env_origins[demo_ids]
             self.soccer_ball_pos[demo_ids] = self._demo_ball_world(demo_ids) - env_origins
@@ -143,3 +178,8 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     class_type: type = DribbleCGMotionCommand
 
     dribble_cg_snap_mode: str = "full"
+    dribble_cg_use_demo_ball: bool = True
+    dribble_cg_fallback_ball_mode: str = "arc_endpoint"
+    dribble_cg_front_ball_distance: float = 0.45
+    dribble_cg_front_ball_lateral_offset: float = 0.0
+    dribble_cg_front_ball_height: float = 0.11

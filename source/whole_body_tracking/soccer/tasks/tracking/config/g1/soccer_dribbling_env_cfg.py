@@ -49,6 +49,21 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
         if hasattr(self.rewards, "pelvis_orientation"):
             self.rewards.pelvis_orientation.weight = -2.5
 
+        # Drop world-frame yaw tracking from the motion: zig-zag motion ("slalom around
+        # cones") would otherwise force the policy to copy the S-shape heading pattern.
+        # The face-ball reward below replaces it with a task-aligned heading signal.
+        if hasattr(self.rewards, "motion_global_anchor_ori"):
+            self.rewards.motion_global_anchor_ori.weight = 0.0
+
+        self.rewards.dribbling_face_ball = RewTerm(
+            func=mdp.dribbling_face_ball,
+            weight=2.0,
+            params={
+                "command_name": "motion",
+                "min_distance": 0.05,
+            },
+        )
+
         mode = str(self.dribble_contact_mode).lower().strip()
         if mode not in {"right", "left", "both"}:
             raise ValueError(
@@ -310,7 +325,13 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
         super().__post_init__()
 
         self.commands.motion.class_type = DribbleCGMotionCommand
-        setattr(self.commands.motion, "dribble_cg_snap_mode", "full")
+        # This CG variant uses contact labels to teach the touch timing/side, while
+        # keeping the ball task simple: spawn the ball in front and let physics move it.
+        setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
+        setattr(self.commands.motion, "dribble_cg_fallback_ball_mode", "front")
+        setattr(self.commands.motion, "dribble_cg_front_ball_distance", 0.45)
+        setattr(self.commands.motion, "dribble_cg_front_ball_lateral_offset", 0.0)
+        setattr(self.commands.motion, "dribble_cg_front_ball_height", 0.11)
 
         self.observations.policy.anchor_ball_polar = ObsTerm(
             func=obs_anchor.anchor_ball_polar,
@@ -393,5 +414,36 @@ class G1FlatMotionCGPretrainEnvCfg(G1FlatMotionEnvCfg):
         )
         self.observations.critic.anchor_ball_polar = ObsTerm(
             func=obs_anchor.anchor_ball_polar,
+            params={"command_name": "motion"},
+        )
+
+        # Stage-1 objective: forward locomotion with the motion's gait style.
+        # The demo is slalom-around-cones, so we drop the world-frame trajectory trackers
+        # and replace them with a simple "walk forward at ~target speed" task. Motion
+        # style is still imitated via joint reference + anchor-relative body rewards.
+        if hasattr(self.rewards, "motion_global_anchor_pos"):
+            self.rewards.motion_global_anchor_pos.weight = 0.0
+        if hasattr(self.rewards, "motion_global_anchor_ori"):
+            self.rewards.motion_global_anchor_ori.weight = 0.0
+        # Slalom side-to-side motion bleeds into per-body world velocity / angular
+        # velocity references too: keep them at reduced weight so they only inform gait
+        # timing rather than enforcing the lateral pattern.
+        if hasattr(self.rewards, "motion_body_lin_vel"):
+            self.rewards.motion_body_lin_vel.weight = 0.3
+        if hasattr(self.rewards, "motion_body_ang_vel"):
+            self.rewards.motion_body_ang_vel.weight = 0.3
+
+        self.rewards.forward_velocity = RewTerm(
+            func=mdp.forward_velocity_reward,
+            weight=3.0,
+            params={
+                "command_name": "motion",
+                "target_speed": 0.8,
+                "std": 0.4,
+            },
+        )
+        self.rewards.lateral_velocity_penalty = RewTerm(
+            func=mdp.lateral_velocity_penalty,
+            weight=-0.5,
             params={"command_name": "motion"},
         )

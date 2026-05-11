@@ -756,3 +756,34 @@ def dribbling_cg_foot_consistency(
     return match.to(torch.float32)
 
 
+def dribbling_face_ball(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    min_distance: float = 0.05,
+) -> torch.Tensor:
+    """Cosine of the horizontal angle between pelvis forward and the pelvis-to-ball vector.
+
+    Returns ``+1`` when the robot pelvis points straight at the ball, ``0`` when
+    the ball is directly sideways, and ``-1`` when the ball is behind the robot.
+    Defaults to ``+1`` when the ball is closer than ``min_distance`` (numerically
+    unstable region right next to the foot).
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+
+    ball_pos_w = soccer_ball.data.root_pos_w[:, :3]
+    pelvis_pos_w = command.robot_pelvis_pos_w
+    pelvis_quat_w = command.robot_pelvis_quat_w
+
+    delta_w = ball_pos_w - pelvis_pos_w
+    delta_local = quat_apply(quat_inv(pelvis_quat_w), delta_w)
+    dx = delta_local[:, 0]
+    dy = delta_local[:, 1]
+    dist = torch.norm(torch.stack([dx, dy], dim=-1), dim=-1)
+    safe = dist > float(min_distance)
+    cos_heading = torch.where(
+        safe,
+        dx / dist.clamp(min=1e-4),
+        torch.ones_like(dist),
+    )
+    return cos_heading.clamp(min=-1.0, max=1.0)
