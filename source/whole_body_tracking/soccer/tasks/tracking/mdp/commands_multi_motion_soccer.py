@@ -54,6 +54,7 @@ class MultiMotionLoader:
         ball_pos_w_list: list[torch.Tensor] = []
         dribble_cg_contact_list: list[torch.Tensor] = []
         dribble_cg_foot_list: list[torch.Tensor] = []
+        dribble_cg_foot_ball_dist_list: list[torch.Tensor] = []
         motion_has_ball_demo_list: list[bool] = []
 
         self.fps_list = []
@@ -143,8 +144,14 @@ class MultiMotionLoader:
                 cf = np.asarray(data["dribble_cg_foot"]).reshape(-1).astype(np.int8)[:T]
                 cg_foot[: cf.shape[0]] = torch.as_tensor(cf, device=device, dtype=torch.int8)
 
+            cg_foot_ball_dist = torch.full((T,), -1.0, dtype=torch.float32, device=device)
+            if "dribble_cg_foot_ball_dist" in data.files:
+                cd = np.asarray(data["dribble_cg_foot_ball_dist"], dtype=np.float32).reshape(-1)[:T]
+                cg_foot_ball_dist[: cd.shape[0]] = torch.as_tensor(cd, device=device, dtype=torch.float32)
+
             dribble_cg_contact_list.append(cg_contact)
             dribble_cg_foot_list.append(cg_foot)
+            dribble_cg_foot_ball_dist_list.append(cg_foot_ball_dist)
 
             max_T = max(max_T, jp.shape[0])
 
@@ -170,6 +177,17 @@ class MultiMotionLoader:
                 padded.append(pad_tensor)
             return torch.stack(padded, dim=0)
 
+        def pad_1d_float(tensor_list: list[torch.Tensor], pad_value: float) -> torch.Tensor:
+            padded = []
+            for t in tensor_list:
+                T = int(t.shape[0])
+                pad_size = max_T - T
+                pad_tensor = torch.cat(
+                    [t, torch.full((pad_size,), pad_value, device=self.device, dtype=torch.float32)], dim=0
+                )
+                padded.append(pad_tensor)
+            return torch.stack(padded, dim=0)
+
         self.joint_pos = pad_tensor_list(joint_pos_list)
         self.joint_vel = pad_tensor_list(joint_vel_list)
         self._body_pos_w = pad_tensor_list(body_pos_w_list)
@@ -189,8 +207,10 @@ class MultiMotionLoader:
         self._ball_pos_w = pad_tensor_list(ball_pos_w_list, pad_value=0.0)
         self._dribble_cg_contact = pad_1d_int8(dribble_cg_contact_list, pad_value=0)
         self._dribble_cg_foot = pad_1d_int8(dribble_cg_foot_list, pad_value=-1)
+        self._dribble_cg_foot_ball_dist = pad_1d_float(dribble_cg_foot_ball_dist_list, pad_value=-1.0)
         self.motion_has_ball_demo = torch.tensor(motion_has_ball_demo_list, dtype=torch.bool, device=self.device)
         self.motion_has_dribble_cg = torch.any(self._dribble_cg_contact > 0, dim=1)
+        self.motion_has_dribble_cg_foot_ball_dist = torch.any(self._dribble_cg_foot_ball_dist >= 0.0, dim=1)
 
     @property
     def body_pos_w(self) -> torch.Tensor:
@@ -236,6 +256,11 @@ class MultiMotionLoader:
     def dribble_cg_foot(self) -> torch.Tensor:
         """Per-frame foot id: -1 unknown/none, 0 left, 1 right (padded with -1)."""
         return self._dribble_cg_foot
+
+    @property
+    def dribble_cg_foot_ball_dist(self) -> torch.Tensor:
+        """Per-frame demo foot–ball distance (m); ``-1`` = no label."""
+        return self._dribble_cg_foot_ball_dist
 
     def get_last_frame_anchor_pos(self, motion_idx: int, anchor_body_idx: int, motion_length: int) -> torch.Tensor:
         """Get the anchor position at the last frame of the specified motion."""
@@ -514,6 +539,16 @@ class MotionCommand(CommandTerm):
     def dribble_cg_foot_ref(self) -> torch.Tensor:
         """Annotated foot id (-1 none, 0 left, 1 right), shape ``(num_envs,)``."""
         return self.motion.dribble_cg_foot[self.motion_idx, self.time_steps].to(torch.int64)
+
+    @property
+    def dribble_cg_foot_ball_dist_ref(self) -> torch.Tensor:
+        """Demo foot–ball distance at current frame (m); ``-1`` if unlabeled."""
+        return self.motion.dribble_cg_foot_ball_dist[self.motion_idx, self.time_steps]
+
+    @property
+    def motion_has_dribble_cg_foot_ball_dist_label(self) -> torch.Tensor:
+        """Whether the motion clip has synthesized foot–ball distance labels."""
+        return self.motion.motion_has_dribble_cg_foot_ball_dist[self.motion_idx]
 
     @property
     def motion_has_dribble_cg_label(self) -> torch.Tensor:

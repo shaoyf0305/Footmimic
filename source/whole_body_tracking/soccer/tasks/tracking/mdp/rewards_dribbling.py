@@ -756,6 +756,58 @@ def dribbling_cg_foot_consistency(
     return match.to(torch.float32)
 
 
+def dribbling_cg_foot_ball_distance_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    std: float = 0.12,
+    use_xy_only: bool = False,
+    left_ankle_body_name: str = "left_ankle_roll_link",
+    right_ankle_body_name: str = "right_ankle_roll_link",
+) -> torch.Tensor:
+    """Match sim foot–ball distance to demo distance from synthesized CG trajectory.
+
+    Requires ``dribble_cg_foot_ball_dist`` in motion ``.npz`` (see
+    ``scripts/rsl_rl/synthesize_dribble_ball_traj.py``). At labeled frames:
+
+    - ``ref_dist`` = demo distance from retargeted foot to synthesized ball.
+    - ``sim_dist`` = distance from the labeled foot to the **sim** ball.
+    - reward = ``exp(-(sim_dist - ref_dist)^2 / std^2)``.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    labeled = command.motion_has_dribble_cg_foot_ball_dist_label
+    if not torch.any(labeled):
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    ref_dist = command.dribble_cg_foot_ball_dist_ref
+    ref_foot = command.dribble_cg_foot_ref
+    active = labeled & (ref_dist >= 0.0) & (ref_foot >= 0)
+
+    robot = env.scene[command.cfg.asset_name]
+    soccer_ball = env.scene["soccer_ball"]
+    ball_pos = soccer_ball.data.root_pos_w[:, :3]
+
+    li = robot.body_names.index(left_ankle_body_name)
+    ri = robot.body_names.index(right_ankle_body_name)
+    left_pos = robot.data.body_pos_w[:, li]
+    right_pos = robot.data.body_pos_w[:, ri]
+
+    foot_pos = torch.where(
+        (ref_foot == 0).unsqueeze(-1),
+        left_pos,
+        torch.where((ref_foot == 1).unsqueeze(-1), right_pos, left_pos),
+    )
+
+    delta = foot_pos - ball_pos
+    if use_xy_only:
+        sim_dist = torch.norm(delta[:, :2], dim=-1)
+    else:
+        sim_dist = torch.norm(delta, dim=-1)
+
+    err = (sim_dist - ref_dist) ** 2
+    rew = torch.exp(-err / max(std, 1e-6) ** 2)
+    return rew * active.to(torch.float32)
+
+
 def dribbling_face_ball(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",

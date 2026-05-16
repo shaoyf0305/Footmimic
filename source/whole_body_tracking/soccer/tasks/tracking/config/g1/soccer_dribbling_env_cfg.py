@@ -369,9 +369,20 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
             weight=4.0,
             params={"command_name": "motion", "std": 0.32},
         )
+        # Continuous CG: demo foot–ball distance (from synthesized ball_pos_w).
+        # Run scripts/rsl_rl/synthesize_dribble_ball_traj.py on labeled motions first.
+        self.rewards.dribbling_cg_foot_ball_distance = RewTerm(
+            func=mdp.dribbling_cg_foot_ball_distance_exp,
+            weight=6.0,
+            params={
+                "command_name": "motion",
+                "std": 0.12,
+                "use_xy_only": True,
+            },
+        )
         self.rewards.dribbling_cg_contact_consistency = RewTerm(
             func=mdp.dribbling_cg_contact_consistency,
-            weight=5.0,
+            weight=0.0,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
@@ -380,7 +391,7 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
         )
         self.rewards.dribbling_cg_foot_consistency = RewTerm(
             func=mdp.dribbling_cg_foot_consistency,
-            weight=4.0,
+            weight=2.0,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
