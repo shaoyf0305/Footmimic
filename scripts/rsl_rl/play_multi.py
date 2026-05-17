@@ -52,7 +52,15 @@ import gymnasium as gym
 import os
 import glob
 import pathlib
+import numpy as np
 import torch
+
+from isaaclab.managers import SceneEntityCfg
+from soccer.tasks.tracking.mdp.rewards_dribbling import (
+    _identify_contact_body,
+    soccer_ball_contact_force_magnitude,
+    soccer_ball_contact_net_force_w,
+)
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -99,42 +107,131 @@ def get_motion_files(motion_path: str) -> list[str]:
         raise ValueError(f"Invalid path: {motion_path}. Must be a file or directory.")
 
 
-def _get_cg_overlay(env, timestep: int) -> str:
-    """Build a text overlay showing Contact Graph phase, timestep, and ball speed."""
+# Bodies checked for ball contact HUD (matches dribbling env contact reward).
+_HUD_CONTACT_BODIES = [
+    "right_ankle_roll_link",
+    "left_ankle_roll_link",
+    "right_knee_link",
+    "left_knee_link",
+    "right_wrist_yaw_link",
+    "left_wrist_yaw_link",
+]
+_HUD_ANKLE_BODIES = ["right_ankle_roll_link", "left_ankle_roll_link"]
+_BALL_SENSOR_NAME = "soccer_ball_contact"
+_CONTACT_FORCE_THRESHOLD = 1.0
+
+
+def _resolve_base_env(env):
+    """Unwrap gym / RSL-RL wrappers to the underlying Isaac Lab env."""
+    base = env
+    while hasattr(base, "env"):
+        base = base.env
+    if hasattr(base, "unwrapped"):
+        base = base.unwrapped
+    return base
+
+
+def _get_play_overlay(env, timestep: int) -> str:
+    """HUD for dual-view video: speeds, distances, contact, and CG labels."""
+    lines: list[str] = [f"Step: {timestep}"]
     try:
-        base_env = env.unwrapped if hasattr(env, 'unwrapped') else env
-        cmd = base_env.command_manager.get_term("motion_command")
+        base_env = _resolve_base_env(env)
+        cmd = base_env.command_manager.get_term("motion")
+        i = 0
 
-        t = int(cmd.time_steps[0].item())
-        kf = int(cmd.kick_frame[0].item()) if hasattr(cmd, 'kick_frame') else -1
-        kef = int(cmd.kick_end_frame[0].item()) if hasattr(cmd, 'kick_end_frame') else -1
+        t = int(cmd.time_steps[i].item())
+        motion_len = int(cmd.motion_length[i].item())
+        lines.append(f"Motion frame: {t}/{max(motion_len - 1, 0)}")
 
-        # Determine CG phase (matches _get_cg_phase in rewards.py).
-        margin = 5
-        if kf < 0:
-            phase = "CG=N/A (no annotation)"
-        elif t < kf - margin:
-            phase = "CG=0 (Approach)"
-        else:
-            phase = "CG=1 (Kick)"
+        pelvis_vel = cmd.robot_anchor_lin_vel_w[i].detach().cpu().numpy()
+        pelvis_pos = cmd.robot_pelvis_pos_w[i].detach().cpu().numpy()
+        pelvis_sp_xy = float(np.linalg.norm(pelvis_vel[:2]))
+        pelvis_sp_3d = float(np.linalg.norm(pelvis_vel))
 
-        # Ball speed.
-        ball_speed = 0.0
-        try:
-            ball = base_env.scene["ball"]
-            ball_vel = ball.data.root_lin_vel_w[0].cpu().numpy()
-            ball_speed = float(np.linalg.norm(ball_vel[:2]))
-        except Exception:
-            pass
+        soccer_ball = base_env.scene["soccer_ball"]
+        ball_vel = soccer_ball.data.root_lin_vel_w[i].detach().cpu().numpy()
+        ball_pos = soccer_ball.data.root_pos_w[i].detach().cpu().numpy()
+        ball_sp_xy = float(np.linalg.norm(ball_vel[:2]))
+        ball_sp_3d = float(np.linalg.norm(ball_vel))
 
-        lines = [
-            f"Step: {timestep}  |  Frame: {t}/{kf}",
-            f"Phase: {phase}",
-            f"Ball Speed: {ball_speed:.2f} m/s",
-        ]
-        return "\n".join(lines)
+        pelvis_ball_xy = float(np.linalg.norm(ball_pos[:2] - pelvis_pos[:2]))
+        pelvis_ball_3d = float(np.linalg.norm(ball_pos - pelvis_pos))
+
+        lines.append(
+            f"Pelvis v_xy: {pelvis_sp_xy:.2f} m/s (|v|={pelvis_sp_3d:.2f})  |  "
+            f"Ball v_xy: {ball_sp_xy:.2f} m/s (|v|={ball_sp_3d:.2f})"
+        )
+        lines.append(
+            f"Pelvis-Ball: {pelvis_ball_xy:.2f} m (xy)  |  {pelvis_ball_3d:.2f} m (3D)"
+        )
+
+        robot = base_env.scene["robot"]
+        ankle_dists: list[float] = []
+        for fname in _HUD_ANKLE_BODIES:
+            if fname not in robot.body_names:
+                continue
+            bidx = robot.body_names.index(fname)
+            fpos = robot.data.body_pos_w[i, bidx].detach().cpu().numpy()
+            ankle_dists.append(float(np.linalg.norm(fpos - ball_pos)))
+        if ankle_dists:
+            lines.append(f"Ankle-Ball (min): {min(ankle_dists):.2f} m (3D)")
+
+        force_xy = float(
+            soccer_ball_contact_force_magnitude(base_env, _BALL_SENSOR_NAME)[i].item()
+        )
+        force_vec = soccer_ball_contact_net_force_w(base_env, _BALL_SENSOR_NAME)[i].detach().cpu().numpy()
+        force_z = float(abs(force_vec[2]))
+        sim_touch = force_xy > _CONTACT_FORCE_THRESHOLD
+
+        nearest = "-"
+        if sim_touch:
+            all_body_cfg = SceneEntityCfg("robot", body_names=_HUD_CONTACT_BODIES)
+            has_contact, _, closest_idx = _identify_contact_body(
+                base_env, cmd, _BALL_SENSOR_NAME, all_body_cfg
+            )
+            if bool(has_contact[i].item()):
+                nearest = _HUD_CONTACT_BODIES[int(closest_idx[i].item())]
+
+        lines.append(
+            f"Robot-Ball: {'YES' if sim_touch else 'NO'}  |  "
+            f"F_xy={force_xy:.1f} N  |  F_z~{force_z:.1f} N (ground)"
+        )
+        if sim_touch:
+            lines.append(f"  nearest body: {nearest}")
+
+        if hasattr(cmd, "motion_has_dribble_cg_label") and bool(cmd.motion_has_dribble_cg_label[i].item()):
+            ref_contact = bool(cmd.dribble_cg_contact_ref[i].item())
+            ref_foot = int(cmd.dribble_cg_foot_ref[i].item())
+            foot_lbl = {0: "L", 1: "R"}.get(ref_foot, "-")
+            match = "ok" if ref_contact == sim_touch else "MISMATCH"
+            lines.append(
+                f"CG label: contact={int(ref_contact)} foot={foot_lbl}  ({match})"
+            )
+            if hasattr(cmd, "dribble_cg_foot_ball_dist_ref"):
+                demo_dist = float(cmd.dribble_cg_foot_ball_dist_ref[i].item())
+                if demo_dist >= 0.0 and ref_foot in (0, 1):
+                    foot_name = _HUD_ANKLE_BODIES[1] if ref_foot == 0 else _HUD_ANKLE_BODIES[0]
+                    if foot_name in robot.body_names:
+                        bidx = robot.body_names.index(foot_name)
+                        fpos = robot.data.body_pos_w[i, bidx].detach().cpu().numpy()
+                        sim_dist = float(np.linalg.norm(fpos - ball_pos))
+                        lines.append(
+                            f"Foot-Ball: sim {sim_dist:.2f} m  |  demo {demo_dist:.2f} m"
+                        )
+        elif hasattr(cmd, "kick_frame"):
+            kf = int(cmd.kick_frame[i].item())
+            margin = 5
+            if kf < 0:
+                lines.append("Kick CG: no annotation")
+            elif t < kf - margin:
+                lines.append(f"Kick CG: 0 (approach)  |  kick_frame={kf}")
+            else:
+                lines.append(f"Kick CG: 1 (kick)  |  kick_frame={kf}")
+
     except Exception as e:
-        return f"Step: {timestep}\nCG: error ({e})"
+        lines.append(f"HUD error: {e}")
+
+    return "\n".join(lines)
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
@@ -346,9 +443,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # env stepping
             obs, _, _, _ = env.step(actions)
 
-        # Capture frame for dual-view recording with CG overlay.
+        # Capture frame for dual-view recording with play HUD overlay.
         if dual_recorder is not None:
-            overlay = _get_cg_overlay(env, timestep)
+            overlay = _get_play_overlay(env, timestep)
             dual_recorder.capture(overlay_text=overlay)
 
         if args_cli.video or args_cli.dual_view:

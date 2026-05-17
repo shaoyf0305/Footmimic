@@ -29,10 +29,10 @@ def Xform "SoccerBall" (
         # 关键：碰撞和物理材质设置
         uniform token physics:collisionEnabled = "on"
         
-        # 弹性属性 - 必须设置
-        float physics:restitution = 1.0      # 弹性系数
-        float physics:dynamicFriction = 0.1  # 动态摩擦
-        float physics:staticFriction = 0.1   # 静态摩擦
+        # 弹性 / 摩擦（盘带需要明显减速，避免一脚滑行长期拿速度 reward）
+        float physics:restitution = 0.28
+        float physics:dynamicFriction = 0.62
+        float physics:staticFriction = 0.68
         
         # 外观
         color3f[] primvars:displayColor = [(0.2, 0.6, 0.9)]

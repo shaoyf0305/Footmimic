@@ -12,6 +12,7 @@ Inherits proximity-level tracking and adds dribbling-specific rewards:
   - ``ball_lost`` and tighter ``dribbling_no_contact`` termination
 """
 
+import isaaclab.sim as sim_utils
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -37,6 +38,20 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # Ball-on-ground: USD had mu~0.1 and restitution 1.0 → long coast after one kick.
+        # Pair higher friction with moderate bounce; add linear damping on the ball body.
+        self.scene.terrain.physics_material = self.scene.terrain.physics_material.replace(
+            restitution=0.32,
+            static_friction=1.0,
+            dynamic_friction=0.95,
+        )
+        self.scene.soccer_ball.spawn = self.scene.soccer_ball.spawn.replace(
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                linear_damping=0.28,
+                angular_damping=0.18,
+            ),
+        )
 
         # Slightly relax imitation so the policy can deviate toward the ball while
         # keeping torso/gait reference (touch-related rewards provide the main ball signal).
@@ -104,10 +119,10 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "command_name": "motion",
                 "std": 1.0,
                 "pelvis_speed_min": 0.14,
-                "ball_speed_min": 0.0,
-                # Ball–pelvis velocity match only counts after real contact (forces touches
-                # instead of orbiting with a static ball).
+                "ball_speed_min": 0.10,
+                # Velocity match only within a short window after a real touch (not coasting).
                 "require_contact": True,
+                "recent_contact_window": 12,
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
             },
@@ -124,8 +139,8 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "pelvis_speed_min": 0.14,
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
-                # In the "ball in front" corridor, do not pay full proximity without a touch.
-                "no_contact_zone_damping": 0.28,
+                # In the "ball in front" corridor, strongly cut proximity without a touch.
+                "no_contact_zone_damping": 0.12,
                 "zone_lateral_abs_max": 0.18,
             },
         )
@@ -166,10 +181,21 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_ball_speed_excess = RewTerm(
             func=mdp.dribbling_ball_xy_speed_excess_penalty,
-            weight=-1.5,
+            weight=-2.5,
             params={
-                "speed_cap": 4.2,
-                "linear_scale": 1.5,
+                "speed_cap": 2.8,
+                "linear_scale": 1.2,
+            },
+        )
+
+        self.rewards.dribbling_ball_coast_penalty = RewTerm(
+            func=mdp.dribbling_ball_coast_without_contact_penalty,
+            weight=-5.0,
+            params={
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "speed_threshold": 0.30,
+                "speed_scale": 0.40,
             },
         )
 
@@ -184,7 +210,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 0.5,
                 "require_recent_contact": True,
-                "recent_contact_window": 10,
+                "recent_contact_window": 8,
             },
         )
 
@@ -254,7 +280,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
                 "grace_steps": 50,
-                "max_steps_without_contact": 40,
+                "max_steps_without_contact": 28,
             },
         )
 

@@ -7,12 +7,15 @@ The original file remains unchanged. The current training pipeline (for example,
 
 Usage examples::
 
-	python kick_motion_label.py motions/football-kjp --label left
+	python kick_motion_label.py motions/soccerkicks --label right \\
+	    --output-dir motions/soccerkicks-side
 	python kick_motion_label.py motion_a.npz motion_b.npz --label right --overwrite
 
 The script accepts individual files or directories. When a directory is
 provided, every ``.npz`` file in it is processed (use ``--recursive`` to
-recurse into subfolders).
+recurse into subfolders). Use ``--output-dir`` to write labeled copies into
+a separate folder (basename only, or mirrored subpaths when a single
+directory target is used with ``--recursive``).
 """
 
 from __future__ import annotations
@@ -86,23 +89,72 @@ def write_npz_payload(path: str, payload: dict[str, np.ndarray]) -> None:
 			os.remove(tmp_path)
 
 
-def build_output_path(path: str, label: str) -> str:
-	base, ext = os.path.splitext(path)
+def _strip_leg_suffix(stem: str) -> str:
 	for suffix in ("_left", "_right"):
-		if base.endswith(suffix):
-			base = base[: -len(suffix)]
-			break
-	return f"{base}_{label}{ext}"
+		if stem.endswith(suffix):
+			return stem[: -len(suffix)]
+	return stem
+
+
+def build_output_path(
+	path: str,
+	label: str,
+	*,
+	output_dir: str | None = None,
+	input_root: str | None = None,
+) -> str:
+	"""Return destination path for a labeled copy of *path*."""
+
+	_, ext = os.path.splitext(path)
+	stem = _strip_leg_suffix(os.path.splitext(os.path.basename(path))[0])
+	filename = f"{stem}_{label}{ext}"
+
+	if output_dir is None:
+		base, _ = os.path.splitext(path)
+		base = _strip_leg_suffix(base)
+		return f"{base}_{label}{ext}"
+
+	out_root = os.path.abspath(output_dir)
+	if input_root is not None:
+		src = os.path.abspath(path)
+		root = os.path.abspath(input_root)
+		rel_dir = os.path.dirname(os.path.relpath(src, root))
+		if rel_dir and rel_dir != ".":
+			return os.path.join(out_root, rel_dir, filename)
+	return os.path.join(out_root, filename)
+
+
+def resolve_input_root(targets: Iterable[str], files: list[str]) -> str | None:
+	"""Directory target to mirror under ``--output-dir`` (single dir only)."""
+
+	dir_targets = [
+		os.path.abspath(t)
+		for t in targets
+		if os.path.isdir(os.path.abspath(t))
+	]
+	if len(dir_targets) != 1:
+		return None
+	root = dir_targets[0]
+	for path in files:
+		try:
+			os.path.relpath(os.path.abspath(path), root)
+		except ValueError:
+			return None
+	return root
 
 
 def update_label(path: str, label: str, *,
 				 kick_start_frame: int | None = None,
 				 kick_end_frame: int | None = None,
+				 output_dir: str | None = None,
+				 input_root: str | None = None,
 				 dry_run: bool, overwrite: bool) -> tuple[str, str]:
 	"""Write the labeled copy for *path*. Returns status and output path."""
 
 	payload, prior_label = load_npz_payload(path)
-	output_path = build_output_path(path, label)
+	output_path = build_output_path(
+		path, label, output_dir=output_dir, input_root=input_root,
+	)
 
 	existed_before = os.path.exists(output_path)
 	if existed_before and not overwrite:
@@ -120,6 +172,7 @@ def update_label(path: str, label: str, *,
 	if dry_run:
 		return "dry-run", output_path
 
+	os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 	write_npz_payload(output_path, payload)
 	status = "overwritten" if existed_before else "written"
 	return status, output_path
@@ -165,6 +218,16 @@ def parse_args() -> argparse.Namespace:
 		action="store_true",
 		help="Allow overwriting existing labeled copies or conflicting labels.",
 	)
+	parser.add_argument(
+		"--output-dir",
+		type=str,
+		default=None,
+		help=(
+			"Write labeled copies here instead of next to the source file "
+			"(e.g. motions/soccerkicks-side). With a single directory target "
+			"and --recursive, subfolder layout is preserved under this path."
+		),
+	)
 	return parser.parse_args()
 
 
@@ -178,7 +241,12 @@ def main() -> None:
 	if not files:
 		raise SystemExit("[INFO] No NPZ files found. Nothing to do.")
 
+	output_dir = os.path.abspath(args.output_dir) if args.output_dir else None
+	input_root = resolve_input_root(args.targets, files) if output_dir else None
+
 	print(f"[INFO] Processing {len(files)} motion file(s) with label '{args.label}'.")
+	if output_dir:
+		print(f"[INFO] Output directory: {output_dir}")
 	if args.dry_run:
 		print("[INFO] Running in dry-run mode; no files will be modified.")
 
@@ -187,6 +255,8 @@ def main() -> None:
 			path, args.label,
 			kick_start_frame=args.kick_start_frame,
 			kick_end_frame=args.kick_end_frame,
+			output_dir=output_dir,
+			input_root=input_root,
 			dry_run=args.dry_run, overwrite=args.overwrite,
 		)
 		print(f"  - {path} -> {output_path}: {status}")
