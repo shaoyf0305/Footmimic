@@ -42,7 +42,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
         # Ball-on-ground: USD had mu~0.1 and restitution 1.0 → long coast after one kick.
         # Pair higher friction with moderate bounce; add linear damping on the ball body.
         self.scene.terrain.physics_material = self.scene.terrain.physics_material.replace(
-            restitution=0.32,
+            restitution=0.22,
             static_friction=1.0,
             dynamic_friction=0.95,
         )
@@ -122,7 +122,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "ball_speed_min": 0.10,
                 # Velocity match only within a short window after a real touch (not coasting).
                 "require_contact": True,
-                "recent_contact_window": 12,
+                "recent_contact_window": 8,
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
             },
@@ -190,12 +190,42 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_ball_coast_penalty = RewTerm(
             func=mdp.dribbling_ball_coast_without_contact_penalty,
-            weight=-5.0,
+            weight=-2.0,
             params={
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
-                "speed_threshold": 0.30,
-                "speed_scale": 0.40,
+                "speed_threshold": 0.55,
+                "speed_scale": 0.50,
+            },
+        )
+
+        self.rewards.dribbling_ball_trapped_penalty = RewTerm(
+            func=mdp.dribbling_ball_trapped_penalty,
+            weight=-4.5,
+            params={
+                "command_name": "motion",
+                "min_forward_x": 0.18,
+                "max_ball_height": 0.20,
+            },
+        )
+
+        self.rewards.dribbling_sustained_contact_penalty = RewTerm(
+            func=mdp.dribbling_sustained_contact_penalty,
+            weight=-3.5,
+            params={
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "max_contact_steps": 5,
+            },
+        )
+
+        self.rewards.dribbling_ball_bounce_penalty = RewTerm(
+            func=mdp.dribbling_ball_bounce_penalty,
+            weight=-3.0,
+            params={
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "vz_threshold": 0.32,
             },
         )
 
@@ -229,7 +259,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_legal_foot_touch = RewTerm(
             func=mdp.dribbling_legal_foot_touch,
-            weight=9.0,
+            weight=3.5,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
@@ -280,7 +310,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
                 "grace_steps": 50,
-                "max_steps_without_contact": 28,
+                "max_steps_without_contact": 50,
             },
         )
 
@@ -408,7 +438,16 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
         )
         self.rewards.dribbling_cg_contact_consistency = RewTerm(
             func=mdp.dribbling_cg_contact_consistency,
-            weight=0.0,
+            weight=5.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+            },
+        )
+        self.rewards.dribbling_cg_premature_contact = RewTerm(
+            func=mdp.dribbling_cg_premature_contact_penalty,
+            weight=-6.0,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
@@ -424,6 +463,11 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
                 "all_body_cfg": cg_body_cfg,
             },
         )
+
+        # CG-labeled clips: touch / velocity rewards only on annotated contact frames.
+        self.rewards.dribbling_velocity_tracking.params["cg_gated_contact"] = True
+        self.rewards.dribbling_ball_forward_progress.params["cg_gated_contact"] = True
+        self.rewards.dribbling_legal_foot_touch.params["cg_gated"] = True
 
 
 @configclass

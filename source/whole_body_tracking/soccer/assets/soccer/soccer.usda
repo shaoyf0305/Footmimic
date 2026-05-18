@@ -30,7 +30,7 @@ def Xform "SoccerBall" (
         uniform token physics:collisionEnabled = "on"
         
         # 弹性 / 摩擦（盘带需要明显减速，避免一脚滑行长期拿速度 reward）
-        float physics:restitution = 0.28
+        float physics:restitution = 0.18
         float physics:dynamicFriction = 0.62
         float physics:staticFriction = 0.68
         
