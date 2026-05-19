@@ -49,22 +49,30 @@ def forward_velocity_reward(
     target_speed: float = 0.8,
     std: float = 0.4,
     command_name: str = "motion",
+    velocity_frame: str = "world",
 ) -> torch.Tensor:
-    """Reward when pelvis forward speed (local +x) matches ``target_speed``.
+    """Reward pelvis speed along the task forward axis matching ``target_speed``.
 
-    Independent of the motion's world trajectory: the only objective is "walk forward
-    at roughly ``target_speed`` m/s in the direction the robot is currently facing".
-    Use as a Stage-1 locomotion objective when the motion's global anchor tracking is
-    turned off (e.g. for slalom-around-cones demos that we do **not** want to copy).
+    Default ``velocity_frame="world"`` uses world +X (non-negative) so the robot is
+    encouraged to advance along the field axis instead of orbiting in place while
+    keeping high body-frame forward speed.
+
+    Set ``velocity_frame="pelvis"`` to restore the legacy local +X objective (speed
+    along the direction the robot is currently facing).
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     robot = command.robot
     pelvis_index = robot.body_names.index("pelvis")
 
-    pelvis_quat_w = robot.data.body_quat_w[:, pelvis_index]
     pelvis_lin_vel_w = robot.data.body_lin_vel_w[:, pelvis_index]
-    pelvis_lin_vel_local = quat_apply(quat_inv(pelvis_quat_w), pelvis_lin_vel_w)
-    forward_speed = pelvis_lin_vel_local[:, 0]
+    if velocity_frame == "world":
+        forward_speed = torch.clamp(pelvis_lin_vel_w[:, 0], min=0.0)
+    elif velocity_frame == "pelvis":
+        pelvis_quat_w = robot.data.body_quat_w[:, pelvis_index]
+        pelvis_lin_vel_local = quat_apply(quat_inv(pelvis_quat_w), pelvis_lin_vel_w)
+        forward_speed = pelvis_lin_vel_local[:, 0]
+    else:
+        raise ValueError(f"Unsupported velocity_frame={velocity_frame!r}; use 'world' or 'pelvis'.")
 
     error = (forward_speed - target_speed) ** 2
     return torch.exp(-error / max(std, 1e-6) ** 2)
@@ -73,20 +81,32 @@ def forward_velocity_reward(
 def lateral_velocity_penalty(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
+    velocity_frame: str = "world",
+    lateral_deadzone: float = 0.12,
+    lateral_scale: float = 0.4,
 ) -> torch.Tensor:
-    """Squared pelvis lateral speed (local +y) — for penalising sideways drift.
+    """Soft penalty for pelvis lateral speed (world +Y by default).
 
-    Apply with a negative weight. Complements :func:`forward_velocity_reward` to push
-    the policy to walk straight forward rather than crab-walk sideways.
+    Only speeds above ``lateral_deadzone`` (m/s) are penalised, so small sideways
+    adjustments needed for dribbling are allowed. Apply with a negative weight.
+    Complements :func:`forward_velocity_reward` when ``velocity_frame="world"``.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     robot = command.robot
     pelvis_index = robot.body_names.index("pelvis")
 
-    pelvis_quat_w = robot.data.body_quat_w[:, pelvis_index]
     pelvis_lin_vel_w = robot.data.body_lin_vel_w[:, pelvis_index]
-    pelvis_lin_vel_local = quat_apply(quat_inv(pelvis_quat_w), pelvis_lin_vel_w)
-    return pelvis_lin_vel_local[:, 1] ** 2
+    if velocity_frame == "world":
+        lateral_speed = pelvis_lin_vel_w[:, 1]
+    elif velocity_frame == "pelvis":
+        pelvis_quat_w = robot.data.body_quat_w[:, pelvis_index]
+        pelvis_lin_vel_local = quat_apply(quat_inv(pelvis_quat_w), pelvis_lin_vel_w)
+        lateral_speed = pelvis_lin_vel_local[:, 1]
+    else:
+        raise ValueError(f"Unsupported velocity_frame={velocity_frame!r}; use 'world' or 'pelvis'.")
+
+    excess = torch.clamp(torch.abs(lateral_speed) - lateral_deadzone, min=0.0)
+    return torch.square(excess / max(lateral_scale, 1e-6))
 
 
 def waist_action_rate_l2_clip(env: ManagerBasedRLEnv, waist_cfg: SceneEntityCfg | None = None) -> torch.Tensor:

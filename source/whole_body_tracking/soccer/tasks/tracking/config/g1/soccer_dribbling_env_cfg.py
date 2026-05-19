@@ -2,7 +2,7 @@
 
 Inherits proximity-level tracking and adds dribbling-specific rewards:
   - velocity / proximity gates (anti static exploit); velocity match requires contact
-  - forward-progress + explicit pelvis forward-speed shaping
+  - forward-progress + world +X pelvis forward-speed shaping (soft world +Y crab cap)
   - optional dense foot–ball approach when not in contact (disabled for CG variant)
   - pelvis orientation vs motion reference (anti lean-back / arched torso)
   - ball horizontal speed excess penalty; anti-trap / anti-sustained-contact penalties
@@ -95,12 +95,18 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "command_name": "motion",
                 "target_speed": 0.55,
                 "std": 0.35,
+                "velocity_frame": "world",
             },
         )
         self.rewards.lateral_velocity_penalty = RewTerm(
             func=mdp.lateral_velocity_penalty,
-            weight=-0.8,
-            params={"command_name": "motion"},
+            weight=-0.35,
+            params={
+                "command_name": "motion",
+                "velocity_frame": "world",
+                "lateral_deadzone": 0.15,
+                "lateral_scale": 0.45,
+            },
         )
 
         mode = str(self.dribble_contact_mode).lower().strip()
@@ -549,10 +555,16 @@ class G1FlatMotionCGPretrainEnvCfg(G1FlatMotionEnvCfg):
                 "command_name": "motion",
                 "target_speed": 0.8,
                 "std": 0.4,
+                "velocity_frame": "world",
             },
         )
         self.rewards.lateral_velocity_penalty = RewTerm(
             func=mdp.lateral_velocity_penalty,
-            weight=-0.5,
-            params={"command_name": "motion"},
+            weight=-0.3,
+            params={
+                "command_name": "motion",
+                "velocity_frame": "world",
+                "lateral_deadzone": 0.12,
+                "lateral_scale": 0.4,
+            },
         )
