@@ -2,13 +2,13 @@
 
 Inherits proximity-level tracking and adds dribbling-specific rewards:
   - velocity / proximity gates (anti static exploit); velocity match requires contact
-  - forward-progress reward: ball must move forward in pelvis-local frame
-  - dense foot–ball approach when not in contact (stronger weight, lower speed gate)
+  - forward-progress + explicit pelvis forward-speed shaping
+  - optional dense foot–ball approach when not in contact (disabled for CG variant)
   - pelvis orientation vs motion reference (anti lean-back / arched torso)
-  - ball horizontal speed excess penalty
+  - ball horizontal speed excess penalty; anti-trap / anti-sustained-contact penalties
   - ankle-based gentle touch / hard-hit EMA / non-ankle contact penalty (no ``kick_leg``)
   - anti-orbit penalty; proximity damped in forward corridor without contact; stall penalty
-  - slightly relaxed imitation weights to favour reaching the ball
+  - slightly relaxed imitation weights; reduced global body velocity tracking (slalom bleed)
   - ``ball_lost`` and tighter ``dribbling_no_contact`` termination
 """
 
@@ -48,7 +48,8 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
         )
         self.scene.soccer_ball.spawn = self.scene.soccer_ball.spawn.replace(
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                linear_damping=0.28,
+                # Slightly lower damping so the ball rolls between discrete touches.
+                linear_damping=0.18,
                 angular_damping=0.18,
             ),
         )
@@ -59,6 +60,14 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             self.rewards.motion_body_pos.weight = 0.72
         if hasattr(self.rewards, "motion_foot_pos"):
             self.rewards.motion_foot_pos.weight = 0.65
+        # Slalom demos bleed low forward speed into body velocity tracking — down-weight.
+        if hasattr(self.rewards, "motion_body_lin_vel"):
+            self.rewards.motion_body_lin_vel.weight = 0.3
+        if hasattr(self.rewards, "motion_body_ang_vel"):
+            self.rewards.motion_body_ang_vel.weight = 0.3
+        # Kick-style frozen proximity is not used for dribbling.
+        if hasattr(self.rewards, "target_point_proximity"):
+            self.rewards.target_point_proximity.weight = 0.0
 
         # Stronger upright / anti-arch than generic proximity alone
         if hasattr(self.rewards, "pelvis_orientation"):
@@ -77,6 +86,21 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "command_name": "motion",
                 "min_distance": 0.05,
             },
+        )
+
+        self.rewards.forward_velocity = RewTerm(
+            func=mdp.forward_velocity_reward,
+            weight=3.0,
+            params={
+                "command_name": "motion",
+                "target_speed": 0.55,
+                "std": 0.35,
+            },
+        )
+        self.rewards.lateral_velocity_penalty = RewTerm(
+            func=mdp.lateral_velocity_penalty,
+            weight=-0.8,
+            params={"command_name": "motion"},
         )
 
         mode = str(self.dribble_contact_mode).lower().strip()
@@ -118,8 +142,8 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             params={
                 "command_name": "motion",
                 "std": 1.0,
-                "pelvis_speed_min": 0.14,
-                "ball_speed_min": 0.10,
+                "pelvis_speed_min": 0.35,
+                "ball_speed_min": 0.12,
                 # Velocity match only within a short window after a real touch (not coasting).
                 "require_contact": True,
                 "recent_contact_window": 8,
@@ -130,13 +154,13 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_dynamic_proximity = RewTerm(
             func=mdp.dribbling_dynamic_proximity,
-            weight=5.0,
+            weight=4.5,
             params={
                 "command_name": "motion",
-                "near_dist": 0.2,
-                "far_dist": 0.5,
+                "near_dist": 0.30,
+                "far_dist": 0.62,
                 "penalty_std": 0.15,
-                "pelvis_speed_min": 0.14,
+                "pelvis_speed_min": 0.35,
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
                 # In the "ball in front" corridor, strongly cut proximity without a touch.
@@ -157,16 +181,17 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             },
         )
 
+        # Non-CG dribbling only: CG variant sets weight=0 (foot–ball distance labels cover contact).
         self.rewards.dribbling_approach_foot_ball = RewTerm(
             func=mdp.dribbling_approach_foot_ball_distance,
-            weight=7.0,
+            weight=3.0,
             params={
                 "command_name": "motion",
                 "foot_cfg": _foot_cfg,
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
-                "std": 0.22,
-                "pelvis_speed_min": 0.05,
+                "std": 0.25,
+                "pelvis_speed_min": 0.12,
             },
         )
 
@@ -190,32 +215,32 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_ball_coast_penalty = RewTerm(
             func=mdp.dribbling_ball_coast_without_contact_penalty,
-            weight=-2.0,
+            weight=-2.8,
             params={
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
-                "speed_threshold": 0.55,
-                "speed_scale": 0.50,
+                "speed_threshold": 0.45,
+                "speed_scale": 0.40,
             },
         )
 
         self.rewards.dribbling_ball_trapped_penalty = RewTerm(
             func=mdp.dribbling_ball_trapped_penalty,
-            weight=-4.5,
+            weight=-8.0,
             params={
                 "command_name": "motion",
-                "min_forward_x": 0.18,
+                "min_forward_x": 0.32,
                 "max_ball_height": 0.20,
             },
         )
 
         self.rewards.dribbling_sustained_contact_penalty = RewTerm(
             func=mdp.dribbling_sustained_contact_penalty,
-            weight=-3.5,
+            weight=-6.0,
             params={
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
-                "max_contact_steps": 5,
+                "max_contact_steps": 3,
             },
         )
 
@@ -231,12 +256,12 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_ball_forward_progress = RewTerm(
             func=mdp.dribbling_ball_forward_progress_reward,
-            weight=5.5,
+            weight=7.5,
             params={
                 "command_name": "motion",
-                "min_forward_speed": 0.24,
-                "speed_scale": 0.25,
-                "pelvis_speed_min": 0.06,
+                "min_forward_speed": 0.42,
+                "speed_scale": 0.22,
+                "pelvis_speed_min": 0.25,
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 0.5,
                 "require_recent_contact": True,
@@ -259,7 +284,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_legal_foot_touch = RewTerm(
             func=mdp.dribbling_legal_foot_touch,
-            weight=3.5,
+            weight=7.0,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
@@ -429,10 +454,10 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
         # Run scripts/rsl_rl/synthesize_dribble_ball_traj.py on labeled motions first.
         self.rewards.dribbling_cg_foot_ball_distance = RewTerm(
             func=mdp.dribbling_cg_foot_ball_distance_exp,
-            weight=6.0,
+            weight=3.5,
             params={
                 "command_name": "motion",
-                "std": 0.12,
+                "std": 0.22,
                 "use_xy_only": True,
             },
         )
@@ -464,9 +489,12 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
             },
         )
 
-        # CG-labeled clips: touch / velocity rewards only on annotated contact frames.
-        self.rewards.dribbling_velocity_tracking.params["cg_gated_contact"] = True
-        self.rewards.dribbling_ball_forward_progress.params["cg_gated_contact"] = True
+        # CG: no dense "hover foot on ball" between touches — proximity + contact labels suffice.
+        self.rewards.dribbling_approach_foot_ball.weight = 0.0
+
+        # Velocity / forward progress use recent sim contact, not only labeled CG frames.
+        self.rewards.dribbling_velocity_tracking.params["cg_gated_contact"] = False
+        self.rewards.dribbling_ball_forward_progress.params["cg_gated_contact"] = False
         self.rewards.dribbling_legal_foot_touch.params["cg_gated"] = True
 
 
