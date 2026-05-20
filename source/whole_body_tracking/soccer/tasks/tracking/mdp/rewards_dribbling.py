@@ -795,6 +795,81 @@ def dribbling_legal_foot_touch(
     return new_touch.to(torch.float32)
 
 
+def dribbling_instep_touch_alignment(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    force_threshold: float = 20.0,
+    all_body_cfg: SceneEntityCfg | None = None,
+    num_ankle_links: int = 2,
+    min_alignment: float = 0.25,
+    cg_gated: bool = False,
+) -> torch.Tensor:
+    """Bonus on a new gentle touch when the foot instep (medial side) faces the ball.
+
+    Encourages inside/outside instep passes instead of toe pokes. Axis convention
+    follows G1 ankle-roll links; verify in sim if alignment looks inverted.
+    """
+    if all_body_cfg is None:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    has_contact, force_mag, closest_idx = _identify_contact_body(
+        env, command, ball_sensor_name, all_body_cfg,
+    )
+    is_ankle = _is_dribble_legal_ankle_contact(closest_idx, num_ankle_links)
+    gentle = force_mag <= force_threshold
+    touch = has_contact & is_ankle & gentle
+    if cg_gated:
+        touch = _dribbling_cg_gated_sim_contact(command, touch)
+
+    prev_name = "_dribbling_prev_instep_touch"
+    prev = getattr(env, prev_name, None)
+    if prev is None or prev.shape[0] != env.num_envs:
+        prev = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    new_touch = touch & ~prev
+    setattr(env, prev_name, touch.detach().clone())
+
+    robot = env.scene[all_body_cfg.name]
+    soccer_ball = env.scene["soccer_ball"]
+    cache_name = "_dribbling_body_indices_cache"
+    cached = getattr(env, cache_name, None)
+    names_t = tuple(all_body_cfg.body_names)
+    if cached is None or cached.get("names") != names_t:
+        body_indices = torch.as_tensor(
+            robot.find_bodies(all_body_cfg.body_names, preserve_order=True)[0],
+            dtype=torch.long,
+            device=env.device,
+        )
+        setattr(env, cache_name, {"names": names_t, "idx": body_indices})
+    body_indices = getattr(env, cache_name)["idx"]
+
+    num_envs = env.num_envs
+    env_ids = torch.arange(num_envs, device=env.device)
+    bi = body_indices[closest_idx]
+    foot_quat = robot.data.body_quat_w[env_ids, bi]
+    foot_pos = robot.data.body_pos_w[env_ids, bi]
+    ball_pos = soccer_ball.data.root_pos_w
+
+    is_left = torch.tensor(
+        ["left" in name for name in all_body_cfg.body_names],
+        device=env.device,
+        dtype=torch.bool,
+    )
+    local_medial = torch.zeros(num_envs, 3, device=env.device, dtype=foot_quat.dtype)
+    local_medial[:, 1] = torch.where(is_left[closest_idx], 1.0, -1.0)
+    instep_dir = quat_apply(foot_quat, local_medial)
+
+    to_ball = ball_pos - foot_pos
+    to_ball_xy = to_ball[:, :2]
+    instep_xy = instep_dir[:, :2]
+    cos_align = torch.sum(instep_xy * to_ball_xy, dim=-1) / (
+        torch.norm(instep_xy, dim=-1).clamp(min=1e-6) * torch.norm(to_ball_xy, dim=-1).clamp(min=1e-6)
+    )
+    reward = torch.clamp((cos_align - min_alignment) / (1.0 - min_alignment + 1e-6), 0.0, 1.0)
+    return reward * new_touch.to(reward.dtype)
+
+
 # ---------------------------------------------------------------------------
 # 3b) Micro-Contact Filter — moderate EMA penalty for legal foot hard kicks
 # ---------------------------------------------------------------------------

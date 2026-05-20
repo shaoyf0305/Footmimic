@@ -391,19 +391,44 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             func=mdp.ball_lost_dribbling,
             params={
                 "command_name": "motion",
-                "max_distance": 1.0,
-                "max_vel_divergence": 2.0,
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "max_distance": 1.25,
+                "max_distance_chase": 1.85,
+                "max_vel_divergence": 3.5,
                 "grace_steps": 50,
+                "recent_contact_window": 8,
+                "chase_min_ahead": 0.35,
+                "approach_max_dist": 0.55,
+                "approach_ball_speed_max": 0.35,
             },
         )
 
         self.terminations.dribbling_no_contact = DoneTerm(
             func=mdp.dribbling_no_ball_contact_timeout,
             params={
+                "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
                 "grace_steps": 50,
-                "max_steps_without_contact": 50,
+                "max_steps_without_contact": 200,
+                "recent_contact_window": 8,
+                "chase_min_ahead": 0.35,
+                "approach_max_dist": 0.55,
+                "approach_ball_speed_max": 0.35,
+            },
+        )
+
+        self.rewards.dribbling_instep_touch_alignment = RewTerm(
+            func=mdp.dribbling_instep_touch_alignment,
+            weight=1.2,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "force_threshold": 22.0,
+                "all_body_cfg": _contact_body_cfg,
+                "num_ankle_links": _num_ankle_links,
+                "min_alignment": 0.25,
             },
         )
 

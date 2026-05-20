@@ -88,6 +88,26 @@ def forward_dominance_gate(dominance: torch.Tensor, min_dominance: float) -> tor
     return torch.clamp((dominance - min_dominance) / (1.0 - min_dominance + 1e-6), min=0.0, max=1.0)
 
 
+def compute_dribble_phase_masks(
+    has_contact: torch.Tensor,
+    recent_contact: torch.Tensor,
+    x_ahead: torch.Tensor,
+    dist_xy: torch.Tensor,
+    ball_speed_xy: torch.Tensor,
+    *,
+    chase_min_ahead: float = 0.35,
+    approach_max_dist: float = 0.55,
+    approach_ball_speed_max: float = 0.35,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Boolean masks for touch / chase / approach (same rules as phased forward speed)."""
+    touch_phase = has_contact | (recent_contact > 0.5)
+    chase_phase = (~touch_phase) & (x_ahead >= chase_min_ahead) & (dist_xy > approach_max_dist)
+    approach_phase = (~touch_phase) & (~chase_phase) & (
+        (dist_xy <= approach_max_dist) | (ball_speed_xy <= approach_ball_speed_max)
+    )
+    return touch_phase, chase_phase, approach_phase
+
+
 def compute_dribble_phase_target_speed(
     has_contact: torch.Tensor,
     recent_contact: torch.Tensor,
@@ -102,16 +122,16 @@ def compute_dribble_phase_target_speed(
     approach_max_dist: float = 0.55,
     approach_ball_speed_max: float = 0.35,
 ) -> torch.Tensor:
-    """Three-phase pelvis forward speed target for kick → chase → approach.
-
-    Phase A (touch): contact or recent touch — low speed for control.
-    Phase B (chase): ball ahead on +X and not yet close — sprint to catch up.
-    Phase C (approach): ball near or slow, no contact — moderate speed before next touch.
-    """
-    touch_phase = has_contact | (recent_contact > 0.5)
-    chase_phase = (~touch_phase) & (x_ahead >= chase_min_ahead) & (dist_xy > approach_max_dist)
-    approach_phase = (~touch_phase) & (~chase_phase) & (
-        (dist_xy <= approach_max_dist) | (ball_speed_xy <= approach_ball_speed_max)
+    """Three-phase pelvis forward speed target for kick → chase → approach."""
+    touch_phase, chase_phase, approach_phase = compute_dribble_phase_masks(
+        has_contact,
+        recent_contact,
+        x_ahead,
+        dist_xy,
+        ball_speed_xy,
+        chase_min_ahead=chase_min_ahead,
+        approach_max_dist=approach_max_dist,
+        approach_ball_speed_max=approach_ball_speed_max,
     )
 
     target = torch.full_like(x_ahead, v_approach)
