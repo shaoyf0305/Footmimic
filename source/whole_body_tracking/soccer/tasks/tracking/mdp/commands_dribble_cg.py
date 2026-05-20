@@ -1,6 +1,8 @@
 """Dribbling motion command with XGen-style demo ball stitching.
 
-Uses per-frame ``ball_pos_w`` from motion (when present) and the same yaw-only
+Uses per-frame ``ball_pos_w`` from motion for labels; ball spawn / physics use the
+task frame (+X forward). Optional demo kinematic snap is disabled when
+``dribble_cg_use_task_frame`` is True. Legacy yaw-only
 anchor transform as body tracking targets so the ball follows the stitched
 interaction trajectory. Optional ``dribble_cg_snap_mode``:
 
@@ -22,6 +24,8 @@ import torch
 from isaaclab.managers import CommandTermCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_apply, quat_inv, quat_mul, yaw_quat
+
+from soccer.tasks.tracking.mdp.task_frame import spawn_ball_ahead_env_local
 
 from .commands_multi_motion_soccer import MotionCommand, MotionCommandCfg
 
@@ -89,27 +93,15 @@ class DribbleCGMotionCommand(MotionCommand):
         return has_demo
 
     def _front_ball_positions(self, env_ids: torch.Tensor) -> torch.Tensor:
-        """Env-local ball positions in front of the motion's starting anchor."""
+        """Env-local ball on task +X ahead of the motion's starting anchor."""
         mi = self.motion_idx[env_ids]
         first_anchor = self.motion._body_pos_w[mi, 0, self.motion_anchor_body_index]
-        first_quat = self.motion._body_quat_w[mi, 0, self.motion_anchor_body_index]
-
-        forward = quat_apply(
-            yaw_quat(first_quat),
-            torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=first_anchor.dtype).expand(env_ids.numel(), -1),
-        )
-        lateral = quat_apply(
-            yaw_quat(first_quat),
-            torch.tensor([0.0, 1.0, 0.0], device=self.device, dtype=first_anchor.dtype).expand(env_ids.numel(), -1),
-        )
 
         distance = float(getattr(self.cfg, "dribble_cg_front_ball_distance", 0.45))
         lateral_offset = float(getattr(self.cfg, "dribble_cg_front_ball_lateral_offset", 0.0))
         height = float(getattr(self.cfg, "dribble_cg_front_ball_height", self._target_height))
 
-        ball_pos = first_anchor + distance * forward + lateral_offset * lateral
-        ball_pos[:, 2] = height
-        return ball_pos
+        return spawn_ball_ahead_env_local(first_anchor, distance, lateral_offset, height)
 
     def _compute_soccer_ball_positions(self, env_ids: Sequence[int] | torch.Tensor):
         ids = self._to_env_id_tensor(env_ids)
@@ -127,11 +119,13 @@ class DribbleCGMotionCommand(MotionCommand):
             else:
                 super()._compute_soccer_ball_positions(fallback_ids)
         if demo_ids.numel() > 0:
-            env_origins = self._env.scene.env_origins[demo_ids]
-            self.soccer_ball_pos[demo_ids] = self._demo_ball_world(demo_ids) - env_origins
+            # Spawn on task +X; per-step demo snap (_sync_demo_ball_after_step) may still move the ball.
+            self.soccer_ball_pos[demo_ids] = self._front_ball_positions(demo_ids)
 
     def _sync_demo_ball_after_step(self):
         """Kinematic sync of sim ball to demo trajectory (subset of envs)."""
+        if getattr(self.cfg, "dribble_cg_use_task_frame", True):
+            return
         if self.soccer_ball is None:
             return
         if hasattr(self.soccer_ball, "is_initialized") and not self.soccer_ball.is_initialized:
@@ -179,6 +173,7 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
 
     dribble_cg_snap_mode: str = "full"
     dribble_cg_use_demo_ball: bool = True
+    dribble_cg_use_task_frame: bool = True
     dribble_cg_fallback_ball_mode: str = "arc_endpoint"
     dribble_cg_front_ball_distance: float = 0.45
     dribble_cg_front_ball_lateral_offset: float = 0.0

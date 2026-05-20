@@ -399,7 +399,9 @@ class MotionCommand(CommandTerm):
             value = float(radius_range)
             self._radius_offset_min = value
             self._radius_offset_max = value
-        self._target_arc_angle = float(curve_cfg.get("arc_angle", math.pi / 18.0))
+        self._target_lateral_spawn_jitter = float(
+            curve_cfg.get("lateral_spawn_jitter", curve_cfg.get("lateral_spawn_max", 0.12))
+        )
         self._target_height = float(curve_cfg.get("height", 0.11))
         marker_cfg = cfg.target_point_marker_cfg
         self.target_point_marker = VisualizationMarkers(marker_cfg) if marker_cfg is not None else None
@@ -719,7 +721,7 @@ class MotionCommand(CommandTerm):
         if ids.numel() == 0:
             return
 
-        arc_limit = float(self._target_arc_angle)
+        lateral_jitter = float(self._target_lateral_spawn_jitter)
         base_height = float(self._target_height)
 
         for env_id in ids:
@@ -731,24 +733,15 @@ class MotionCommand(CommandTerm):
 
             radius_vec = last_anchor[:2] - first_anchor[:2]
             radius_sq = torch.dot(radius_vec, radius_vec)
-            target_xy = last_anchor[:2]
-
             radius = torch.sqrt(radius_sq) if float(radius_sq) > 1e-12 else torch.tensor(0.0, device=self.device)
-            if float(radius_sq) > 1e-12:
-                base_direction = radius_vec / radius
-            else:
-                base_direction = torch.tensor([1.0, 0.0], device=self.device)
-
-            if arc_limit > 0.0 and float(radius_sq) > 1e-12:
-                base_angle = torch.atan2(radius_vec[1], radius_vec[0])
-                angle_offset = sample_uniform(-arc_limit, arc_limit, (1,), device=self.device).squeeze(0)
-                new_angle = base_angle + angle_offset
-                direction = torch.stack((torch.cos(new_angle), torch.sin(new_angle)))
-            else:
-                direction = base_direction
-
             radius = torch.clamp(radius + self.curve_radius_offset[env_id], min=0.0)
-            target_xy = first_anchor[:2] + radius * direction
+
+            # Task frame: place ball along env-local +X from the motion start anchor.
+            target_xy = first_anchor[:2].clone()
+            target_xy[0] = target_xy[0] + radius
+            if lateral_jitter > 0.0:
+                y_off = sample_uniform(-lateral_jitter, lateral_jitter, (1,), device=self.device).squeeze(0)
+                target_xy[1] = target_xy[1] + y_off
 
             ball_pos = self.soccer_ball_pos.new_empty(3)
             ball_pos[:2] = target_xy

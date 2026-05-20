@@ -203,7 +203,7 @@ class G1FlatProximityEnvCfg(G1FlatMotionEnvCfg):
 
         self.commands.motion.curve_offset_range = {
             "radius": (-0.25, 0.25),
-            "arc_angle": math.pi / 9,
+            "lateral_spawn_jitter": 0.12,
             "height": SOCCER_BALL_RADIUS,
         }
 

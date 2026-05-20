@@ -232,7 +232,7 @@ class G1AnchorCGKickEnvCfg(G1FlatKickEnvCfg):
         # --- Push ball placement farther forward to reduce CG=0 collisions ---
         self.commands.motion.curve_offset_range = {
             "radius": (0.0, 0.4),   # was (-0.25, 0.25): now 0~0.4m forward only
-            "arc_angle": math.pi / 9,
+            "lateral_spawn_jitter": 0.12,
             "height": 0.11,
         }
 

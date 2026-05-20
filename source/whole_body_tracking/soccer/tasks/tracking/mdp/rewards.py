@@ -10,6 +10,10 @@ from isaaclab.utils.math import quat_error_magnitude, quat_apply, quat_inv, quat
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
 from soccer.tasks.tracking.mdp.observations import get_target_point_world
 from soccer.tasks.tracking.mdp.kick_detection import KickContactTracker
+from soccer.tasks.tracking.mdp.task_frame import (
+    task_forward_speed,
+    task_lateral_speed_penalty,
+)
 
 
 if TYPE_CHECKING:
@@ -66,7 +70,7 @@ def forward_velocity_reward(
 
     pelvis_lin_vel_w = robot.data.body_lin_vel_w[:, pelvis_index]
     if velocity_frame == "world":
-        forward_speed = torch.clamp(pelvis_lin_vel_w[:, 0], min=0.0)
+        forward_speed = task_forward_speed(pelvis_lin_vel_w)
     elif velocity_frame == "pelvis":
         pelvis_quat_w = robot.data.body_quat_w[:, pelvis_index]
         pelvis_lin_vel_local = quat_apply(quat_inv(pelvis_quat_w), pelvis_lin_vel_w)
@@ -97,16 +101,13 @@ def lateral_velocity_penalty(
 
     pelvis_lin_vel_w = robot.data.body_lin_vel_w[:, pelvis_index]
     if velocity_frame == "world":
-        lateral_speed = pelvis_lin_vel_w[:, 1]
-    elif velocity_frame == "pelvis":
+        return task_lateral_speed_penalty(pelvis_lin_vel_w, lateral_deadzone, lateral_scale)
+    if velocity_frame == "pelvis":
         pelvis_quat_w = robot.data.body_quat_w[:, pelvis_index]
         pelvis_lin_vel_local = quat_apply(quat_inv(pelvis_quat_w), pelvis_lin_vel_w)
-        lateral_speed = pelvis_lin_vel_local[:, 1]
-    else:
-        raise ValueError(f"Unsupported velocity_frame={velocity_frame!r}; use 'world' or 'pelvis'.")
-
-    excess = torch.clamp(torch.abs(lateral_speed) - lateral_deadzone, min=0.0)
-    return torch.square(excess / max(lateral_scale, 1e-6))
+        excess = torch.clamp(torch.abs(pelvis_lin_vel_local[:, 1]) - lateral_deadzone, min=0.0)
+        return torch.square(excess / max(lateral_scale, 1e-6))
+    raise ValueError(f"Unsupported velocity_frame={velocity_frame!r}; use 'world' or 'pelvis'.")
 
 
 def waist_action_rate_l2_clip(env: ManagerBasedRLEnv, waist_cfg: SceneEntityCfg | None = None) -> torch.Tensor:

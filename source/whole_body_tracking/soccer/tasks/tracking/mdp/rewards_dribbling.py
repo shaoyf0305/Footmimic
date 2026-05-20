@@ -2,9 +2,10 @@
 
 Encourages close ball control without strike-the-ball objectives. Contact
 legality is **geometry-based**: the first ``num_ankle_links`` entries in
-``all_body_cfg.body_names`` must be the ankle links (both are valid for gentle
-touches); knees/wrists listed after incur ``dribbling_undesired_contact_penalty``
-when closest to the ball under contact. No ``kick_leg`` motion labels required.
+``all_body_cfg.body_names`` are ankle links (typically both feet); knees/wrists
+listed after incur ``dribbling_undesired_contact_penalty`` when closest to the
+ball. Trapping between feet is handled by ``dribbling_ball_trapped_penalty`` /
+``dribbling_sustained_contact_penalty``. No ``kick_leg`` labels required.
 """
 from __future__ import annotations
 
@@ -16,6 +17,12 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply, quat_error_magnitude, quat_inv
 
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
+from soccer.tasks.tracking.mdp.rewards import motion_relative_foot_position_error_exp
+from soccer.tasks.tracking.mdp.task_frame import (
+    task_forward_offset,
+    task_forward_speed,
+    task_lateral_offset,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -235,21 +242,20 @@ def dribbling_dynamic_proximity(
     no_contact_zone_damping: float = 1.0,
     zone_lateral_abs_max: float = 0.18,
 ) -> torch.Tensor:
-    """Reward keeping the ball inside a longitudinal safe-zone in front of the robot.
+    """Reward keeping the ball inside a longitudinal safe-zone ahead on task +X.
 
-    The ball position is projected into the robot's local frame:
-    - x_local in [near_dist, far_dist] → reward = 1.0
+    Ball offset uses env-local / world-parallel axes (pelvis → ball):
+    - x_task in [near_dist, far_dist] → reward = 1.0
     - Outside that range → exponential decay with ``penalty_std``
 
-    Lateral deviation (|y_local|) is also penalised with the same decay to
-    encourage straight-ahead dribbling.
+    Lateral deviation (|y_task|) is also penalised with the same decay.
 
     If ``pelvis_speed_min > 0``, the reward is multiplied by
     ``clamp(|v_pelvis_xy| / pelvis_speed_min, max=1)`` so standing still in the
     safe zone is not a local optimum.
 
     If ``no_contact_zone_damping < 1``, when the ball sits in the forward corridor
-    (longitudinal band + ``|y_local| <= zone_lateral_abs_max``) but the ball
+    (longitudinal band + ``|y_task| <= zone_lateral_abs_max``) but the ball
     sensor reports no contact, the proximity reward is scaled by that factor.
     This reduces the \"park in front of the ball and wiggle\" optimum.
 
@@ -258,32 +264,23 @@ def dribbling_dynamic_proximity(
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
 
-    # Ball position in world frame
     ball_pos_w = soccer_ball.data.root_pos_w  # (N, 3)
-    # Robot pelvis position and orientation in world frame
     pelvis_pos_w = command.robot_pelvis_pos_w  # (N, 3)
-    pelvis_quat_w = command.robot_pelvis_quat_w  # (N, 4)
 
-    # Transform ball position into the robot's local frame
-    delta_w = ball_pos_w - pelvis_pos_w  # (N, 3)
-    delta_local = quat_apply(quat_inv(pelvis_quat_w), delta_w)  # (N, 3)
+    x_task = task_forward_offset(ball_pos_w, pelvis_pos_w)
+    y_task = task_lateral_offset(ball_pos_w, pelvis_pos_w)
 
-    x_local = delta_local[:, 0]  # forward axis
-    y_local = delta_local[:, 1]  # lateral axis
-
-    # Longitudinal error: distance to the nearest edge of the safe zone
     x_error = torch.where(
-        x_local < near_dist,
-        near_dist - x_local,    # too close → positive error
+        x_task < near_dist,
+        near_dist - x_task,
         torch.where(
-            x_local > far_dist,
-            x_local - far_dist,  # too far → positive error
-            torch.zeros_like(x_local),  # inside safe zone → zero error
+            x_task > far_dist,
+            x_task - far_dist,
+            torch.zeros_like(x_task),
         ),
     )
 
-    # Lateral error: absolute lateral offset
-    y_error = torch.abs(y_local)
+    y_error = torch.abs(y_task)
 
     total_error = x_error ** 2 + y_error ** 2
     proximity_reward = torch.exp(-total_error / (penalty_std ** 2))
@@ -295,9 +292,9 @@ def dribbling_dynamic_proximity(
 
     if no_contact_zone_damping < 1.0 - 1e-6:
         in_corridor = (
-            (x_local >= near_dist)
-            & (x_local <= far_dist)
-            & (torch.abs(y_local) <= zone_lateral_abs_max)
+            (x_task >= near_dist)
+            & (x_task <= far_dist)
+            & (torch.abs(y_task) <= zone_lateral_abs_max)
         )
         fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
         no_touch = fmag <= contact_force_threshold
@@ -509,23 +506,32 @@ def dribbling_ball_xy_speed_excess_penalty(
 
 def dribbling_ball_coast_without_contact_penalty(
     env: ManagerBasedRLEnv,
+    command_name: str = "motion",
     ball_sensor_name: str = "soccer_ball_contact",
     contact_force_threshold: float = 1.0,
     speed_threshold: float = 0.35,
     speed_scale: float = 0.45,
+    max_close_xy_dist: float = 0.55,
 ) -> torch.Tensor:
-    """Penalty when the ball slides above ``speed_threshold`` with no robot contact.
+    """Penalty when the ball slides fast **near** the robot with no contact.
 
-    Targets the exploit: one hard touch, then coasting ball velocity still
-    aligns with pelvis motion reference while the feet stay off the ball.
+    Only applies when the ball is within ``max_close_xy_dist`` of the pelvis so a
+    kick-and-chase rollout (ball rolling ahead out of reach) is not penalised.
     """
+    command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
     ball_sp = torch.norm(soccer_ball.data.root_lin_vel_w[:, :2], dim=-1)
     fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
     no_touch = fmag <= contact_force_threshold
+
+    pelvis_pos_xy = command.robot_pelvis_pos_w[:, :2]
+    ball_pos_xy = soccer_ball.data.root_pos_w[:, :2]
+    dist_xy = torch.norm(ball_pos_xy - pelvis_pos_xy, dim=-1)
+    close = dist_xy <= max_close_xy_dist
+
     excess = torch.relu(ball_sp - speed_threshold)
     penalty = torch.clamp(excess / max(speed_scale, 1e-6), max=1.0)
-    return penalty * no_touch.to(torch.float32)
+    return penalty * no_touch.to(torch.float32) * close.to(torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -545,21 +551,18 @@ def dribbling_ball_forward_progress_reward(
     recent_contact_window: int = 10,
     cg_gated_contact: bool = False,
 ) -> torch.Tensor:
-    """Reward forward ball velocity in pelvis-local frame.
+    """Reward forward ball velocity along task +X (world-parallel).
 
-    This term rewards positive local-X ball speed (ball moving in front of the
-    robot), and can optionally be gated by recent contact to avoid standing
+    This term rewards positive +X ball speed, and can optionally be gated by
+    recent contact to avoid standing
     exploits where the policy does not engage the ball.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
 
     ball_vel_w = soccer_ball.data.root_lin_vel_w[:, :3]
-    pelvis_quat_w = command.robot_pelvis_quat_w
-    ball_vel_local = quat_apply(quat_inv(pelvis_quat_w), ball_vel_w)
-    forward_speed = torch.clamp(ball_vel_local[:, 0], min=0.0)
+    forward_speed = task_forward_speed(ball_vel_w)
 
-    # Smooth ramp around the target forward speed.
     base = torch.clamp((forward_speed - min_forward_speed) / max(speed_scale, 1e-6), min=0.0, max=1.0)
 
     pelvis_speed = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
@@ -596,7 +599,7 @@ def dribbling_phase_graph_alignment(
 
     - ``approach`` phase (ball far): reward getting closer while avoiding contact.
     - ``control/push`` phase (ball near): reward contact, and reward stronger when
-      ball moves forward in pelvis-local frame (push over static trapping).
+      ball moves forward along task +X (push over static trapping).
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
@@ -609,8 +612,7 @@ def dribbling_phase_graph_alignment(
     has_contact = fmag > contact_force_threshold
 
     ball_vel_w = soccer_ball.data.root_lin_vel_w[:, :3]
-    ball_vel_local = quat_apply(quat_inv(command.robot_pelvis_quat_w), ball_vel_w)
-    forward_speed = torch.clamp(ball_vel_local[:, 0], min=0.0)
+    forward_speed = task_forward_speed(ball_vel_w)
 
     phase_approach = dist_xy > approach_xy_dist
     phase_interact = ~phase_approach
@@ -850,11 +852,9 @@ def dribbling_ball_trapped_penalty(
     soccer_ball = env.scene["soccer_ball"]
     ball_pos_w = soccer_ball.data.root_pos_w
     pelvis_pos_w = command.robot_pelvis_pos_w
-    pelvis_quat_w = command.robot_pelvis_quat_w
-    delta_local = quat_apply(quat_inv(pelvis_quat_w), ball_pos_w - pelvis_pos_w)
-    x_local = delta_local[:, 0]
-    too_close = x_local < min_forward_x
-    behind = x_local < 0.0
+    x_task = task_forward_offset(ball_pos_w, pelvis_pos_w)
+    too_close = x_task < min_forward_x
+    behind = x_task < 0.0
     popped = ball_pos_w[:, 2] > max_ball_height
     return (too_close | behind | popped).to(torch.float32)
 
@@ -981,15 +981,130 @@ def dribbling_cg_foot_ball_distance_exp(
     return rew * active.to(torch.float32)
 
 
+def dribbling_gait_foot_tracking_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    std: float = 0.3,
+    foot_body_names: list[str] | None = None,
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """Foot imitation reward active only while the ball is **not** in contact.
+
+    Between touches the policy should follow the reference gait (alternating
+  steps) instead of freezing in a kick-ready stance with the dribble foot forward.
+    """
+    base = motion_relative_foot_position_error_exp(
+        env, command_name, std, foot_body_names=foot_body_names
+    )
+    no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
+    return base * no_ball.to(torch.float32)
+
+
+def dribbling_chase_ball_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    min_ball_ahead: float = 0.25,
+    max_chase_xy_dist: float = 1.1,
+    pelvis_forward_speed_min: float = 0.22,
+    forward_speed_scale: float = 0.45,
+) -> torch.Tensor:
+    """Reward running forward to catch a ball that rolled ahead after a touch.
+
+    Active when there is no ball contact, the ball lies on task +X ahead of the
+    pelvis by at least ``min_ball_ahead``, and the robot is within chase range.
+    This shapes kick → run → kick rather than shuffling beside the ball.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+
+    no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
+    pelvis_pos_w = command.robot_pelvis_pos_w
+    ball_pos_w = soccer_ball.data.root_pos_w
+
+    x_ahead = task_forward_offset(ball_pos_w, pelvis_pos_w)
+    dist_xy = torch.norm(ball_pos_w[:, :2] - pelvis_pos_w[:, :2], dim=-1)
+
+    ball_ahead = x_ahead >= min_ball_ahead
+    in_range = dist_xy <= max_chase_xy_dist
+
+    pelvis_vel_w = command.robot_anchor_lin_vel_w[:, :3]
+    forward = task_forward_speed(pelvis_vel_w)
+    speed_rew = torch.clamp(
+        (forward - pelvis_forward_speed_min) / max(forward_speed_scale, 1e-6),
+        min=0.0,
+        max=1.0,
+    )
+
+    active = no_ball & ball_ahead & in_range
+    return speed_rew * active.to(torch.float32)
+
+
+def dribbling_rapid_retouch_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    force_threshold: float = 20.0,
+    min_steps_between_touches: int = 22,
+    all_body_cfg: SceneEntityCfg | None = None,
+    num_ankle_links: int = 2,
+    cg_gated: bool = False,
+) -> torch.Tensor:
+    """Penalty for a **new** legal gentle touch sooner than ``min_steps_between_touches``.
+
+    Encourages kick → chase → kick cadence instead of tapping the ball every step.
+    """
+    if min_steps_between_touches <= 0:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    has_contact, force_mag, closest_idx = _identify_contact_body(
+        env, command, ball_sensor_name, all_body_cfg,
+    )
+    is_ankle = _is_dribble_legal_ankle_contact(closest_idx, num_ankle_links)
+    gentle = force_mag <= force_threshold
+    touch = has_contact & is_ankle & gentle
+    if cg_gated:
+        touch = _dribbling_cg_gated_sim_contact(command, touch)
+
+    prev_touch_name = "_dribbling_prev_retouch_touch"
+    steps_name = "_dribbling_steps_since_legal_touch"
+    prev_touch = getattr(env, prev_touch_name, None)
+    if prev_touch is None or prev_touch.shape[0] != env.num_envs:
+        prev_touch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    steps_since = getattr(env, steps_name, None)
+    if steps_since is None or steps_since.shape[0] != env.num_envs:
+        steps_since = torch.full(
+            (env.num_envs,),
+            fill_value=min_steps_between_touches + 1,
+            device=env.device,
+            dtype=torch.int32,
+        )
+
+    step_buf = getattr(env, "episode_length_buf", None)
+    reset_mask = step_buf == 0 if step_buf is not None else torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    steps_since = torch.where(reset_mask, torch.full_like(steps_since, min_steps_between_touches + 1), steps_since + 1)
+
+    new_touch = touch & ~prev_touch
+    too_soon = new_touch & (steps_since < int(min_steps_between_touches))
+    steps_since = torch.where(new_touch, torch.zeros_like(steps_since), steps_since)
+
+    setattr(env, prev_touch_name, touch.detach().clone())
+    setattr(env, steps_name, steps_since)
+    return too_soon.to(torch.float32)
+
+
 def dribbling_face_ball(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
     min_distance: float = 0.05,
 ) -> torch.Tensor:
-    """Cosine of the horizontal angle between pelvis forward and the pelvis-to-ball vector.
+    """Cosine of the angle from task +X to the pelvis→ball vector (XY).
 
-    Returns ``+1`` when the robot pelvis points straight at the ball, ``0`` when
-    the ball is directly sideways, and ``-1`` when the ball is behind the robot.
+    Returns ``+1`` when the ball lies straight ahead on task +X, ``0`` when it is
+    purely lateral (±Y), and ``-1`` when it is behind on -X.
     Defaults to ``+1`` when the ball is closer than ``min_distance`` (numerically
     unstable region right next to the foot).
     """
@@ -998,12 +1113,9 @@ def dribbling_face_ball(
 
     ball_pos_w = soccer_ball.data.root_pos_w[:, :3]
     pelvis_pos_w = command.robot_pelvis_pos_w
-    pelvis_quat_w = command.robot_pelvis_quat_w
 
-    delta_w = ball_pos_w - pelvis_pos_w
-    delta_local = quat_apply(quat_inv(pelvis_quat_w), delta_w)
-    dx = delta_local[:, 0]
-    dy = delta_local[:, 1]
+    dx = task_forward_offset(ball_pos_w, pelvis_pos_w)
+    dy = task_lateral_offset(ball_pos_w, pelvis_pos_w)
     dist = torch.norm(torch.stack([dx, dy], dim=-1), dim=-1)
     safe = dist > float(min_distance)
     cos_heading = torch.where(
