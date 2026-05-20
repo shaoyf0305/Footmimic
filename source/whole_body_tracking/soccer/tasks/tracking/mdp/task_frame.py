@@ -7,6 +7,7 @@ All dribbling / stage-1 locomotion terms use the same convention:
 from __future__ import annotations
 
 import torch
+from isaaclab.utils.math import quat_apply, quat_inv
 
 
 def task_delta_xy(pos_w: torch.Tensor, ref_pos_w: torch.Tensor) -> torch.Tensor:
@@ -37,6 +38,26 @@ def task_lateral_speed(lin_vel_w: torch.Tensor) -> torch.Tensor:
     return lin_vel_w[..., 1]
 
 
+def task_velocity_forward_dominance(lin_vel_w: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Share of XY speed along task +X in ``[0, 1]`` (0 = pure lateral / backward)."""
+    vx = lin_vel_w[..., 0]
+    vy = lin_vel_w[..., 1]
+    speed_xy = torch.sqrt(vx * vx + vy * vy + eps)
+    vx_pos = torch.clamp(vx, min=0.0)
+    return (vx_pos / speed_xy).clamp(0.0, 1.0)
+
+
+def task_pelvis_heading_cos_world_x(pelvis_quat_w: torch.Tensor) -> torch.Tensor:
+    """Cosine between pelvis forward (XY) and task +X."""
+    num_envs = pelvis_quat_w.shape[0]
+    ref_forward = torch.zeros(num_envs, 3, device=pelvis_quat_w.device, dtype=pelvis_quat_w.dtype)
+    ref_forward[:, 0] = 1.0
+    pelvis_forward = quat_apply(pelvis_quat_w, ref_forward)
+    forward_xy = pelvis_forward[:, :2]
+    norm = torch.norm(forward_xy, dim=-1).clamp(min=1e-6)
+    return (forward_xy[:, 0] / norm).clamp(-1.0, 1.0)
+
+
 def task_lateral_speed_penalty(
     lin_vel_w: torch.Tensor,
     lateral_deadzone: float = 0.12,
@@ -45,6 +66,59 @@ def task_lateral_speed_penalty(
     """Soft squared penalty for |v_y| above ``lateral_deadzone``."""
     excess = torch.clamp(torch.abs(task_lateral_speed(lin_vel_w)) - lateral_deadzone, min=0.0)
     return torch.square(excess / max(lateral_scale, 1e-6))
+
+
+def task_combined_lateral_speed_penalty(
+    pelvis_lin_vel_w: torch.Tensor,
+    pelvis_quat_w: torch.Tensor,
+    lateral_deadzone: float = 0.06,
+    lateral_scale: float = 0.28,
+) -> torch.Tensor:
+    """Penalise lateral drift in both task (+Y) and pelvis-local (+Y) frames."""
+    pelvis_lin_vel_local = quat_apply(quat_inv(pelvis_quat_w), pelvis_lin_vel_w)
+    return task_lateral_speed_penalty(pelvis_lin_vel_w, lateral_deadzone, lateral_scale) + task_lateral_speed_penalty(
+        pelvis_lin_vel_local, lateral_deadzone, lateral_scale
+    )
+
+
+def forward_dominance_gate(dominance: torch.Tensor, min_dominance: float) -> torch.Tensor:
+    """Linear ramp from 0 at ``min_dominance`` to 1 at full forward dominance."""
+    if min_dominance <= 0.0:
+        return torch.ones_like(dominance)
+    return torch.clamp((dominance - min_dominance) / (1.0 - min_dominance + 1e-6), min=0.0, max=1.0)
+
+
+def compute_dribble_phase_target_speed(
+    has_contact: torch.Tensor,
+    recent_contact: torch.Tensor,
+    x_ahead: torch.Tensor,
+    dist_xy: torch.Tensor,
+    ball_speed_xy: torch.Tensor,
+    *,
+    v_touch: float = 0.20,
+    v_chase: float = 0.75,
+    v_approach: float = 0.30,
+    chase_min_ahead: float = 0.35,
+    approach_max_dist: float = 0.55,
+    approach_ball_speed_max: float = 0.35,
+) -> torch.Tensor:
+    """Three-phase pelvis forward speed target for kick → chase → approach.
+
+    Phase A (touch): contact or recent touch — low speed for control.
+    Phase B (chase): ball ahead on +X and not yet close — sprint to catch up.
+    Phase C (approach): ball near or slow, no contact — moderate speed before next touch.
+    """
+    touch_phase = has_contact | (recent_contact > 0.5)
+    chase_phase = (~touch_phase) & (x_ahead >= chase_min_ahead) & (dist_xy > approach_max_dist)
+    approach_phase = (~touch_phase) & (~chase_phase) & (
+        (dist_xy <= approach_max_dist) | (ball_speed_xy <= approach_ball_speed_max)
+    )
+
+    target = torch.full_like(x_ahead, v_approach)
+    target = torch.where(approach_phase, torch.full_like(target, v_approach), target)
+    target = torch.where(chase_phase, torch.full_like(target, v_chase), target)
+    target = torch.where(touch_phase, torch.full_like(target, v_touch), target)
+    return target
 
 
 def spawn_ball_ahead_env_local(

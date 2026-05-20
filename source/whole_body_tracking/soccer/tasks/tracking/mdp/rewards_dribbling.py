@@ -19,9 +19,13 @@ from isaaclab.utils.math import quat_apply, quat_error_magnitude, quat_inv
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
 from soccer.tasks.tracking.mdp.rewards import motion_relative_foot_position_error_exp
 from soccer.tasks.tracking.mdp.task_frame import (
+    compute_dribble_phase_target_speed,
+    forward_dominance_gate,
     task_forward_offset,
     task_forward_speed,
     task_lateral_offset,
+    task_pelvis_heading_cos_world_x,
+    task_velocity_forward_dominance,
 )
 
 if TYPE_CHECKING:
@@ -157,6 +161,84 @@ def _dribbling_recent_contact_gate(
 
 
 # ---------------------------------------------------------------------------
+# 1b) Phased forward velocity — kick / chase / approach target speed
+# ---------------------------------------------------------------------------
+
+
+def dribbling_phased_forward_velocity(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    std: float = 0.35,
+    velocity_frame: str = "world",
+    min_forward_dominance: float = 0.55,
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    recent_contact_window: int = 8,
+    v_touch: float = 0.20,
+    v_chase: float = 0.75,
+    v_approach: float = 0.30,
+    chase_min_ahead: float = 0.35,
+    approach_max_dist: float = 0.55,
+    approach_ball_speed_max: float = 0.35,
+) -> torch.Tensor:
+    """Reward matching a phase-dependent forward speed target (kick–chase–approach).
+
+    Replaces a constant ``forward_velocity`` target during dribbling so the policy
+    is not pushed to maintain cruise speed while controlling or approaching the ball.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+    robot = command.robot
+    pelvis_index = robot.body_names.index("pelvis")
+    pelvis_lin_vel_w = robot.data.body_lin_vel_w[:, pelvis_index]
+
+    if velocity_frame == "world":
+        forward_speed = task_forward_speed(pelvis_lin_vel_w)
+        dominance = task_velocity_forward_dominance(pelvis_lin_vel_w)
+    elif velocity_frame == "pelvis":
+        pelvis_quat_w = robot.data.body_quat_w[:, pelvis_index]
+        pelvis_lin_vel_local = quat_apply(quat_inv(pelvis_quat_w), pelvis_lin_vel_w)
+        forward_speed = pelvis_lin_vel_local[:, 0]
+        dominance = task_velocity_forward_dominance(pelvis_lin_vel_local)
+    else:
+        raise ValueError(f"Unsupported velocity_frame={velocity_frame!r}; use 'world' or 'pelvis'.")
+
+    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
+    has_contact = fmag > contact_force_threshold
+    recent_contact = _dribbling_recent_contact_gate(
+        env,
+        ball_sensor_name,
+        contact_force_threshold,
+        recent_contact_window,
+        command=command,
+    )
+
+    pelvis_pos_w = command.robot_pelvis_pos_w
+    ball_pos_w = soccer_ball.data.root_pos_w
+    x_ahead = task_forward_offset(ball_pos_w, pelvis_pos_w)
+    dist_xy = torch.norm(ball_pos_w[:, :2] - pelvis_pos_w[:, :2], dim=-1)
+    ball_speed_xy = torch.norm(soccer_ball.data.root_lin_vel_w[:, :2], dim=-1)
+
+    target_speed = compute_dribble_phase_target_speed(
+        has_contact,
+        recent_contact,
+        x_ahead,
+        dist_xy,
+        ball_speed_xy,
+        v_touch=v_touch,
+        v_chase=v_chase,
+        v_approach=v_approach,
+        chase_min_ahead=chase_min_ahead,
+        approach_max_dist=approach_max_dist,
+        approach_ball_speed_max=approach_ball_speed_max,
+    )
+
+    error = (forward_speed - target_speed) ** 2
+    reward = torch.exp(-error / max(std, 1e-6) ** 2)
+    return reward * forward_dominance_gate(dominance, min_forward_dominance)
+
+
+# ---------------------------------------------------------------------------
 # 1) Velocity Tracking  — ball vel aligned with pelvis vel
 # ---------------------------------------------------------------------------
 
@@ -172,6 +254,7 @@ def dribbling_velocity_tracking(
     contact_force_threshold: float = 1.0,
     recent_contact_window: int = 0,
     cg_gated_contact: bool = False,
+    min_forward_dominance: float = 0.45,
 ) -> torch.Tensor:
     """Reward alignment between the soccer ball velocity and the robot pelvis velocity.
 
@@ -222,6 +305,10 @@ def dribbling_velocity_tracking(
             command=command,
             cg_gated=cg_gated_contact,
         )
+
+    if min_forward_dominance > 0.0:
+        dominance = task_velocity_forward_dominance(pelvis_vel_xy)
+        gate = gate * forward_dominance_gate(dominance, min_forward_dominance)
 
     return base * gate
 
@@ -562,8 +649,10 @@ def dribbling_ball_forward_progress_reward(
 
     ball_vel_w = soccer_ball.data.root_lin_vel_w[:, :3]
     forward_speed = task_forward_speed(ball_vel_w)
+    ball_dominance = task_velocity_forward_dominance(ball_vel_w)
 
     base = torch.clamp((forward_speed - min_forward_speed) / max(speed_scale, 1e-6), min=0.0, max=1.0)
+    base = base * forward_dominance_gate(ball_dominance, 0.4)
 
     pelvis_speed = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
     gate = torch.clamp(pelvis_speed / max(pelvis_speed_min, 1e-6), max=1.0)
@@ -1032,11 +1121,13 @@ def dribbling_chase_ball_reward(
 
     pelvis_vel_w = command.robot_anchor_lin_vel_w[:, :3]
     forward = task_forward_speed(pelvis_vel_w)
+    dominance = task_velocity_forward_dominance(pelvis_vel_w)
     speed_rew = torch.clamp(
         (forward - pelvis_forward_speed_min) / max(forward_speed_scale, 1e-6),
         min=0.0,
         max=1.0,
     )
+    speed_rew = speed_rew * forward_dominance_gate(dominance, 0.45)
 
     active = no_ball & ball_ahead & in_range
     return speed_rew * active.to(torch.float32)
@@ -1101,26 +1192,27 @@ def dribbling_face_ball(
     command_name: str = "motion",
     min_distance: float = 0.05,
 ) -> torch.Tensor:
-    """Cosine of the angle from task +X to the pelvis→ball vector (XY).
+    """Reward ball ahead on task +X **and** pelvis facing task +X.
 
-    Returns ``+1`` when the ball lies straight ahead on task +X, ``0`` when it is
-    purely lateral (±Y), and ``-1`` when it is behind on -X.
-    Defaults to ``+1`` when the ball is closer than ``min_distance`` (numerically
-    unstable region right next to the foot).
+    Returns the product of (a) cos(angle from task +X to pelvis→ball) and
+    (b) cos(pelvis yaw vs task +X), each clamped to [0, 1]. Sideways crab
+    dribbling (body or ball mostly on ±Y) scores near zero.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
 
     ball_pos_w = soccer_ball.data.root_pos_w[:, :3]
     pelvis_pos_w = command.robot_pelvis_pos_w
+    pelvis_quat_w = command.robot_pelvis_quat_w
 
     dx = task_forward_offset(ball_pos_w, pelvis_pos_w)
     dy = task_lateral_offset(ball_pos_w, pelvis_pos_w)
     dist = torch.norm(torch.stack([dx, dy], dim=-1), dim=-1)
     safe = dist > float(min_distance)
-    cos_heading = torch.where(
+    ball_ahead = torch.where(
         safe,
-        dx / dist.clamp(min=1e-4),
+        (dx / dist.clamp(min=1e-4)).clamp(min=0.0, max=1.0),
         torch.ones_like(dist),
     )
-    return cos_heading.clamp(min=-1.0, max=1.0)
+    pelvis_forward = task_pelvis_heading_cos_world_x(pelvis_quat_w).clamp(min=0.0, max=1.0)
+    return ball_ahead * pelvis_forward

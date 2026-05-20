@@ -7,7 +7,7 @@ Inherits proximity-level tracking and adds dribbling-specific rewards:
   - pelvis orientation vs motion reference (anti lean-back / arched torso)
   - ball horizontal speed excess penalty; anti-trap / anti-sustained-contact penalties
   - both ankles legal for gentle touches; anti-trap / sustained-contact block 夹球
-  - kick–chase–kick: chase reward, rapid-retouch penalty, coast penalty only when ball is close
+  - kick–chase–kick: phased forward velocity, chase bonus, rapid-retouch penalty
   - gait foot tracking between touches; reduced close-proximity / foot-hover shaping
   - slightly relaxed imitation weights; reduced global body velocity tracking (slalom bleed)
   - ``ball_lost`` and tighter ``dribbling_no_contact`` termination
@@ -90,24 +90,41 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             },
         )
 
-        self.rewards.forward_velocity = RewTerm(
-            func=mdp.forward_velocity_reward,
+        # Pelvis yaw vs task +X (``dribbling_face_ball`` already includes heading × ball-ahead).
+        self.rewards.task_heading_alignment = RewTerm(
+            func=mdp.task_heading_alignment_reward,
+            weight=1.0,
+            params={"command_name": "motion"},
+        )
+
+        # Phase-dependent forward speed (touch / chase / approach); replaces constant cruise.
+        self.rewards.dribbling_phased_forward_velocity = RewTerm(
+            func=mdp.dribbling_phased_forward_velocity,
             weight=3.0,
             params={
                 "command_name": "motion",
-                "target_speed": 0.55,
                 "std": 0.35,
                 "velocity_frame": "world",
+                "min_forward_dominance": 0.55,
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "recent_contact_window": 8,
+                "v_touch": 0.20,
+                "v_chase": 0.75,
+                "v_approach": 0.30,
+                "chase_min_ahead": 0.35,
+                "approach_max_dist": 0.55,
+                "approach_ball_speed_max": 0.35,
             },
         )
         self.rewards.lateral_velocity_penalty = RewTerm(
             func=mdp.lateral_velocity_penalty,
-            weight=-0.35,
+            weight=-0.9,
             params={
                 "command_name": "motion",
                 "velocity_frame": "world",
-                "lateral_deadzone": 0.15,
-                "lateral_scale": 0.45,
+                "lateral_deadzone": 0.06,
+                "lateral_scale": 0.28,
             },
         )
 
@@ -158,6 +175,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "recent_contact_window": 8,
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
+                "min_forward_dominance": 0.45,
             },
         )
 
@@ -174,7 +192,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "contact_force_threshold": 1.0,
                 # In the "ball in front" corridor, strongly cut proximity without a touch.
                 "no_contact_zone_damping": 0.12,
-                "zone_lateral_abs_max": 0.18,
+                "zone_lateral_abs_max": 0.14,
             },
         )
 
@@ -307,7 +325,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_chase_ball = RewTerm(
             func=mdp.dribbling_chase_ball_reward,
-            weight=4.0,
+            weight=2.0,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
@@ -603,15 +621,21 @@ class G1FlatMotionCGPretrainEnvCfg(G1FlatMotionEnvCfg):
                 "target_speed": 0.8,
                 "std": 0.4,
                 "velocity_frame": "world",
+                "min_forward_dominance": 0.55,
             },
         )
         self.rewards.lateral_velocity_penalty = RewTerm(
             func=mdp.lateral_velocity_penalty,
-            weight=-0.3,
+            weight=-0.8,
             params={
                 "command_name": "motion",
                 "velocity_frame": "world",
-                "lateral_deadzone": 0.12,
-                "lateral_scale": 0.4,
+                "lateral_deadzone": 0.06,
+                "lateral_scale": 0.28,
             },
+        )
+        self.rewards.task_heading_alignment = RewTerm(
+            func=mdp.task_heading_alignment_reward,
+            weight=1.5,
+            params={"command_name": "motion"},
         )
