@@ -57,10 +57,13 @@ import torch
 
 from isaaclab.managers import SceneEntityCfg
 from soccer.tasks.tracking.mdp.rewards_dribbling import (
+    _dribbling_recent_contact_gate,
     _identify_contact_body,
     soccer_ball_contact_force_magnitude,
     soccer_ball_contact_net_force_w,
 )
+from soccer.tasks.tracking.mdp.rewards_dribbling import gather_dribble_phase_bundle
+from soccer.tasks.tracking.mdp.task_frame import resolve_dribble_phase_label, task_forward_offset
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -119,6 +122,16 @@ _HUD_CONTACT_BODIES = [
 _HUD_ANKLE_BODIES = ["right_ankle_roll_link", "left_ankle_roll_link"]
 _BALL_SENSOR_NAME = "soccer_ball_contact"
 _CONTACT_FORCE_THRESHOLD = 1.0
+# Match G1FlatDribblingEnvCfg termination / phased-velocity defaults.
+_DRIBBLE_RECENT_CONTACT_WINDOW = 8
+_DRIBBLE_CHASE_MIN_AHEAD = 0.35
+_DRIBBLE_APPROACH_MAX_DIST = 0.55
+_DRIBBLE_APPROACH_BALL_SPEED_MAX = 0.35
+_DRIBBLE_CLOSE_MAX_DIST = 0.48
+_DRIBBLE_CLOSE_X_MIN = 0.18
+_DRIBBLE_CLOSE_X_MAX = 0.62
+_DRIBBLE_SEEK_TOUCH_MIN_STEPS = 2
+_DRIBBLE_SEEK_TOUCH_COMMIT_DIST = 0.24
 
 
 def _resolve_base_env(env):
@@ -165,6 +178,60 @@ def _get_play_overlay(env, timestep: int) -> str:
             f"Pelvis-Ball: {pelvis_ball_xy:.2f} m (xy)  |  {pelvis_ball_3d:.2f} m (3D)"
         )
 
+        force_xy = float(
+            soccer_ball_contact_force_magnitude(base_env, _BALL_SENSOR_NAME)[i].item()
+        )
+        x_ahead = float(
+            task_forward_offset(
+                soccer_ball.data.root_pos_w[i : i + 1],
+                cmd.robot_pelvis_pos_w[i : i + 1],
+            ).item()
+        )
+        has_contact_t = force_xy > _CONTACT_FORCE_THRESHOLD
+        recent_contact_t = float(
+            _dribbling_recent_contact_gate(
+                base_env,
+                _BALL_SENSOR_NAME,
+                _CONTACT_FORCE_THRESHOLD,
+                _DRIBBLE_RECENT_CONTACT_WINDOW,
+                command=cmd,
+            )[i].item()
+        )
+        foot_cfg = SceneEntityCfg("robot", body_names=_HUD_ANKLE_BODIES)
+        bundle = gather_dribble_phase_bundle(
+            base_env,
+            cmd,
+            _BALL_SENSOR_NAME,
+            _CONTACT_FORCE_THRESHOLD,
+            _DRIBBLE_RECENT_CONTACT_WINDOW,
+            foot_cfg,
+            chase_min_ahead=_DRIBBLE_CHASE_MIN_AHEAD,
+            approach_max_dist=_DRIBBLE_APPROACH_MAX_DIST,
+            approach_ball_speed_max=_DRIBBLE_APPROACH_BALL_SPEED_MAX,
+            close_max_dist=_DRIBBLE_CLOSE_MAX_DIST,
+            close_x_min=_DRIBBLE_CLOSE_X_MIN,
+            close_x_max=_DRIBBLE_CLOSE_X_MAX,
+            seek_touch_min_steps=_DRIBBLE_SEEK_TOUCH_MIN_STEPS,
+            seek_touch_commit_dist=_DRIBBLE_SEEK_TOUCH_COMMIT_DIST,
+        )
+        phase = resolve_dribble_phase_label(bundle, 0)
+        if phase == "seek_touch":
+            phase = "approach->touch"
+        recent_lbl = "YES" if recent_contact_t > 0.5 else "NO"
+        steps_close = int(bundle.steps_in_close_approach[i].item())
+        phase_lines = [
+            f"Phase: {phase}  |  sim_touch={'YES' if has_contact_t else 'NO'}  "
+            f"|  recent_touch={recent_lbl} (win={_DRIBBLE_RECENT_CONTACT_WINDOW})",
+            f"  x_ahead={x_ahead:.2f} m  dist_xy={pelvis_ball_xy:.2f} m  "
+            f"ball_v_xy={ball_sp_xy:.2f} m/s  close_steps={steps_close}",
+        ]
+        if bool(bundle.close_approach[i].item()) and phase not in ("touch", "approach->touch"):
+            phase_lines.append("  close_approach: YES (waiting for seek_touch commit)")
+        if phase == "touch" and not has_contact_t:
+            phase_lines.append(
+                "  (touch w/o sim_touch: recent_touch window after last contact)"
+            )
+
         robot = base_env.scene["robot"]
         ankle_dists: list[float] = []
         for fname in _HUD_ANKLE_BODIES:
@@ -175,10 +242,12 @@ def _get_play_overlay(env, timestep: int) -> str:
             ankle_dists.append(float(np.linalg.norm(fpos - ball_pos)))
         if ankle_dists:
             lines.append(f"Ankle-Ball (min): {min(ankle_dists):.2f} m (3D)")
+            if min(ankle_dists) <= _DRIBBLE_SEEK_TOUCH_COMMIT_DIST:
+                phase_lines.append(
+                    f"  seek_touch commit: ankle dist <= {_DRIBBLE_SEEK_TOUCH_COMMIT_DIST:.2f} m"
+                )
+        lines[1:1] = phase_lines
 
-        force_xy = float(
-            soccer_ball_contact_force_magnitude(base_env, _BALL_SENSOR_NAME)[i].item()
-        )
         force_vec = soccer_ball_contact_net_force_w(base_env, _BALL_SENSOR_NAME)[i].detach().cpu().numpy()
         force_z = float(abs(force_vec[2]))
         sim_touch = force_xy > _CONTACT_FORCE_THRESHOLD
@@ -326,21 +395,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     log_dir = os.path.dirname(resume_path)
 
-    # wrap for video recording
-    if args_cli.video:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        video_dir = os.path.join(log_dir, "videos", f"play_{timestamp}")
-        video_kwargs = {
-            "video_folder": video_dir,
-            "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print(f"[INFO] Recording video ({args_cli.video_length} steps) to: {video_dir}")
-        print("[INFO] Use --video_length N to control clip duration.")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
@@ -407,15 +461,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         print("[INFO]: Skipping policy export (set --export_motion_name to enable export).")
     
-    # --- Dual-view recorder setup (optional) ---
-    dual_recorder = None
-    if args_cli.dual_view:
+    # --- Video recorder with HUD overlay (--video and/or --dual_view) ---
+    video_recorder = None
+    if args_cli.video or args_cli.dual_view:
         from dual_view_recorder import DualViewRecorder
 
-        video_dir = os.path.join(log_dir, "videos",
-                                 f"dual_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        dual_recorder = DualViewRecorder(
-            env=env.unwrapped if hasattr(env, 'unwrapped') else env,
+        tag = "dual" if args_cli.dual_view else "play"
+        video_dir = os.path.join(
+            log_dir, "videos", f"{tag}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        video_recorder = DualViewRecorder(
+            env=env.unwrapped if hasattr(env, "unwrapped") else env,
             output_dir=video_dir,
             resolution=(960, 540),
             front_offset=(4.0, 3.0, 2.5),
@@ -423,12 +479,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             lookat_offset=0.5,
             fps=30,
             path_tracing=args_cli.path_tracing,
+            dual=args_cli.dual_view,
         )
-        dual_recorder.setup()
-        # Need some warmup frames for the renderer.
+        video_recorder.setup()
         for _ in range(5):
             env.unwrapped.sim.render()
-        print(f"[INFO] Dual-view recording: {args_cli.video_length} steps → {video_dir}")
+        mode = "dual-view" if args_cli.dual_view else "single-view"
+        print(f"[INFO] {mode} recording ({args_cli.video_length} steps) → {video_dir}")
+        print("[INFO] HUD: phase (touch/chase/approach), speeds, contact, CG labels.")
 
     # reset environment
     # breakpoint()
@@ -443,20 +501,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # env stepping
             obs, _, _, _ = env.step(actions)
 
-        # Capture frame for dual-view recording with play HUD overlay.
-        if dual_recorder is not None:
+        if video_recorder is not None:
             overlay = _get_play_overlay(env, timestep)
-            dual_recorder.capture(overlay_text=overlay)
+            video_recorder.capture(overlay_text=overlay)
 
         if args_cli.video or args_cli.dual_view:
             timestep += 1
-            # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
 
-    # Save dual-view video.
-    if dual_recorder is not None:
-        dual_recorder.save()
+    if video_recorder is not None:
+        video_recorder.save()
 
     # close the simulator
     env.close()

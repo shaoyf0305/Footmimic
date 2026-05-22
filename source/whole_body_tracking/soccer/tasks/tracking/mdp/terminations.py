@@ -16,7 +16,8 @@ from soccer.tasks.tracking.mdp.rewards_dribbling import (
     _dribbling_recent_contact_gate,
     soccer_ball_contact_force_magnitude,
 )
-from soccer.tasks.tracking.mdp.task_frame import compute_dribble_phase_masks, task_forward_offset
+from soccer.tasks.tracking.mdp.rewards_dribbling import gather_dribble_phase_bundle
+from soccer.tasks.tracking.mdp.task_frame import task_forward_offset
 
 from soccer.tasks.tracking.mdp.rewards import _get_body_indexes
 
@@ -30,38 +31,44 @@ def _dribble_phase_context(
     chase_min_ahead: float,
     approach_max_dist: float,
     approach_ball_speed_max: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pelvis–ball geometry and touch/chase/approach masks shared by dribble terminations."""
+    foot_cfg: SceneEntityCfg | None = None,
+    close_max_dist: float = 0.48,
+    close_x_min: float = 0.18,
+    close_x_max: float = 0.62,
+    seek_touch_min_steps: int = 2,
+    seek_touch_commit_dist: float = 0.24,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pelvis–ball geometry and phase masks shared by dribble terminations."""
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
+    ball_pos_w = soccer_ball.data.root_pos_w
+    dist_xy = torch.norm(ball_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2], dim=-1)
 
-    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
-    has_contact = fmag > contact_force_threshold
-    recent_contact = _dribbling_recent_contact_gate(
+    bundle = gather_dribble_phase_bundle(
         env,
+        command,
         ball_sensor_name,
         contact_force_threshold,
         recent_contact_window,
-        command=command,
-    )
-
-    pelvis_pos_w = command.robot_pelvis_pos_w
-    ball_pos_w = soccer_ball.data.root_pos_w
-    x_ahead = task_forward_offset(ball_pos_w, pelvis_pos_w)
-    dist_xy = torch.norm(ball_pos_w[:, :2] - pelvis_pos_w[:, :2], dim=-1)
-    ball_speed_xy = torch.norm(soccer_ball.data.root_lin_vel_w[:, :2], dim=-1)
-
-    touch_phase, chase_phase, approach_phase = compute_dribble_phase_masks(
-        has_contact,
-        recent_contact,
-        x_ahead,
-        dist_xy,
-        ball_speed_xy,
+        foot_cfg,
         chase_min_ahead=chase_min_ahead,
         approach_max_dist=approach_max_dist,
         approach_ball_speed_max=approach_ball_speed_max,
+        close_max_dist=close_max_dist,
+        close_x_min=close_x_min,
+        close_x_max=close_x_max,
+        seek_touch_min_steps=seek_touch_min_steps,
+        seek_touch_commit_dist=seek_touch_commit_dist,
     )
-    return has_contact, touch_phase, chase_phase, approach_phase, dist_xy
+    has_contact = soccer_ball_contact_force_magnitude(env, ball_sensor_name) > contact_force_threshold
+    return (
+        has_contact,
+        bundle.touch,
+        bundle.seek_touch,
+        bundle.chase,
+        bundle.approach,
+        dist_xy,
+    )
 
 
 def bad_anchor_pos(env: ManagerBasedRLEnv, command_name: str, threshold: float) -> torch.Tensor:
@@ -136,7 +143,7 @@ def ball_lost_dribbling(
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
 
-    _, _, chase_phase, _, dist_xy = _dribble_phase_context(
+    _, _, _, chase_phase, _, dist_xy = _dribble_phase_context(
         env,
         command_name,
         ball_sensor_name,
@@ -178,7 +185,7 @@ def dribbling_no_ball_contact_timeout(
     a kick). It only accumulates in approach / idle phases to block "hover near
     the ball without ever touching" without cutting kick–chase–kick rollouts short.
     """
-    has_contact, _, chase_phase, _, _ = _dribble_phase_context(
+    has_contact, _, _, chase_phase, _, _ = _dribble_phase_context(
         env,
         command_name,
         ball_sensor_name,

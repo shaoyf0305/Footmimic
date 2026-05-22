@@ -115,8 +115,14 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "chase_min_ahead": 0.35,
                 "approach_max_dist": 0.55,
                 "approach_ball_speed_max": 0.35,
+                "close_max_dist": 0.48,
+                "close_x_min": 0.18,
+                "close_x_max": 0.62,
+                "seek_touch_min_steps": 2,
+                "seek_touch_commit_dist": 0.24,
             },
         )
+
         self.rewards.lateral_velocity_penalty = RewTerm(
             func=mdp.lateral_velocity_penalty,
             weight=-0.9,
@@ -162,6 +168,51 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
         )
         _num_ankle_links = len(legal_ankles)
 
+        self.rewards.dribbling_phased_forward_velocity.params["foot_cfg"] = _foot_cfg
+
+        self.rewards.dribbling_approach_touch_bridge = RewTerm(
+            func=mdp.dribbling_approach_touch_bridge,
+            weight=5.0,
+            params={
+                "command_name": "motion",
+                "foot_cfg": _foot_cfg,
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "recent_contact_window": 8,
+                "std": 0.18,
+                "chase_min_ahead": 0.35,
+                "approach_max_dist": 0.55,
+                "approach_ball_speed_max": 0.35,
+                "close_max_dist": 0.48,
+                "close_x_min": 0.18,
+                "close_x_max": 0.62,
+                "seek_touch_min_steps": 2,
+                "seek_touch_commit_dist": 0.24,
+                "close_approach_scale": 0.35,
+                "seek_touch_scale": 1.0,
+            },
+        )
+
+        self.rewards.dribbling_approach_touch_transition = RewTerm(
+            func=mdp.dribbling_approach_touch_transition,
+            weight=2.5,
+            params={
+                "command_name": "motion",
+                "foot_cfg": _foot_cfg,
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "recent_contact_window": 8,
+                "chase_min_ahead": 0.35,
+                "approach_max_dist": 0.55,
+                "approach_ball_speed_max": 0.35,
+                "close_max_dist": 0.48,
+                "close_x_min": 0.18,
+                "close_x_max": 0.62,
+                "seek_touch_min_steps": 2,
+                "seek_touch_commit_dist": 0.24,
+            },
+        )
+
         self.rewards.dribbling_velocity_tracking = RewTerm(
             func=mdp.dribbling_velocity_tracking,
             weight=5.0,
@@ -205,13 +256,14 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "contact_force_threshold": 1.0,
                 "max_xy_dist": 0.52,
                 "pelvis_speed_max": 0.16,
+                "min_x_ahead": 0.10,
             },
         )
 
         # Non-CG dribbling only: CG variant sets weight=0 (foot–ball distance labels cover contact).
         self.rewards.dribbling_approach_foot_ball = RewTerm(
             func=mdp.dribbling_approach_foot_ball_distance,
-            weight=1.2,
+            weight=2.5,
             params={
                 "command_name": "motion",
                 "foot_cfg": _foot_cfg,
