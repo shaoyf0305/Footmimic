@@ -143,6 +143,12 @@ def ball_lost_dribbling(
     grace_steps: int = 50,
     recent_contact_window: int = 8,
     chase_min_ahead: float = 0.35,
+    chase_ball_speed_min: float = 0.25,
+    chase_speed_margin: float = 0.08,
+    chase_catchup_ratio: float = 0.90,
+    chase_to_approach_dist: float = 0.60,
+    chase_max_steps: int = 32,
+    approach_enter_speed_margin: float = 0.06,
     approach_max_dist: float = 0.55,
     approach_ball_speed_max: float = 0.35,
 ) -> torch.Tensor:
@@ -164,6 +170,12 @@ def ball_lost_dribbling(
         chase_min_ahead,
         approach_max_dist,
         approach_ball_speed_max,
+        chase_ball_speed_min=chase_ball_speed_min,
+        chase_speed_margin=chase_speed_margin,
+        chase_catchup_ratio=chase_catchup_ratio,
+        chase_to_approach_dist=chase_to_approach_dist,
+        chase_max_steps=chase_max_steps,
+        approach_enter_speed_margin=approach_enter_speed_margin,
     )
 
     ball_vel_xy = soccer_ball.data.root_lin_vel_w[:, :2]
@@ -188,6 +200,12 @@ def dribbling_no_ball_contact_timeout(
     max_steps_without_contact: int = 200,
     recent_contact_window: int = 8,
     chase_min_ahead: float = 0.35,
+    chase_ball_speed_min: float = 0.25,
+    chase_speed_margin: float = 0.08,
+    chase_catchup_ratio: float = 0.90,
+    chase_to_approach_dist: float = 0.60,
+    chase_max_steps: int = 32,
+    approach_enter_speed_margin: float = 0.06,
     approach_max_dist: float = 0.55,
     approach_ball_speed_max: float = 0.35,
 ) -> torch.Tensor:
@@ -206,6 +224,12 @@ def dribbling_no_ball_contact_timeout(
         chase_min_ahead,
         approach_max_dist,
         approach_ball_speed_max,
+        chase_ball_speed_min=chase_ball_speed_min,
+        chase_speed_margin=chase_speed_margin,
+        chase_catchup_ratio=chase_catchup_ratio,
+        chase_to_approach_dist=chase_to_approach_dist,
+        chase_max_steps=chase_max_steps,
+        approach_enter_speed_margin=approach_enter_speed_margin,
     )
 
     step_buf = getattr(env, "episode_length_buf", torch.zeros(env.num_envs, device=env.device))
