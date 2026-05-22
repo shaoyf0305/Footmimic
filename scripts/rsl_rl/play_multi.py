@@ -125,6 +125,11 @@ _CONTACT_FORCE_THRESHOLD = 1.0
 # Match G1FlatDribblingEnvCfg termination / phased-velocity defaults.
 _DRIBBLE_RECENT_CONTACT_WINDOW = 8
 _DRIBBLE_CHASE_MIN_AHEAD = 0.35
+_DRIBBLE_CHASE_BALL_SPEED_MIN = 0.25
+_DRIBBLE_CHASE_SPEED_MARGIN = 0.08
+_DRIBBLE_CHASE_CATCHUP_RATIO = 0.90
+_DRIBBLE_CHASE_TO_APPROACH_DIST = 0.60
+_DRIBBLE_CHASE_MAX_STEPS = 32
 _DRIBBLE_APPROACH_MAX_DIST = 0.55
 _DRIBBLE_APPROACH_BALL_SPEED_MAX = 0.35
 _DRIBBLE_CLOSE_MAX_DIST = 0.48
@@ -206,6 +211,11 @@ def _get_play_overlay(env, timestep: int) -> str:
             _DRIBBLE_RECENT_CONTACT_WINDOW,
             foot_cfg,
             chase_min_ahead=_DRIBBLE_CHASE_MIN_AHEAD,
+            chase_ball_speed_min=_DRIBBLE_CHASE_BALL_SPEED_MIN,
+            chase_speed_margin=_DRIBBLE_CHASE_SPEED_MARGIN,
+            chase_catchup_ratio=_DRIBBLE_CHASE_CATCHUP_RATIO,
+            chase_to_approach_dist=_DRIBBLE_CHASE_TO_APPROACH_DIST,
+            chase_max_steps=_DRIBBLE_CHASE_MAX_STEPS,
             approach_max_dist=_DRIBBLE_APPROACH_MAX_DIST,
             approach_ball_speed_max=_DRIBBLE_APPROACH_BALL_SPEED_MAX,
             close_max_dist=_DRIBBLE_CLOSE_MAX_DIST,
@@ -219,11 +229,13 @@ def _get_play_overlay(env, timestep: int) -> str:
             phase = "approach->touch"
         recent_lbl = "YES" if recent_contact_t > 0.5 else "NO"
         steps_close = int(bundle.steps_in_close_approach[i].item())
+        steps_chase = int(bundle.steps_in_chase[i].item())
         phase_lines = [
             f"Phase: {phase}  |  sim_touch={'YES' if has_contact_t else 'NO'}  "
             f"|  recent_touch={recent_lbl} (win={_DRIBBLE_RECENT_CONTACT_WINDOW})",
             f"  x_ahead={x_ahead:.2f} m  dist_xy={pelvis_ball_xy:.2f} m  "
-            f"ball_v_xy={ball_sp_xy:.2f} m/s  close_steps={steps_close}",
+            f"ball_v_xy={ball_sp_xy:.2f} m/s  chase_steps={steps_chase}/{_DRIBBLE_CHASE_MAX_STEPS}  "
+            f"close_steps={steps_close}",
         ]
         if bool(bundle.close_approach[i].item()) and phase not in ("touch", "approach->touch"):
             phase_lines.append("  close_approach: YES (waiting for seek_touch commit)")

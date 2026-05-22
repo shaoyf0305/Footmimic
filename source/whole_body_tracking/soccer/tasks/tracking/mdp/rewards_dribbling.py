@@ -24,6 +24,7 @@ from soccer.tasks.tracking.mdp.task_frame import (
     compute_dribble_phase_target_speed,
     forward_dominance_gate,
     update_approach_touch_transition_steps,
+    update_chase_phase_steps,
     task_forward_offset,
     task_forward_speed,
     task_lateral_offset,
@@ -194,6 +195,12 @@ def gather_dribble_phase_bundle(
     foot_cfg: SceneEntityCfg | None = None,
     *,
     chase_min_ahead: float = 0.35,
+    chase_ball_speed_min: float = 0.25,
+    chase_speed_margin: float = 0.08,
+    chase_catchup_ratio: float = 0.90,
+    chase_to_approach_dist: float = 0.60,
+    chase_max_steps: int = 32,
+    approach_enter_speed_margin: float = 0.06,
     approach_max_dist: float = 0.55,
     approach_ball_speed_max: float = 0.35,
     close_max_dist: float = 0.48,
@@ -218,20 +225,28 @@ def gather_dribble_phase_bundle(
     pelvis_pos_w = command.robot_pelvis_pos_w
     x_ahead = task_forward_offset(ball_pos_w, pelvis_pos_w)
     dist_xy = torch.norm(ball_pos_w[:, :2] - pelvis_pos_w[:, :2], dim=-1)
-    ball_speed_xy = torch.norm(soccer_ball.data.root_lin_vel_w[:, :2], dim=-1)
+    ball_vel_w = soccer_ball.data.root_lin_vel_w
+    ball_speed_xy = torch.norm(ball_vel_w[:, :2], dim=-1)
+    pelvis_index = command.robot.body_names.index("pelvis")
+    pelvis_forward = task_forward_speed(command.robot.data.body_lin_vel_w[:, pelvis_index])
+    ball_forward = task_forward_speed(ball_vel_w)
 
     min_ankle_dist = torch.full_like(dist_xy, 999.0)
     if foot_cfg is not None:
         min_ankle_dist = _min_ankle_ball_distance(env, foot_cfg, ball_pos_w)
 
-    close_pre = compute_dribble_phase_bundle(
-        has_contact,
-        recent_contact,
-        x_ahead,
-        dist_xy,
-        ball_speed_xy,
+    zero_steps = torch.zeros(env.num_envs, device=env.device, dtype=torch.int32)
+    phase_kwargs = dict(
         min_ankle_ball_dist=min_ankle_dist,
+        pelvis_forward_speed=pelvis_forward,
+        ball_forward_speed=ball_forward,
         chase_min_ahead=chase_min_ahead,
+        chase_ball_speed_min=chase_ball_speed_min,
+        chase_speed_margin=chase_speed_margin,
+        chase_catchup_ratio=chase_catchup_ratio,
+        chase_to_approach_dist=chase_to_approach_dist,
+        chase_max_steps=chase_max_steps,
+        approach_enter_speed_margin=approach_enter_speed_margin,
         approach_max_dist=approach_max_dist,
         approach_ball_speed_max=approach_ball_speed_max,
         close_max_dist=close_max_dist,
@@ -240,23 +255,35 @@ def gather_dribble_phase_bundle(
         seek_touch_min_steps=seek_touch_min_steps,
         seek_touch_commit_dist=seek_touch_commit_dist,
     )
-    steps = update_approach_touch_transition_steps(env, close_pre.close_approach, has_contact)
+    chase_pre = compute_dribble_phase_bundle(
+        has_contact,
+        recent_contact,
+        x_ahead,
+        dist_xy,
+        ball_speed_xy,
+        steps_in_chase=zero_steps,
+        **phase_kwargs,
+    )
+    chase_steps = update_chase_phase_steps(env, chase_pre.chase, has_contact)
+    close_pre = compute_dribble_phase_bundle(
+        has_contact,
+        recent_contact,
+        x_ahead,
+        dist_xy,
+        ball_speed_xy,
+        steps_in_chase=chase_steps,
+        **phase_kwargs,
+    )
+    approach_steps = update_approach_touch_transition_steps(env, close_pre.close_approach, has_contact)
     return compute_dribble_phase_bundle(
         has_contact,
         recent_contact,
         x_ahead,
         dist_xy,
         ball_speed_xy,
-        steps_in_close_approach=steps,
-        min_ankle_ball_dist=min_ankle_dist,
-        chase_min_ahead=chase_min_ahead,
-        approach_max_dist=approach_max_dist,
-        approach_ball_speed_max=approach_ball_speed_max,
-        close_max_dist=close_max_dist,
-        close_x_min=close_x_min,
-        close_x_max=close_x_max,
-        seek_touch_min_steps=seek_touch_min_steps,
-        seek_touch_commit_dist=seek_touch_commit_dist,
+        steps_in_close_approach=approach_steps,
+        steps_in_chase=chase_steps,
+        **phase_kwargs,
     )
 
 
@@ -275,9 +302,17 @@ def dribbling_phased_forward_velocity(
     contact_force_threshold: float = 1.0,
     recent_contact_window: int = 8,
     v_touch: float = 0.20,
-    v_chase: float = 0.75,
-    v_approach: float = 0.30,
+    v_chase_floor: float = 0.35,
+    chase_target_ball_ratio: float = 0.92,
+    approach_overshoot: float = 0.14,
+    v_approach_floor: float = 0.38,
     chase_min_ahead: float = 0.35,
+    chase_ball_speed_min: float = 0.25,
+    chase_speed_margin: float = 0.08,
+    chase_catchup_ratio: float = 0.90,
+    chase_to_approach_dist: float = 0.60,
+    chase_max_steps: int = 32,
+    approach_enter_speed_margin: float = 0.06,
     approach_max_dist: float = 0.55,
     approach_ball_speed_max: float = 0.35,
     close_max_dist: float = 0.48,
@@ -287,10 +322,10 @@ def dribbling_phased_forward_velocity(
     seek_touch_commit_dist: float = 0.24,
     foot_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """Reward matching a phase-dependent forward speed target (kick–chase–approach).
+    """Reward pelvis speed vs phase target: chase ≈ ball, approach > ball, touch slow.
 
-    Replaces a constant ``forward_velocity`` target during dribbling so the policy
-    is not pushed to maintain cruise speed while controlling or approaching the ball.
+    Replaces a constant cruise target so the policy runs up, closes, then contacts
+    instead of holding a kick-ready pose at high speed.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     robot = command.robot
@@ -316,6 +351,12 @@ def dribbling_phased_forward_velocity(
         recent_contact_window,
         foot_cfg,
         chase_min_ahead=chase_min_ahead,
+        chase_ball_speed_min=chase_ball_speed_min,
+        chase_speed_margin=chase_speed_margin,
+        chase_catchup_ratio=chase_catchup_ratio,
+        chase_to_approach_dist=chase_to_approach_dist,
+        chase_max_steps=chase_max_steps,
+        approach_enter_speed_margin=approach_enter_speed_margin,
         approach_max_dist=approach_max_dist,
         approach_ball_speed_max=approach_ball_speed_max,
         close_max_dist=close_max_dist,
@@ -325,12 +366,16 @@ def dribbling_phased_forward_velocity(
         seek_touch_commit_dist=seek_touch_commit_dist,
     )
 
-    ref = forward_speed
-    target_speed = torch.full_like(ref, v_approach)
-    target_speed = torch.where(bundle.approach, torch.full_like(target_speed, v_approach), target_speed)
-    target_speed = torch.where(bundle.close_approach, torch.full_like(target_speed, v_touch), target_speed)
+    soccer_ball = env.scene["soccer_ball"]
+    ball_forward = task_forward_speed(soccer_ball.data.root_lin_vel_w)
+    chase_target = (ball_forward * chase_target_ball_ratio).clamp(min=v_chase_floor)
+    approach_target = (ball_forward + approach_overshoot).clamp(min=v_approach_floor)
+
+    target_speed = torch.full_like(forward_speed, v_approach_floor)
+    in_approach = bundle.approach | bundle.close_approach
+    target_speed = torch.where(in_approach, approach_target, target_speed)
     target_speed = torch.where(bundle.seek_touch, torch.full_like(target_speed, v_touch), target_speed)
-    target_speed = torch.where(bundle.chase, torch.full_like(target_speed, v_chase), target_speed)
+    target_speed = torch.where(bundle.chase, chase_target, target_speed)
     target_speed = torch.where(bundle.touch, torch.full_like(target_speed, v_touch), target_speed)
 
     error = (forward_speed - target_speed) ** 2
@@ -545,6 +590,12 @@ def dribbling_approach_touch_bridge(
     recent_contact_window: int = 8,
     std: float = 0.20,
     chase_min_ahead: float = 0.35,
+    chase_ball_speed_min: float = 0.25,
+    chase_speed_margin: float = 0.08,
+    chase_catchup_ratio: float = 0.90,
+    chase_to_approach_dist: float = 0.60,
+    chase_max_steps: int = 32,
+    approach_enter_speed_margin: float = 0.06,
     approach_max_dist: float = 0.55,
     approach_ball_speed_max: float = 0.35,
     close_max_dist: float = 0.48,
@@ -568,6 +619,12 @@ def dribbling_approach_touch_bridge(
         recent_contact_window,
         foot_cfg,
         chase_min_ahead=chase_min_ahead,
+        chase_ball_speed_min=chase_ball_speed_min,
+        chase_speed_margin=chase_speed_margin,
+        chase_catchup_ratio=chase_catchup_ratio,
+        chase_to_approach_dist=chase_to_approach_dist,
+        chase_max_steps=chase_max_steps,
+        approach_enter_speed_margin=approach_enter_speed_margin,
         approach_max_dist=approach_max_dist,
         approach_ball_speed_max=approach_ball_speed_max,
         close_max_dist=close_max_dist,
@@ -582,8 +639,8 @@ def dribbling_approach_touch_bridge(
     shaping = torch.exp(-(min_dist ** 2) / (max(std, 1e-6) ** 2))
 
     gate = torch.zeros(env.num_envs, device=env.device, dtype=shaping.dtype)
-    in_close_only = bundle.close_approach & (~bundle.seek_touch)
-    gate = torch.where(in_close_only, torch.full_like(gate, close_approach_scale), gate)
+    in_approach_touch = (bundle.approach | bundle.close_approach) & (~bundle.seek_touch)
+    gate = torch.where(in_approach_touch, torch.full_like(gate, close_approach_scale), gate)
     gate = torch.where(bundle.seek_touch, torch.full_like(gate, seek_touch_scale), gate)
     return shaping * gate
 
@@ -596,6 +653,12 @@ def dribbling_approach_touch_transition(
     contact_force_threshold: float = 1.0,
     recent_contact_window: int = 8,
     chase_min_ahead: float = 0.35,
+    chase_ball_speed_min: float = 0.25,
+    chase_speed_margin: float = 0.08,
+    chase_catchup_ratio: float = 0.90,
+    chase_to_approach_dist: float = 0.60,
+    chase_max_steps: int = 32,
+    approach_enter_speed_margin: float = 0.06,
     approach_max_dist: float = 0.55,
     approach_ball_speed_max: float = 0.35,
     close_max_dist: float = 0.48,
@@ -617,6 +680,12 @@ def dribbling_approach_touch_transition(
         recent_contact_window,
         foot_cfg,
         chase_min_ahead=chase_min_ahead,
+        chase_ball_speed_min=chase_ball_speed_min,
+        chase_speed_margin=chase_speed_margin,
+        chase_catchup_ratio=chase_catchup_ratio,
+        chase_to_approach_dist=chase_to_approach_dist,
+        chase_max_steps=chase_max_steps,
+        approach_enter_speed_margin=approach_enter_speed_margin,
         approach_max_dist=approach_max_dist,
         approach_ball_speed_max=approach_ball_speed_max,
         close_max_dist=close_max_dist,
@@ -1366,42 +1435,58 @@ def dribbling_chase_ball_reward(
     command_name: str = "motion",
     ball_sensor_name: str = "soccer_ball_contact",
     contact_force_threshold: float = 1.0,
-    min_ball_ahead: float = 0.25,
-    max_chase_xy_dist: float = 1.1,
-    pelvis_forward_speed_min: float = 0.22,
-    forward_speed_scale: float = 0.45,
+    recent_contact_window: int = 8,
+    std: float = 0.22,
+    chase_target_ball_ratio: float = 0.92,
+    v_chase_floor: float = 0.35,
+    chase_min_ahead: float = 0.35,
+    chase_ball_speed_min: float = 0.25,
+    chase_speed_margin: float = 0.08,
+    chase_catchup_ratio: float = 0.90,
+    chase_to_approach_dist: float = 0.60,
+    chase_max_steps: int = 32,
+    approach_enter_speed_margin: float = 0.06,
+    approach_max_dist: float = 0.55,
+    approach_ball_speed_max: float = 0.35,
+    foot_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """Reward running forward to catch a ball that rolled ahead after a touch.
+    """In **chase**, reward pelvis forward speed catching up to (but not overshooting) the ball.
 
-    Active when there is no ball contact, the ball lies on task +X ahead of the
-    pelvis by at least ``min_ball_ahead``, and the robot is within chase range.
-    This shapes kick → run → kick rather than shuffling beside the ball.
+    Target is ``ball_vx * chase_target_ball_ratio``; best when still slightly slower than the
+    ball so the phase hands off to approach for closing distance.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-
-    no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
-    pelvis_pos_w = command.robot_pelvis_pos_w
-    ball_pos_w = soccer_ball.data.root_pos_w
-
-    x_ahead = task_forward_offset(ball_pos_w, pelvis_pos_w)
-    dist_xy = torch.norm(ball_pos_w[:, :2] - pelvis_pos_w[:, :2], dim=-1)
-
-    ball_ahead = x_ahead >= min_ball_ahead
-    in_range = dist_xy <= max_chase_xy_dist
-
-    pelvis_vel_w = command.robot_anchor_lin_vel_w[:, :3]
-    forward = task_forward_speed(pelvis_vel_w)
-    dominance = task_velocity_forward_dominance(pelvis_vel_w)
-    speed_rew = torch.clamp(
-        (forward - pelvis_forward_speed_min) / max(forward_speed_scale, 1e-6),
-        min=0.0,
-        max=1.0,
+    bundle = gather_dribble_phase_bundle(
+        env,
+        command,
+        ball_sensor_name,
+        contact_force_threshold,
+        recent_contact_window,
+        foot_cfg,
+        chase_min_ahead=chase_min_ahead,
+        chase_ball_speed_min=chase_ball_speed_min,
+        chase_speed_margin=chase_speed_margin,
+        chase_catchup_ratio=chase_catchup_ratio,
+        chase_to_approach_dist=chase_to_approach_dist,
+        chase_max_steps=chase_max_steps,
+        approach_enter_speed_margin=approach_enter_speed_margin,
+        approach_max_dist=approach_max_dist,
+        approach_ball_speed_max=approach_ball_speed_max,
     )
+
+    soccer_ball = env.scene["soccer_ball"]
+    ball_forward = task_forward_speed(soccer_ball.data.root_lin_vel_w)
+    pelvis_vel_w = command.robot_anchor_lin_vel_w[:, :3]
+    pelvis_forward = task_forward_speed(pelvis_vel_w)
+    dominance = task_velocity_forward_dominance(pelvis_vel_w)
+
+    chase_target = (ball_forward * chase_target_ball_ratio).clamp(min=v_chase_floor)
+    behind_ball = pelvis_forward <= (ball_forward + 0.05)
+    match = torch.exp(-((pelvis_forward - chase_target) ** 2) / max(std, 1e-6) ** 2)
+    speed_rew = match * behind_ball.to(match.dtype)
     speed_rew = speed_rew * forward_dominance_gate(dominance, 0.45)
 
-    active = no_ball & ball_ahead & in_range
-    return speed_rew * active.to(torch.float32)
+    return speed_rew * bundle.chase.to(torch.float32)
 
 
 def dribbling_rapid_retouch_penalty(

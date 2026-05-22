@@ -96,7 +96,7 @@ def forward_dominance_gate(dominance: torch.Tensor, min_dominance: float) -> tor
 
 @dataclass
 class DribblePhaseBundle:
-    """Per-env dribble phase masks (mutually exclusive display priority: touch > seek_touch > chase > approach)."""
+    """Per-env dribble phase masks (display priority: touch > seek_touch > chase > approach)."""
 
     touch: torch.Tensor
     seek_touch: torch.Tensor
@@ -105,6 +105,32 @@ class DribblePhaseBundle:
     close_approach: torch.Tensor
     transition_ready: torch.Tensor
     steps_in_close_approach: torch.Tensor
+    steps_in_chase: torch.Tensor
+
+
+def update_chase_phase_steps(
+    env: ManagerBasedRLEnv,
+    chase_active: torch.Tensor,
+    has_contact: torch.Tensor,
+    *,
+    buf_name: str = "_dribble_steps_in_chase",
+) -> torch.Tensor:
+    """Count consecutive steps in chase (resets on touch or leaving chase)."""
+    step_buf = getattr(env, "episode_length_buf", None)
+    reset_ep = step_buf == 0 if step_buf is not None else torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    cnt = getattr(env, buf_name, None)
+    if cnt is None or cnt.shape[0] != env.num_envs:
+        cnt = torch.zeros(env.num_envs, device=env.device, dtype=torch.int32)
+
+    leave_or_touch = has_contact | (~chase_active)
+    cnt = torch.where(
+        reset_ep | leave_or_touch,
+        torch.zeros_like(cnt),
+        torch.where(chase_active, cnt + 1, cnt),
+    )
+    setattr(env, buf_name, cnt)
+    return cnt
 
 
 def update_approach_touch_transition_steps(
@@ -139,9 +165,18 @@ def compute_dribble_phase_bundle(
     dist_xy: torch.Tensor,
     ball_speed_xy: torch.Tensor,
     *,
+    pelvis_forward_speed: torch.Tensor | None = None,
+    ball_forward_speed: torch.Tensor | None = None,
     steps_in_close_approach: torch.Tensor | None = None,
+    steps_in_chase: torch.Tensor | None = None,
     min_ankle_ball_dist: torch.Tensor | None = None,
     chase_min_ahead: float = 0.35,
+    chase_ball_speed_min: float = 0.25,
+    chase_speed_margin: float = 0.08,
+    chase_catchup_ratio: float = 0.90,
+    chase_to_approach_dist: float = 0.60,
+    chase_max_steps: int = 32,
+    approach_enter_speed_margin: float = 0.06,
     approach_max_dist: float = 0.55,
     approach_ball_speed_max: float = 0.35,
     approach_min_x_ahead: float = 0.10,
@@ -152,20 +187,47 @@ def compute_dribble_phase_bundle(
     seek_touch_min_steps: int = 2,
     seek_touch_commit_dist: float = 0.24,
 ) -> DribblePhaseBundle:
-    """Full phase logic including explicit **approach → touch** via ``seek_touch``.
+    """Kick → chase → approach → touch (run-up, close, contact).
 
-    Pipeline:
-      chase (ball far ahead) → approach (ball in corridor, not close) →
-      close_approach (near, no sensor touch) → **seek_touch** (transition committed) →
-      touch (``has_contact`` or ``recent_contact``).
+    **Chase** (limited time): ball ahead and rolling; pelvis slower than ball — match
+    ball speed from below. Ends when speed caught up, distance closed, robot overtakes
+    ball forward speed, or ``chase_max_steps`` (cannot farm infinite chase).
+
+    **Approach**: not chasing; shorten XY distance with pelvis faster than ball.
+
+    **seek_touch** / **touch**: committed foot contact / sensor contact window.
     """
     touch_phase = has_contact | (recent_contact > 0.5)
-    chase_phase = (~touch_phase) & (x_ahead >= chase_min_ahead) & (dist_xy > approach_max_dist)
+
+    if pelvis_forward_speed is None:
+        pelvis_forward_speed = torch.zeros_like(dist_xy)
+    if ball_forward_speed is None:
+        ball_forward_speed = torch.zeros_like(dist_xy)
+    if steps_in_chase is None:
+        steps_in_chase = torch.zeros_like(dist_xy, dtype=torch.int32)
+
+    ball_ahead = x_ahead >= chase_min_ahead
+    ball_rolling = ball_forward_speed >= chase_ball_speed_min
+    robot_slower = pelvis_forward_speed < (ball_forward_speed - chase_speed_margin)
+    still_far = dist_xy > chase_to_approach_dist
+
+    chase_kinematic = (
+        (~touch_phase) & ball_ahead & ball_rolling & robot_slower & still_far
+    )
+    caught_up_speed = pelvis_forward_speed >= (ball_forward_speed * chase_catchup_ratio)
+    close_enough = dist_xy <= chase_to_approach_dist
+    overtaking = pelvis_forward_speed > (ball_forward_speed + approach_enter_speed_margin)
+    chase_timed_out = steps_in_chase >= int(chase_max_steps)
+    chase_handoff = caught_up_speed | close_enough | overtaking | chase_timed_out
+
+    chase_phase = chase_kinematic & (~chase_handoff)
+
     ball_in_corridor = (x_ahead >= approach_min_x_ahead) & (x_ahead <= approach_max_x_ahead)
     approach_wide = (
         (~touch_phase)
         & (~chase_phase)
         & ball_in_corridor
+        & (~has_contact)
         & (
             (dist_xy <= approach_max_dist)
             | (
@@ -174,15 +236,7 @@ def compute_dribble_phase_bundle(
             )
         )
     )
-    close_approach = compute_close_approach_mask(
-        approach_wide,
-        has_contact,
-        x_ahead,
-        dist_xy,
-        close_max_dist=close_max_dist,
-        close_x_min=close_x_min,
-        close_x_max=close_x_max,
-    )
+    close_approach = approach_wide
 
     if steps_in_close_approach is None:
         steps_in_close_approach = torch.zeros_like(dist_xy, dtype=torch.int32)
@@ -194,7 +248,7 @@ def compute_dribble_phase_bundle(
         | (min_ankle_ball_dist <= seek_touch_commit_dist)
     )
     seek_touch_phase = transition_ready
-    approach_phase = approach_wide & (~close_approach) & (~touch_phase) & (~chase_phase)
+    approach_phase = close_approach & (~seek_touch_phase) & (~touch_phase)
 
     return DribblePhaseBundle(
         touch=touch_phase,
@@ -204,6 +258,7 @@ def compute_dribble_phase_bundle(
         close_approach=close_approach,
         transition_ready=transition_ready,
         steps_in_close_approach=steps_in_close_approach,
+        steps_in_chase=steps_in_chase,
     )
 
 
@@ -216,7 +271,7 @@ def resolve_dribble_phase_label(bundle: DribblePhaseBundle, env_index: int = 0) 
         return "seek_touch"
     if bool(bundle.chase[i].item()):
         return "chase"
-    if bool(bundle.approach[i].item()):
+    if bool(bundle.approach[i].item()) or bool(bundle.close_approach[i].item()):
         return "approach"
     return "idle"
 
@@ -228,9 +283,18 @@ def compute_dribble_phase_masks(
     dist_xy: torch.Tensor,
     ball_speed_xy: torch.Tensor,
     *,
+    pelvis_forward_speed: torch.Tensor | None = None,
+    ball_forward_speed: torch.Tensor | None = None,
     steps_in_close_approach: torch.Tensor | None = None,
+    steps_in_chase: torch.Tensor | None = None,
     min_ankle_ball_dist: torch.Tensor | None = None,
     chase_min_ahead: float = 0.35,
+    chase_ball_speed_min: float = 0.25,
+    chase_speed_margin: float = 0.08,
+    chase_catchup_ratio: float = 0.90,
+    chase_to_approach_dist: float = 0.60,
+    chase_max_steps: int = 32,
+    approach_enter_speed_margin: float = 0.06,
     approach_max_dist: float = 0.55,
     approach_ball_speed_max: float = 0.35,
     approach_min_x_ahead: float = 0.10,
@@ -250,7 +314,16 @@ def compute_dribble_phase_masks(
         ball_speed_xy,
         steps_in_close_approach=steps_in_close_approach,
         min_ankle_ball_dist=min_ankle_ball_dist,
+        pelvis_forward_speed=pelvis_forward_speed,
+        ball_forward_speed=ball_forward_speed,
+        steps_in_chase=steps_in_chase,
         chase_min_ahead=chase_min_ahead,
+        chase_ball_speed_min=chase_ball_speed_min,
+        chase_speed_margin=chase_speed_margin,
+        chase_catchup_ratio=chase_catchup_ratio,
+        chase_to_approach_dist=chase_to_approach_dist,
+        chase_max_steps=chase_max_steps,
+        approach_enter_speed_margin=approach_enter_speed_margin,
         approach_max_dist=approach_max_dist,
         approach_ball_speed_max=approach_ball_speed_max,
         approach_min_x_ahead=approach_min_x_ahead,
@@ -274,7 +347,7 @@ def compute_close_approach_mask(
     close_x_min: float = 0.18,
     close_x_max: float = 0.62,
 ) -> torch.Tensor:
-    """Near the ball in approach but not yet touching — use touch-speed / foot-shaping."""
+    """Legacy tight near-ball mask; prefer merged ``close_approach`` in ``compute_dribble_phase_bundle``."""
     return (
         approach_phase
         & (~has_contact)
@@ -291,12 +364,23 @@ def compute_dribble_phase_target_speed(
     dist_xy: torch.Tensor,
     ball_speed_xy: torch.Tensor,
     *,
+    pelvis_forward_speed: torch.Tensor | None = None,
+    ball_forward_speed: torch.Tensor | None = None,
     steps_in_close_approach: torch.Tensor | None = None,
+    steps_in_chase: torch.Tensor | None = None,
     min_ankle_ball_dist: torch.Tensor | None = None,
     v_touch: float = 0.20,
-    v_chase: float = 0.75,
-    v_approach: float = 0.30,
+    v_chase_floor: float = 0.35,
+    chase_target_ball_ratio: float = 0.92,
+    approach_overshoot: float = 0.14,
+    v_approach_floor: float = 0.38,
     chase_min_ahead: float = 0.35,
+    chase_ball_speed_min: float = 0.25,
+    chase_speed_margin: float = 0.08,
+    chase_catchup_ratio: float = 0.90,
+    chase_to_approach_dist: float = 0.60,
+    chase_max_steps: int = 32,
+    approach_enter_speed_margin: float = 0.06,
     approach_max_dist: float = 0.55,
     approach_ball_speed_max: float = 0.35,
     close_max_dist: float = 0.48,
@@ -305,7 +389,9 @@ def compute_dribble_phase_target_speed(
     seek_touch_min_steps: int = 2,
     seek_touch_commit_dist: float = 0.24,
 ) -> torch.Tensor:
-    """Pelvis forward speed target: chase → approach → seek_touch → touch."""
+    """Pelvis forward speed target: chase (≈ball) → approach (>ball) → touch (slow)."""
+    if ball_forward_speed is None:
+        ball_forward_speed = torch.zeros_like(x_ahead)
     bundle = compute_dribble_phase_bundle(
         has_contact,
         recent_contact,
@@ -314,7 +400,16 @@ def compute_dribble_phase_target_speed(
         ball_speed_xy,
         steps_in_close_approach=steps_in_close_approach,
         min_ankle_ball_dist=min_ankle_ball_dist,
+        pelvis_forward_speed=pelvis_forward_speed,
+        ball_forward_speed=ball_forward_speed,
+        steps_in_chase=steps_in_chase,
         chase_min_ahead=chase_min_ahead,
+        chase_ball_speed_min=chase_ball_speed_min,
+        chase_speed_margin=chase_speed_margin,
+        chase_catchup_ratio=chase_catchup_ratio,
+        chase_to_approach_dist=chase_to_approach_dist,
+        chase_max_steps=chase_max_steps,
+        approach_enter_speed_margin=approach_enter_speed_margin,
         approach_max_dist=approach_max_dist,
         approach_ball_speed_max=approach_ball_speed_max,
         close_max_dist=close_max_dist,
@@ -324,11 +419,13 @@ def compute_dribble_phase_target_speed(
         seek_touch_commit_dist=seek_touch_commit_dist,
     )
 
-    target = torch.full_like(x_ahead, v_approach)
-    target = torch.where(bundle.approach, torch.full_like(target, v_approach), target)
-    target = torch.where(bundle.close_approach, torch.full_like(target, v_touch), target)
+    chase_target = (ball_forward_speed * chase_target_ball_ratio).clamp(min=v_chase_floor)
+    approach_target = (ball_forward_speed + approach_overshoot).clamp(min=v_approach_floor)
+
+    target = torch.full_like(x_ahead, v_approach_floor)
+    target = torch.where(bundle.approach | bundle.close_approach, approach_target, target)
     target = torch.where(bundle.seek_touch, torch.full_like(target, v_touch), target)
-    target = torch.where(bundle.chase, torch.full_like(target, v_chase), target)
+    target = torch.where(bundle.chase, chase_target, target)
     target = torch.where(bundle.touch, torch.full_like(target, v_touch), target)
     return target
 

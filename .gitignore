@@ -51,6 +51,8 @@ motion-data/
 .hypothesis/
 gmr/
 temp/
+pipeline/
+inputs/
 
 *_original.*
 *_temp.*
