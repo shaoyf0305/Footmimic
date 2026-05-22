@@ -16,7 +16,8 @@ from soccer.tasks.tracking.mdp.rewards_dribbling import (
     _dribbling_recent_contact_gate,
     soccer_ball_contact_force_magnitude,
 )
-from soccer.tasks.tracking.mdp.task_frame import compute_dribble_phase_masks, task_forward_offset
+from soccer.tasks.tracking.mdp.rewards_dribbling import gather_dribble_phase_bundle
+from soccer.tasks.tracking.mdp.task_frame import task_forward_offset
 
 from soccer.tasks.tracking.mdp.rewards import _get_body_indexes
 
@@ -27,41 +28,49 @@ def _dribble_phase_context(
     ball_sensor_name: str,
     contact_force_threshold: float,
     recent_contact_window: int,
-    chase_min_ahead: float,
+    approach_run_min_ahead: float,
     approach_max_dist: float,
     approach_ball_speed_max: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pelvis–ball geometry and touch/chase/approach masks shared by dribble terminations."""
+    approach_run_max_dist: float = 1.85,
+    foot_cfg: SceneEntityCfg | None = None,
+    close_max_dist: float = 0.48,
+    close_x_min: float = 0.18,
+    close_x_max: float = 0.62,
+    seek_touch_min_steps: int = 2,
+    seek_touch_commit_dist: float = 0.24,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pelvis–ball geometry and phase masks shared by dribble terminations."""
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
+    ball_pos_w = soccer_ball.data.root_pos_w
+    dist_xy = torch.norm(ball_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2], dim=-1)
 
-    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
-    has_contact = fmag > contact_force_threshold
-    recent_contact = _dribbling_recent_contact_gate(
+    bundle = gather_dribble_phase_bundle(
         env,
+        command,
         ball_sensor_name,
         contact_force_threshold,
         recent_contact_window,
-        command=command,
-    )
-
-    pelvis_pos_w = command.robot_pelvis_pos_w
-    ball_pos_w = soccer_ball.data.root_pos_w
-    x_ahead = task_forward_offset(ball_pos_w, pelvis_pos_w)
-    dist_xy = torch.norm(ball_pos_w[:, :2] - pelvis_pos_w[:, :2], dim=-1)
-    ball_speed_xy = torch.norm(soccer_ball.data.root_lin_vel_w[:, :2], dim=-1)
-
-    touch_phase, chase_phase, approach_phase = compute_dribble_phase_masks(
-        has_contact,
-        recent_contact,
-        x_ahead,
-        dist_xy,
-        ball_speed_xy,
-        chase_min_ahead=chase_min_ahead,
+        foot_cfg,
+        approach_run_min_ahead=approach_run_min_ahead,
+        approach_run_max_dist=approach_run_max_dist,
         approach_max_dist=approach_max_dist,
         approach_ball_speed_max=approach_ball_speed_max,
+        close_max_dist=close_max_dist,
+        close_x_min=close_x_min,
+        close_x_max=close_x_max,
+        seek_touch_min_steps=seek_touch_min_steps,
+        seek_touch_commit_dist=seek_touch_commit_dist,
     )
-    return has_contact, touch_phase, chase_phase, approach_phase, dist_xy
+    has_contact = soccer_ball_contact_force_magnitude(env, ball_sensor_name) > contact_force_threshold
+    return (
+        has_contact,
+        bundle.touch,
+        bundle.seek_touch,
+        bundle.approach,
+        dist_xy,
+        ball_pos_w,
+    )
 
 
 def bad_anchor_pos(env: ManagerBasedRLEnv, command_name: str, threshold: float) -> torch.Tensor:
@@ -123,29 +132,32 @@ def ball_lost_dribbling(
     max_vel_divergence: float = 3.5,
     grace_steps: int = 50,
     recent_contact_window: int = 8,
-    chase_min_ahead: float = 0.35,
-    approach_max_dist: float = 0.55,
+    approach_run_min_ahead: float = 0.35,
+    approach_max_dist: float = 0.60,
     approach_ball_speed_max: float = 0.35,
 ) -> torch.Tensor:
     """Terminate the episode if the ball is lost during dribbling.
 
-    During **chase** (ball ahead, no touch), only XY distance is checked and the
-    limit is relaxed (``max_distance_chase``). Velocity mismatch is ignored while
-    chasing so a kicked ball rolling ahead does not instantly fail the episode.
+    During **approach** with the ball ahead (run-after-kick), only XY distance is checked
+    and the limit is relaxed (``max_distance_chase``). Velocity mismatch is ignored while
+    running after the ball so a kicked rollout does not instantly fail the episode.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
 
-    _, _, chase_phase, _, dist_xy = _dribble_phase_context(
+    _, _, _, approach_phase, dist_xy, ball_pos_w = _dribble_phase_context(
         env,
         command_name,
         ball_sensor_name,
         contact_force_threshold,
         recent_contact_window,
-        chase_min_ahead,
+        approach_run_min_ahead,
         approach_max_dist,
         approach_ball_speed_max,
     )
+
+    x_ahead = task_forward_offset(ball_pos_w, command.robot_pelvis_pos_w)
+    run_after_ball = approach_phase & (x_ahead >= approach_run_min_ahead)
 
     ball_vel_xy = soccer_ball.data.root_lin_vel_w[:, :2]
     pelvis_vel_xy = command.robot_anchor_lin_vel_w[:, :2]
@@ -154,9 +166,9 @@ def ball_lost_dribbling(
     step_buf = getattr(env, "episode_length_buf", torch.zeros(env.num_envs, device=env.device))
     past_grace = step_buf > grace_steps
 
-    dist_limit = torch.where(chase_phase, torch.full_like(dist_xy, max_distance_chase), torch.full_like(dist_xy, max_distance))
+    dist_limit = torch.where(run_after_ball, torch.full_like(dist_xy, max_distance_chase), torch.full_like(dist_xy, max_distance))
     lost_dist = dist_xy > dist_limit
-    lost_vel = past_grace & (~chase_phase) & (vel_diff > max_vel_divergence)
+    lost_vel = past_grace & (~run_after_ball) & (vel_diff > max_vel_divergence)
     return past_grace & (lost_dist | lost_vel)
 
 
@@ -168,26 +180,29 @@ def dribbling_no_ball_contact_timeout(
     grace_steps: int = 50,
     max_steps_without_contact: int = 200,
     recent_contact_window: int = 8,
-    chase_min_ahead: float = 0.35,
-    approach_max_dist: float = 0.55,
+    approach_run_min_ahead: float = 0.35,
+    approach_max_dist: float = 0.60,
     approach_ball_speed_max: float = 0.35,
 ) -> torch.Tensor:
     """End the episode if the ball sees no robot contact for too long after warm-up.
 
-    The counter does **not** advance during chase phase (ball ahead, pursuing after
-    a kick). It only accumulates in approach / idle phases to block "hover near
-    the ball without ever touching" without cutting kick–chase–kick rollouts short.
+    The counter does **not** advance while **approach** with the ball ahead (pursuing
+    after a kick). It only accumulates in seek_touch / idle without touch to block
+    hovering near the ball without ever contacting.
     """
-    has_contact, _, chase_phase, _, _ = _dribble_phase_context(
+    has_contact, _, _, approach_phase, _, ball_pos_w = _dribble_phase_context(
         env,
         command_name,
         ball_sensor_name,
         contact_force_threshold,
         recent_contact_window,
-        chase_min_ahead,
+        approach_run_min_ahead,
         approach_max_dist,
         approach_ball_speed_max,
     )
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    x_ahead = task_forward_offset(ball_pos_w, command.robot_pelvis_pos_w)
+    run_after_ball = approach_phase & (x_ahead >= approach_run_min_ahead)
 
     step_buf = getattr(env, "episode_length_buf", torch.zeros(env.num_envs, device=env.device))
     past_grace = step_buf > grace_steps
@@ -198,8 +213,8 @@ def dribbling_no_ball_contact_timeout(
     if cnt is None or cnt.shape[0] != env.num_envs:
         cnt = torch.zeros(env.num_envs, device=env.device, dtype=torch.int32)
 
-    # Do not count steps while chasing after a kick; only approach / idle without touch.
-    should_count = past_grace & (~has_contact) & (~chase_phase)
+    # Do not count steps while running after the ball; only seek_touch / idle without touch.
+    should_count = past_grace & (~has_contact) & (~run_after_ball)
 
     cnt = torch.where(
         reset_m,

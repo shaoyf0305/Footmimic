@@ -19,8 +19,10 @@ from isaaclab.utils.math import quat_apply, quat_error_magnitude, quat_inv
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
 from soccer.tasks.tracking.mdp.rewards import motion_relative_foot_position_error_exp
 from soccer.tasks.tracking.mdp.task_frame import (
-    compute_dribble_phase_target_speed,
+    DribblePhaseBundle,
+    compute_dribble_phase_bundle,
     forward_dominance_gate,
+    update_seek_touch_zone_steps,
     task_forward_offset,
     task_forward_speed,
     task_lateral_offset,
@@ -160,8 +162,112 @@ def _dribbling_recent_contact_gate(
     return (cnt <= int(recent_contact_window)).to(torch.float32)
 
 
+def _min_ankle_ball_distance(
+    env: ManagerBasedRLEnv,
+    foot_cfg: SceneEntityCfg,
+    ball_pos_w: torch.Tensor,
+) -> torch.Tensor:
+    """Minimum 3D distance from any listed foot body to the ball, shape ``(num_envs,)``."""
+    robot = env.scene[foot_cfg.name]
+    cache_name = "_dribbling_phase_foot_idx"
+    cached = getattr(env, cache_name, None)
+    names_t = tuple(foot_cfg.body_names)
+    if cached is None or cached.get("names") != names_t:
+        foot_indices = torch.as_tensor(
+            robot.find_bodies(foot_cfg.body_names, preserve_order=True)[0],
+            dtype=torch.long,
+            device=env.device,
+        )
+        setattr(env, cache_name, {"names": names_t, "idx": foot_indices})
+    foot_indices = getattr(env, cache_name)["idx"]
+    feet_pos = robot.data.body_pos_w[:, foot_indices]
+    return torch.norm(feet_pos - ball_pos_w.unsqueeze(1), dim=-1).min(dim=-1).values
+
+
+def gather_dribble_phase_bundle(
+    env: ManagerBasedRLEnv,
+    command: MotionCommand,
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    recent_contact_window: int = 8,
+    foot_cfg: SceneEntityCfg | None = None,
+    *,
+    approach_run_min_ahead: float = 0.35,
+    approach_run_max_dist: float = 1.85,
+    approach_max_dist: float = 0.60,
+    approach_ball_speed_max: float = 0.35,
+    approach_min_x_ahead: float = 0.10,
+    approach_max_x_ahead: float = 0.85,
+    close_max_dist: float = 0.48,
+    close_x_min: float = 0.18,
+    close_x_max: float = 0.62,
+    seek_touch_min_steps: int = 2,
+    seek_touch_commit_dist: float = 0.24,
+) -> DribblePhaseBundle:
+    """Shared per-step phase state (contact, geometry, transition steps, ankle distance)."""
+    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
+    has_contact = fmag > contact_force_threshold
+    recent_contact = _dribbling_recent_contact_gate(
+        env,
+        ball_sensor_name,
+        contact_force_threshold,
+        recent_contact_window,
+        command=command,
+    )
+
+    soccer_ball = env.scene["soccer_ball"]
+    ball_pos_w = soccer_ball.data.root_pos_w
+    pelvis_pos_w = command.robot_pelvis_pos_w
+    x_ahead = task_forward_offset(ball_pos_w, pelvis_pos_w)
+    dist_xy = torch.norm(ball_pos_w[:, :2] - pelvis_pos_w[:, :2], dim=-1)
+    ball_vel_w = soccer_ball.data.root_lin_vel_w
+    ball_speed_xy = torch.norm(ball_vel_w[:, :2], dim=-1)
+    pelvis_index = command.robot.body_names.index("pelvis")
+    pelvis_forward = task_forward_speed(command.robot.data.body_lin_vel_w[:, pelvis_index])
+    ball_forward = task_forward_speed(ball_vel_w)
+
+    min_ankle_dist = torch.full_like(dist_xy, 999.0)
+    if foot_cfg is not None:
+        min_ankle_dist = _min_ankle_ball_distance(env, foot_cfg, ball_pos_w)
+
+    zero_steps = torch.zeros(env.num_envs, device=env.device, dtype=torch.int32)
+    phase_kwargs = dict(
+        min_ankle_ball_dist=min_ankle_dist,
+        approach_run_min_ahead=approach_run_min_ahead,
+        approach_run_max_dist=approach_run_max_dist,
+        approach_max_dist=approach_max_dist,
+        approach_ball_speed_max=approach_ball_speed_max,
+        approach_min_x_ahead=approach_min_x_ahead,
+        approach_max_x_ahead=approach_max_x_ahead,
+        close_max_dist=close_max_dist,
+        close_x_min=close_x_min,
+        close_x_max=close_x_max,
+        seek_touch_min_steps=seek_touch_min_steps,
+        seek_touch_commit_dist=seek_touch_commit_dist,
+    )
+    zone_pre = compute_dribble_phase_bundle(
+        has_contact,
+        recent_contact,
+        x_ahead,
+        dist_xy,
+        ball_speed_xy,
+        steps_in_seek_touch_zone=zero_steps,
+        **phase_kwargs,
+    )
+    zone_steps = update_seek_touch_zone_steps(env, zone_pre.seek_touch_zone, has_contact)
+    return compute_dribble_phase_bundle(
+        has_contact,
+        recent_contact,
+        x_ahead,
+        dist_xy,
+        ball_speed_xy,
+        steps_in_seek_touch_zone=zone_steps,
+        **phase_kwargs,
+    )
+
+
 # ---------------------------------------------------------------------------
-# 1b) Phased forward velocity — kick / chase / approach target speed
+# 1b) Phased forward velocity — approach (run) / seek_touch / touch
 # ---------------------------------------------------------------------------
 
 
@@ -175,19 +281,23 @@ def dribbling_phased_forward_velocity(
     contact_force_threshold: float = 1.0,
     recent_contact_window: int = 8,
     v_touch: float = 0.20,
-    v_chase: float = 0.75,
-    v_approach: float = 0.30,
-    chase_min_ahead: float = 0.35,
-    approach_max_dist: float = 0.55,
+    approach_overshoot: float = 0.14,
+    v_approach_floor: float = 0.38,
+    approach_run_min_ahead: float = 0.35,
+    approach_run_max_dist: float = 1.85,
+    approach_max_dist: float = 0.60,
     approach_ball_speed_max: float = 0.35,
+    approach_min_x_ahead: float = 0.10,
+    approach_max_x_ahead: float = 0.85,
+    close_max_dist: float = 0.48,
+    close_x_min: float = 0.18,
+    close_x_max: float = 0.62,
+    seek_touch_min_steps: int = 2,
+    seek_touch_commit_dist: float = 0.24,
+    foot_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """Reward matching a phase-dependent forward speed target (kick–chase–approach).
-
-    Replaces a constant ``forward_velocity`` target during dribbling so the policy
-    is not pushed to maintain cruise speed while controlling or approaching the ball.
-    """
+    """Reward pelvis speed vs phase target: approach (run, faster than ball), seek_touch / touch slow."""
     command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
     robot = command.robot
     pelvis_index = robot.body_names.index("pelvis")
     pelvis_lin_vel_w = robot.data.body_lin_vel_w[:, pelvis_index]
@@ -203,35 +313,34 @@ def dribbling_phased_forward_velocity(
     else:
         raise ValueError(f"Unsupported velocity_frame={velocity_frame!r}; use 'world' or 'pelvis'.")
 
-    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
-    has_contact = fmag > contact_force_threshold
-    recent_contact = _dribbling_recent_contact_gate(
+    bundle = gather_dribble_phase_bundle(
         env,
+        command,
         ball_sensor_name,
         contact_force_threshold,
         recent_contact_window,
-        command=command,
-    )
-
-    pelvis_pos_w = command.robot_pelvis_pos_w
-    ball_pos_w = soccer_ball.data.root_pos_w
-    x_ahead = task_forward_offset(ball_pos_w, pelvis_pos_w)
-    dist_xy = torch.norm(ball_pos_w[:, :2] - pelvis_pos_w[:, :2], dim=-1)
-    ball_speed_xy = torch.norm(soccer_ball.data.root_lin_vel_w[:, :2], dim=-1)
-
-    target_speed = compute_dribble_phase_target_speed(
-        has_contact,
-        recent_contact,
-        x_ahead,
-        dist_xy,
-        ball_speed_xy,
-        v_touch=v_touch,
-        v_chase=v_chase,
-        v_approach=v_approach,
-        chase_min_ahead=chase_min_ahead,
+        foot_cfg,
+        approach_run_min_ahead=approach_run_min_ahead,
+        approach_run_max_dist=approach_run_max_dist,
         approach_max_dist=approach_max_dist,
         approach_ball_speed_max=approach_ball_speed_max,
+        approach_min_x_ahead=approach_min_x_ahead,
+        approach_max_x_ahead=approach_max_x_ahead,
+        close_max_dist=close_max_dist,
+        close_x_min=close_x_min,
+        close_x_max=close_x_max,
+        seek_touch_min_steps=seek_touch_min_steps,
+        seek_touch_commit_dist=seek_touch_commit_dist,
     )
+
+    soccer_ball = env.scene["soccer_ball"]
+    ball_forward = task_forward_speed(soccer_ball.data.root_lin_vel_w)
+    approach_target = (ball_forward + approach_overshoot).clamp(min=v_approach_floor)
+
+    target_speed = torch.full_like(forward_speed, v_approach_floor)
+    target_speed = torch.where(bundle.approach, approach_target, target_speed)
+    target_speed = torch.where(bundle.seek_touch, torch.full_like(target_speed, v_touch), target_speed)
+    target_speed = torch.where(bundle.touch, torch.full_like(target_speed, v_touch), target_speed)
 
     error = (forward_speed - target_speed) ** 2
     reward = torch.exp(-error / max(std, 1e-6) ** 2)
@@ -378,15 +487,18 @@ def dribbling_dynamic_proximity(
         proximity_reward = proximity_reward * torch.clamp(pelvis_sp / pelvis_speed_min, max=1.0)
 
     if no_contact_zone_damping < 1.0 - 1e-6:
+        dist_xy = torch.norm(ball_pos_w[:, :2] - pelvis_pos_w[:, :2], dim=-1)
         in_corridor = (
             (x_task >= near_dist)
             & (x_task <= far_dist)
             & (torch.abs(y_task) <= zone_lateral_abs_max)
         )
+        # Ball ahead and within dribble reach but no sensor touch — cut proximity hard.
+        in_approach_no_touch = (x_task > 0.0) & (dist_xy <= 0.58)
         fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
         no_touch = fmag <= contact_force_threshold
         damp = torch.where(
-            in_corridor & no_touch,
+            (in_corridor | in_approach_no_touch) & no_touch,
             torch.full_like(proximity_reward, no_contact_zone_damping),
             torch.ones_like(proximity_reward),
         )
@@ -407,12 +519,11 @@ def dribbling_stall_no_touch_penalty(
     contact_force_threshold: float = 1.0,
     max_xy_dist: float = 0.52,
     pelvis_speed_max: float = 0.16,
+    min_x_ahead: float = 0.10,
 ) -> torch.Tensor:
-    """Penalty in ``[0, 1]`` when the ball is close in XY but pelvis is nearly static and there is no contact.
+    """Penalty when the ball is close in front but pelvis is nearly static and there is no contact.
 
-    Targets the local optimum: robot brings the ball into a comfortable pose in
-    front of the body, then stops or only sways without registering foot-ball
-    contact on the ball sensor.
+    Only targets **freeze** exploits, not moderate-speed stepping needed to reach touch.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
@@ -420,6 +531,7 @@ def dribbling_stall_no_touch_penalty(
     pelvis_pos_xy = command.robot_pelvis_pos_w[:, :2]
     ball_pos_xy = soccer_ball.data.root_pos_w[:, :2]
     dist_xy = torch.norm(ball_pos_xy - pelvis_pos_xy, dim=-1)
+    x_ahead = task_forward_offset(soccer_ball.data.root_pos_w, command.robot_pelvis_pos_w)
 
     pelvis_vel_xy = command.robot_anchor_lin_vel_w[:, :2]
     pelvis_sp = torch.norm(pelvis_vel_xy, dim=-1)
@@ -428,8 +540,112 @@ def dribbling_stall_no_touch_penalty(
     no_touch = fmag <= contact_force_threshold
 
     near = dist_xy <= max_xy_dist
+    ball_in_front = x_ahead >= min_x_ahead
     slow = pelvis_sp <= pelvis_speed_max
-    return (near & slow & no_touch).to(torch.float32)
+    return (near & ball_in_front & no_touch & slow).to(torch.float32)
+
+
+def dribbling_approach_touch_bridge(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    foot_cfg: SceneEntityCfg | None = None,
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    recent_contact_window: int = 8,
+    std: float = 0.20,
+    approach_run_min_ahead: float = 0.35,
+    approach_run_max_dist: float = 1.85,
+    approach_max_dist: float = 0.60,
+    approach_ball_speed_max: float = 0.35,
+    approach_min_x_ahead: float = 0.10,
+    approach_max_x_ahead: float = 0.85,
+    close_max_dist: float = 0.48,
+    close_x_min: float = 0.18,
+    close_x_max: float = 0.62,
+    seek_touch_min_steps: int = 2,
+    seek_touch_commit_dist: float = 0.24,
+    approach_scale: float = 0.35,
+    seek_touch_scale: float = 1.0,
+) -> torch.Tensor:
+    """Foot–ball shaping while running (``approach``); stronger in ``seek_touch``."""
+    if foot_cfg is None:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    bundle = gather_dribble_phase_bundle(
+        env,
+        command,
+        ball_sensor_name,
+        contact_force_threshold,
+        recent_contact_window,
+        foot_cfg,
+        approach_run_min_ahead=approach_run_min_ahead,
+        approach_run_max_dist=approach_run_max_dist,
+        approach_max_dist=approach_max_dist,
+        approach_ball_speed_max=approach_ball_speed_max,
+        approach_min_x_ahead=approach_min_x_ahead,
+        approach_max_x_ahead=approach_max_x_ahead,
+        close_max_dist=close_max_dist,
+        close_x_min=close_x_min,
+        close_x_max=close_x_max,
+        seek_touch_min_steps=seek_touch_min_steps,
+        seek_touch_commit_dist=seek_touch_commit_dist,
+    )
+
+    soccer_ball = env.scene["soccer_ball"]
+    min_dist = _min_ankle_ball_distance(env, foot_cfg, soccer_ball.data.root_pos_w)
+    shaping = torch.exp(-(min_dist ** 2) / (max(std, 1e-6) ** 2))
+
+    gate = torch.zeros(env.num_envs, device=env.device, dtype=shaping.dtype)
+    gate = torch.where(bundle.approach & (~bundle.seek_touch), torch.full_like(gate, approach_scale), gate)
+    gate = torch.where(bundle.seek_touch, torch.full_like(gate, seek_touch_scale), gate)
+    return shaping * gate
+
+
+def dribbling_approach_touch_transition(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    foot_cfg: SceneEntityCfg | None = None,
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    recent_contact_window: int = 8,
+    approach_run_min_ahead: float = 0.35,
+    approach_run_max_dist: float = 1.85,
+    approach_max_dist: float = 0.60,
+    approach_ball_speed_max: float = 0.35,
+    approach_min_x_ahead: float = 0.10,
+    approach_max_x_ahead: float = 0.85,
+    close_max_dist: float = 0.48,
+    close_x_min: float = 0.18,
+    close_x_max: float = 0.62,
+    seek_touch_min_steps: int = 2,
+    seek_touch_commit_dist: float = 0.24,
+) -> torch.Tensor:
+    """Binary bonus while in ``seek_touch`` (kick-pose setup before contact)."""
+    if foot_cfg is None:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    bundle = gather_dribble_phase_bundle(
+        env,
+        command,
+        ball_sensor_name,
+        contact_force_threshold,
+        recent_contact_window,
+        foot_cfg,
+        approach_run_min_ahead=approach_run_min_ahead,
+        approach_run_max_dist=approach_run_max_dist,
+        approach_max_dist=approach_max_dist,
+        approach_ball_speed_max=approach_ball_speed_max,
+        approach_min_x_ahead=approach_min_x_ahead,
+        approach_max_x_ahead=approach_max_x_ahead,
+        close_max_dist=close_max_dist,
+        close_x_min=close_x_min,
+        close_x_max=close_x_max,
+        seek_touch_min_steps=seek_touch_min_steps,
+        seek_touch_commit_dist=seek_touch_commit_dist,
+    )
+    return bundle.seek_touch.to(torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -1163,49 +1379,6 @@ def dribbling_gait_foot_tracking_exp(
     )
     no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
     return base * no_ball.to(torch.float32)
-
-
-def dribbling_chase_ball_reward(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    ball_sensor_name: str = "soccer_ball_contact",
-    contact_force_threshold: float = 1.0,
-    min_ball_ahead: float = 0.25,
-    max_chase_xy_dist: float = 1.1,
-    pelvis_forward_speed_min: float = 0.22,
-    forward_speed_scale: float = 0.45,
-) -> torch.Tensor:
-    """Reward running forward to catch a ball that rolled ahead after a touch.
-
-    Active when there is no ball contact, the ball lies on task +X ahead of the
-    pelvis by at least ``min_ball_ahead``, and the robot is within chase range.
-    This shapes kick → run → kick rather than shuffling beside the ball.
-    """
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-
-    no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
-    pelvis_pos_w = command.robot_pelvis_pos_w
-    ball_pos_w = soccer_ball.data.root_pos_w
-
-    x_ahead = task_forward_offset(ball_pos_w, pelvis_pos_w)
-    dist_xy = torch.norm(ball_pos_w[:, :2] - pelvis_pos_w[:, :2], dim=-1)
-
-    ball_ahead = x_ahead >= min_ball_ahead
-    in_range = dist_xy <= max_chase_xy_dist
-
-    pelvis_vel_w = command.robot_anchor_lin_vel_w[:, :3]
-    forward = task_forward_speed(pelvis_vel_w)
-    dominance = task_velocity_forward_dominance(pelvis_vel_w)
-    speed_rew = torch.clamp(
-        (forward - pelvis_forward_speed_min) / max(forward_speed_scale, 1e-6),
-        min=0.0,
-        max=1.0,
-    )
-    speed_rew = speed_rew * forward_dominance_gate(dominance, 0.45)
-
-    active = no_ball & ball_ahead & in_range
-    return speed_rew * active.to(torch.float32)
 
 
 def dribbling_rapid_retouch_penalty(

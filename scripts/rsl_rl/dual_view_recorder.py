@@ -69,6 +69,7 @@ class DualViewRecorder:
         fps: int = 30,
         path_tracing: bool = False,
         spp: int = 32,
+        dual: bool = True,
     ):
         _lazy_imports()
         self._env = env
@@ -78,6 +79,7 @@ class DualViewRecorder:
         self._back_offset = back_offset
         self._lookat_offset = lookat_offset
         self._fps = fps
+        self._dual = dual
         self._frames: list[np.ndarray] = []
         self._front_annotator = None
         self._back_annotator = None
@@ -111,19 +113,21 @@ class DualViewRecorder:
         self._front_annotator = _rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
         self._front_annotator.attach([front_rp])
 
-        self._back_cam = self._create_camera(
-            stage, "/World/DualView/BackCamera",
-            eye=self._offset_pos(robot_pos, self._back_offset),
-            target=(robot_pos[0], robot_pos[1], robot_pos[2] + self._lookat_offset),
-        )
-        back_rp = _rep.create.render_product(
-            str(self._back_cam.GetPath()), self._resolution
-        )
-        self._back_annotator = _rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
-        self._back_annotator.attach([back_rp])
+        if self._dual:
+            self._back_cam = self._create_camera(
+                stage, "/World/DualView/BackCamera",
+                eye=self._offset_pos(robot_pos, self._back_offset),
+                target=(robot_pos[0], robot_pos[1], robot_pos[2] + self._lookat_offset),
+            )
+            back_rp = _rep.create.render_product(
+                str(self._back_cam.GetPath()), self._resolution
+            )
+            self._back_annotator = _rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
+            self._back_annotator.attach([back_rp])
 
         os.makedirs(self._output_dir, exist_ok=True)
-        print(f"[DualViewRecorder] Setup complete. Resolution per view: {self._resolution}")
+        mode = "dual" if self._dual else "single"
+        print(f"[DualViewRecorder] Setup complete ({mode}). Resolution: {self._resolution}")
         print(f"[DualViewRecorder] Front offset={self._front_offset}, Back offset={self._back_offset}")
 
     def capture(self, overlay_text: str | None = None):
@@ -140,21 +144,23 @@ class DualViewRecorder:
             eye=self._offset_pos(robot_pos, self._front_offset),
             target=(robot_pos[0], robot_pos[1], robot_pos[2] + self._lookat_offset),
         )
-        self._update_camera(
-            self._back_cam,
-            eye=self._offset_pos(robot_pos, self._back_offset),
-            target=(robot_pos[0], robot_pos[1], robot_pos[2] + self._lookat_offset),
-        )
+        if self._dual:
+            self._update_camera(
+                self._back_cam,
+                eye=self._offset_pos(robot_pos, self._back_offset),
+                target=(robot_pos[0], robot_pos[1], robot_pos[2] + self._lookat_offset),
+            )
 
         # 2. Force a render so annotators get fresh data.
         self._env.sim.render()
 
-        # 3. Read RGB from both cameras.
+        # 3. Read RGB from camera(s).
         front_rgb = self._read_annotator(self._front_annotator)
-        back_rgb = self._read_annotator(self._back_annotator)
-
-        # 4. Side-by-side: [front | back]
-        combined = np.concatenate([front_rgb, back_rgb], axis=1)
+        if self._dual:
+            back_rgb = self._read_annotator(self._back_annotator)
+            combined = np.concatenate([front_rgb, back_rgb], axis=1)
+        else:
+            combined = front_rgb
 
         # 5. Overlay text HUD if provided.
         if overlay_text:
@@ -170,7 +176,7 @@ class DualViewRecorder:
 
         if filename is None:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"dual_view_{ts}.mp4"
+            filename = f"dual_view_{ts}.mp4" if self._dual else f"play_{ts}.mp4"
 
         filepath = os.path.join(self._output_dir, filename)
         import imageio.v2 as iio
