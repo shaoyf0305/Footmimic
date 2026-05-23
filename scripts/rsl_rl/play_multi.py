@@ -126,13 +126,14 @@ _CONTACT_FORCE_THRESHOLD = 1.0
 _DRIBBLE_RECENT_CONTACT_WINDOW = 8
 _DRIBBLE_APPROACH_RUN_MIN_AHEAD = 0.35
 _DRIBBLE_APPROACH_RUN_MAX_DIST = 1.85
-_DRIBBLE_APPROACH_MAX_DIST = 0.60
+_DRIBBLE_APPROACH_MAX_DIST = 0.55
 _DRIBBLE_APPROACH_BALL_SPEED_MAX = 0.35
+_DRIBBLE_APPROACH_BALL_STOPPED_MAX = 0.08
 _DRIBBLE_APPROACH_MIN_X_AHEAD = 0.10
 _DRIBBLE_APPROACH_MAX_X_AHEAD = 0.85
-_DRIBBLE_CLOSE_MAX_DIST = 0.48
-_DRIBBLE_CLOSE_X_MIN = 0.18
-_DRIBBLE_CLOSE_X_MAX = 0.62
+_DRIBBLE_CLOSE_MAX_DIST = 0.52
+_DRIBBLE_CLOSE_X_MIN = 0.15
+_DRIBBLE_CLOSE_X_MAX = 0.65
 _DRIBBLE_SEEK_TOUCH_MIN_STEPS = 2
 _DRIBBLE_SEEK_TOUCH_COMMIT_DIST = 0.24
 
@@ -212,6 +213,7 @@ def _get_play_overlay(env, timestep: int) -> str:
             approach_run_max_dist=_DRIBBLE_APPROACH_RUN_MAX_DIST,
             approach_max_dist=_DRIBBLE_APPROACH_MAX_DIST,
             approach_ball_speed_max=_DRIBBLE_APPROACH_BALL_SPEED_MAX,
+            approach_ball_stopped_max_speed=_DRIBBLE_APPROACH_BALL_STOPPED_MAX,
             approach_min_x_ahead=_DRIBBLE_APPROACH_MIN_X_AHEAD,
             approach_max_x_ahead=_DRIBBLE_APPROACH_MAX_X_AHEAD,
             close_max_dist=_DRIBBLE_CLOSE_MAX_DIST,
@@ -221,11 +223,12 @@ def _get_play_overlay(env, timestep: int) -> str:
             seek_touch_commit_dist=_DRIBBLE_SEEK_TOUCH_COMMIT_DIST,
         )
         phase = resolve_dribble_phase_label(bundle, 0)
+        phase_level = int(bundle.phase_level[i].item())
         recent_lbl = "YES" if recent_contact_t > 0.5 else "NO"
         steps_seek_zone = int(bundle.steps_in_seek_touch_zone[i].item())
         in_seek_zone = bool(bundle.seek_touch_zone[i].item())
         phase_lines = [
-            f"Phase: {phase}  |  sim_touch={'YES' if has_contact_t else 'NO'}  "
+            f"Phase: {phase} (level={phase_level})  |  sim_touch={'YES' if has_contact_t else 'NO'}  "
             f"|  recent_touch={recent_lbl} (win={_DRIBBLE_RECENT_CONTACT_WINDOW})",
             f"  x_ahead={x_ahead:.2f} m  dist_xy={pelvis_ball_xy:.2f} m  "
             f"ball_v_xy={ball_sp_xy:.2f} m/s  seek_zone_steps={steps_seek_zone}",

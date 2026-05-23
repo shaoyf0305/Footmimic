@@ -103,6 +103,47 @@ class DribblePhaseBundle:
     approach: torch.Tensor
     seek_touch_zone: torch.Tensor
     steps_in_seek_touch_zone: torch.Tensor
+    phase_level: torch.Tensor
+
+
+# Monotonic dribble ladder: approach (1) → seek_touch (2) → touch (3).
+DRIBBLE_PHASE_APPROACH = 1
+DRIBBLE_PHASE_SEEK_TOUCH = 2
+DRIBBLE_PHASE_TOUCH = 3
+
+
+def update_monotonic_dribble_phase_level(
+    env: ManagerBasedRLEnv,
+    has_contact: torch.Tensor,
+    recent_contact: torch.Tensor,
+    geometric_seek_commit: torch.Tensor,
+) -> torch.Tensor:
+    """Sticky phase ladder — once ``seek_touch`` commits, never drop back to ``approach``.
+
+  Resets to ``approach`` only on episode reset or after the ``touch`` window ends.
+    """
+    step_buf = getattr(env, "episode_length_buf", None)
+    reset_ep = step_buf == 0 if step_buf is not None else torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    level = getattr(env, "_dribble_monotonic_phase_level", None)
+    if level is None or level.shape[0] != env.num_envs:
+        level = torch.full(
+            (env.num_envs,),
+            DRIBBLE_PHASE_APPROACH,
+            dtype=torch.int32,
+            device=env.device,
+        )
+
+    touch_now = has_contact | (recent_contact > 0.5)
+    touch_cycle_ended = (level == DRIBBLE_PHASE_TOUCH) & (~touch_now)
+
+    level = torch.where(reset_ep | touch_cycle_ended, torch.full_like(level, DRIBBLE_PHASE_APPROACH), level)
+    level = torch.where(touch_now, torch.full_like(level, DRIBBLE_PHASE_TOUCH), level)
+    seek_commit = geometric_seek_commit & (~touch_now) & (level < DRIBBLE_PHASE_SEEK_TOUCH)
+    level = torch.where(seek_commit, torch.full_like(level, DRIBBLE_PHASE_SEEK_TOUCH), level)
+
+    setattr(env, "_dribble_monotonic_phase_level", level)
+    return level
 
 
 def update_seek_touch_zone_steps(
@@ -157,22 +198,24 @@ def compute_dribble_phase_bundle(
     *,
     steps_in_seek_touch_zone: torch.Tensor | None = None,
     min_ankle_ball_dist: torch.Tensor | None = None,
+    phase_level: torch.Tensor | None = None,
     approach_run_min_ahead: float = 0.35,
     approach_run_max_dist: float = 1.85,
-    approach_max_dist: float = 0.60,
+    approach_max_dist: float = 0.55,
     approach_ball_speed_max: float = 0.35,
+    approach_ball_stopped_max_speed: float = 0.08,
     approach_min_x_ahead: float = 0.10,
     approach_max_x_ahead: float = 0.85,
-    close_max_dist: float = 0.48,
-    close_x_min: float = 0.18,
-    close_x_max: float = 0.62,
+    close_max_dist: float = 0.52,
+    close_x_min: float = 0.15,
+    close_x_max: float = 0.65,
     seek_touch_min_steps: int = 2,
     seek_touch_commit_dist: float = 0.24,
 ) -> DribblePhaseBundle:
-    """Three dribble phases: **approach** (run to ball), **seek_touch** (kick pose), **touch**.
+    """Three dribble phases: **approach** (run) → **seek_touch** (pose) → **touch**.
 
-    Former chase / wide-approach / close-approach running sub-phases are merged into
-    ``approach`` with a single run-speed reward target.
+    When ``phase_level`` is supplied (from ``update_monotonic_dribble_phase_level``),
+    ``seek_touch`` stays latched until ``touch`` or cycle reset — no revert to ``approach``.
     """
     touch_phase = has_contact | (recent_contact > 0.5)
 
@@ -190,28 +233,46 @@ def compute_dribble_phase_bundle(
     if min_ankle_ball_dist is None:
         min_ankle_ball_dist = torch.full_like(dist_xy, 999.0)
 
-    seek_touch_phase = seek_touch_zone & (~touch_phase) & (
+    geometric_seek_commit = seek_touch_zone & (~touch_phase) & (
         (steps_in_seek_touch_zone >= int(seek_touch_min_steps))
         | (min_ankle_ball_dist <= seek_touch_commit_dist)
     )
 
+    # Ball clearly ahead when rolling; stationary spawn uses relaxed ``approach_min_x_ahead``.
     ball_in_corridor = (x_ahead >= approach_min_x_ahead) & (x_ahead <= approach_max_x_ahead)
-    ball_ahead = x_ahead >= approach_run_min_ahead
-    corridor_run = ball_in_corridor & (
+    ball_stopped = ball_speed_xy <= approach_ball_stopped_max_speed
+    ball_clearly_ahead = x_ahead >= approach_run_min_ahead
+    ball_ahead_for_run = ball_clearly_ahead | (ball_stopped & (x_ahead >= approach_min_x_ahead))
+    corridor_run = ball_ahead_for_run & ball_in_corridor & (
         (dist_xy <= approach_max_dist)
         | (
             (ball_speed_xy <= approach_ball_speed_max)
             & (dist_xy <= approach_max_dist + 0.20)
         )
     )
-    far_run = ball_ahead & (dist_xy <= approach_run_max_dist)
+    far_run = ball_ahead_for_run & (dist_xy <= approach_run_max_dist)
+    can_approach = (~touch_phase) & (~has_contact) & (corridor_run | far_run)
 
-    approach_phase = (
-        (~touch_phase)
-        & (~seek_touch_phase)
-        & (~has_contact)
-        & (corridor_run | far_run)
-    )
+    if phase_level is None:
+        seek_touch_phase = geometric_seek_commit
+        approach_phase = can_approach & (~geometric_seek_commit)
+        level = torch.where(
+            touch_phase,
+            torch.full_like(dist_xy, DRIBBLE_PHASE_TOUCH, dtype=torch.int32),
+            torch.where(
+                geometric_seek_commit,
+                torch.full_like(dist_xy, DRIBBLE_PHASE_SEEK_TOUCH, dtype=torch.int32),
+                torch.where(
+                    approach_phase,
+                    torch.full_like(dist_xy, DRIBBLE_PHASE_APPROACH, dtype=torch.int32),
+                    torch.zeros_like(dist_xy, dtype=torch.int32),
+                ),
+            ),
+        )
+    else:
+        level = phase_level
+        seek_touch_phase = (level >= DRIBBLE_PHASE_SEEK_TOUCH) & (~touch_phase)
+        approach_phase = (level == DRIBBLE_PHASE_APPROACH) & can_approach
 
     return DribblePhaseBundle(
         touch=touch_phase,
@@ -219,6 +280,7 @@ def compute_dribble_phase_bundle(
         approach=approach_phase,
         seek_touch_zone=seek_touch_zone,
         steps_in_seek_touch_zone=steps_in_seek_touch_zone,
+        phase_level=level,
     )
 
 

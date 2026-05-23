@@ -100,13 +100,14 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
         _dribble_phase = {
             "approach_run_min_ahead": 0.35,
             "approach_run_max_dist": 1.85,
-            "approach_max_dist": 0.60,
+            "approach_max_dist": 0.55,
             "approach_ball_speed_max": 0.35,
+            "approach_ball_stopped_max_speed": 0.08,
             "approach_min_x_ahead": 0.10,
             "approach_max_x_ahead": 0.85,
-            "close_max_dist": 0.48,
-            "close_x_min": 0.18,
-            "close_x_max": 0.62,
+            "close_max_dist": 0.52,
+            "close_x_min": 0.15,
+            "close_x_max": 0.65,
             "seek_touch_min_steps": 2,
             "seek_touch_commit_dist": 0.24,
         }
@@ -126,6 +127,9 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "v_touch": 0.20,
                 "approach_overshoot": 0.14,
                 "v_approach_floor": 0.38,
+                "v_approach_min": 0.28,
+                "v_approach_stopped_ball": 0.22,
+                "backward_penalty_scale": 0.35,
                 **_dribble_phase,
             },
         )
@@ -430,7 +434,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "grace_steps": 50,
                 "recent_contact_window": 8,
                 "approach_run_min_ahead": 0.35,
-                "approach_max_dist": 0.60,
+                "approach_max_dist": 0.55,
                 "approach_ball_speed_max": 0.35,
             },
         )
@@ -445,8 +449,36 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "max_steps_without_contact": 200,
                 "recent_contact_window": 8,
                 "approach_run_min_ahead": 0.35,
-                "approach_max_dist": 0.60,
+                "approach_max_dist": 0.55,
                 "approach_ball_speed_max": 0.35,
+                "no_contact_pause_min_dist": 0.55,
+                "approach_ball_stopped_max_speed": 0.08,
+            },
+        )
+
+        self.terminations.dribbling_seek_touch_timeout = DoneTerm(
+            func=mdp.dribbling_seek_touch_timeout,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "grace_steps": 50,
+                "max_steps_in_seek_touch": 60,
+                "recent_contact_window": 8,
+                "foot_cfg": _foot_cfg,
+                **_dribble_phase,
+            },
+        )
+
+        self.terminations.dribbling_ball_stagnant = DoneTerm(
+            func=mdp.dribbling_ball_must_move_after_touch,
+            params={
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "grace_steps": 50,
+                "post_touch_grace_steps": 20,
+                "min_ball_speed": 0.12,
+                "max_stagnant_steps": 45,
             },
         )
 

@@ -32,10 +32,13 @@ def _dribble_phase_context(
     approach_max_dist: float,
     approach_ball_speed_max: float,
     approach_run_max_dist: float = 1.85,
+    approach_ball_stopped_max_speed: float = 0.08,
+    approach_min_x_ahead: float = 0.10,
+    approach_max_x_ahead: float = 0.85,
     foot_cfg: SceneEntityCfg | None = None,
-    close_max_dist: float = 0.48,
-    close_x_min: float = 0.18,
-    close_x_max: float = 0.62,
+    close_max_dist: float = 0.52,
+    close_x_min: float = 0.15,
+    close_x_max: float = 0.65,
     seek_touch_min_steps: int = 2,
     seek_touch_commit_dist: float = 0.24,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -56,6 +59,9 @@ def _dribble_phase_context(
         approach_run_max_dist=approach_run_max_dist,
         approach_max_dist=approach_max_dist,
         approach_ball_speed_max=approach_ball_speed_max,
+        approach_ball_stopped_max_speed=approach_ball_stopped_max_speed,
+        approach_min_x_ahead=approach_min_x_ahead,
+        approach_max_x_ahead=approach_max_x_ahead,
         close_max_dist=close_max_dist,
         close_x_min=close_x_min,
         close_x_max=close_x_max,
@@ -181,16 +187,21 @@ def dribbling_no_ball_contact_timeout(
     max_steps_without_contact: int = 200,
     recent_contact_window: int = 8,
     approach_run_min_ahead: float = 0.35,
-    approach_max_dist: float = 0.60,
+    approach_max_dist: float = 0.55,
     approach_ball_speed_max: float = 0.35,
+    no_contact_pause_min_dist: float = 0.55,
+    approach_ball_stopped_max_speed: float = 0.08,
 ) -> torch.Tensor:
     """End the episode if the ball sees no robot contact for too long after warm-up.
 
-    The counter does **not** advance while **approach** with the ball ahead (pursuing
-    after a kick). It only accumulates in seek_touch / idle without touch to block
-    hovering near the ball without ever contacting.
+    The no-contact counter pauses **only** during far ``approach`` (ball clearly ahead,
+    ``dist_xy > no_contact_pause_min_dist``, ball rolling). Near-ball approach, idle,
+    ``seek_touch``, and stationary-ball spawn always accumulate toward timeout.
     """
-    has_contact, _, _, approach_phase, _, ball_pos_w = _dribble_phase_context(
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+
+    has_contact, _, _, approach_phase, dist_xy, ball_pos_w = _dribble_phase_context(
         env,
         command_name,
         ball_sensor_name,
@@ -200,9 +211,16 @@ def dribbling_no_ball_contact_timeout(
         approach_max_dist,
         approach_ball_speed_max,
     )
-    command: MotionCommand = env.command_manager.get_term(command_name)
+
     x_ahead = task_forward_offset(ball_pos_w, command.robot_pelvis_pos_w)
-    run_after_ball = approach_phase & (x_ahead >= approach_run_min_ahead)
+    ball_speed_xy = torch.norm(soccer_ball.data.root_lin_vel_w[:, :2], dim=-1)
+    ball_stopped = ball_speed_xy <= approach_ball_stopped_max_speed
+    far_run_approach = (
+        approach_phase
+        & (x_ahead >= approach_run_min_ahead)
+        & (dist_xy > no_contact_pause_min_dist)
+        & (~ball_stopped)
+    )
 
     step_buf = getattr(env, "episode_length_buf", torch.zeros(env.num_envs, device=env.device))
     past_grace = step_buf > grace_steps
@@ -213,8 +231,7 @@ def dribbling_no_ball_contact_timeout(
     if cnt is None or cnt.shape[0] != env.num_envs:
         cnt = torch.zeros(env.num_envs, device=env.device, dtype=torch.int32)
 
-    # Do not count steps while running after the ball; only seek_touch / idle without touch.
-    should_count = past_grace & (~has_contact) & (~run_after_ball)
+    should_count = past_grace & (~has_contact) & (~far_run_approach)
 
     cnt = torch.where(
         reset_m,
@@ -224,6 +241,72 @@ def dribbling_no_ball_contact_timeout(
     setattr(env, buf_name, cnt)
 
     return cnt >= max_steps_without_contact
+
+
+def dribbling_seek_touch_timeout(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    grace_steps: int = 50,
+    max_steps_in_seek_touch: int = 60,
+    recent_contact_window: int = 8,
+    approach_run_min_ahead: float = 0.35,
+    approach_run_max_dist: float = 1.85,
+    approach_max_dist: float = 0.55,
+    approach_ball_speed_max: float = 0.35,
+    approach_ball_stopped_max_speed: float = 0.08,
+    approach_min_x_ahead: float = 0.10,
+    approach_max_x_ahead: float = 0.85,
+    foot_cfg: SceneEntityCfg | None = None,
+    close_max_dist: float = 0.52,
+    close_x_min: float = 0.15,
+    close_x_max: float = 0.65,
+    seek_touch_min_steps: int = 2,
+    seek_touch_commit_dist: float = 0.24,
+) -> torch.Tensor:
+    """Terminate if ``seek_touch`` persists without sensor contact for too long."""
+    has_contact, _, seek_touch, _, _, _ = _dribble_phase_context(
+        env,
+        command_name,
+        ball_sensor_name,
+        contact_force_threshold,
+        recent_contact_window,
+        approach_run_min_ahead,
+        approach_max_dist,
+        approach_ball_speed_max,
+        approach_run_max_dist=approach_run_max_dist,
+        approach_ball_stopped_max_speed=approach_ball_stopped_max_speed,
+        approach_min_x_ahead=approach_min_x_ahead,
+        approach_max_x_ahead=approach_max_x_ahead,
+        foot_cfg=foot_cfg,
+        close_max_dist=close_max_dist,
+        close_x_min=close_x_min,
+        close_x_max=close_x_max,
+        seek_touch_min_steps=seek_touch_min_steps,
+        seek_touch_commit_dist=seek_touch_commit_dist,
+    )
+
+    step_buf = getattr(env, "episode_length_buf", torch.zeros(env.num_envs, device=env.device))
+    past_grace = step_buf > grace_steps
+    reset_m = step_buf == 0
+
+    buf_name = "_dribbling_seek_touch_no_contact_steps"
+    cnt = getattr(env, buf_name, None)
+    if cnt is None or cnt.shape[0] != env.num_envs:
+        cnt = torch.zeros(env.num_envs, device=env.device, dtype=torch.int32)
+
+    in_seek_no_touch = past_grace & seek_touch & (~has_contact)
+    leave_seek_or_touch = has_contact | (~seek_touch)
+
+    cnt = torch.where(
+        reset_m | leave_seek_or_touch,
+        torch.zeros_like(cnt),
+        torch.where(in_seek_no_touch, cnt + 1, cnt),
+    )
+    setattr(env, buf_name, cnt)
+
+    return cnt >= int(max_steps_in_seek_touch)
 
 
 def contact_phase_violation(
