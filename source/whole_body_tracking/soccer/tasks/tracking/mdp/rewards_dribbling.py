@@ -467,6 +467,190 @@ def dribbling_velocity_tracking(
 
 
 # ---------------------------------------------------------------------------
+# 1c) Phase-wise ball-speed requirement (explicit target + urgency)
+# ---------------------------------------------------------------------------
+
+def dribbling_phase_ball_speed_requirement(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    recent_contact_window: int = 8,
+    foot_cfg: SceneEntityCfg | None = None,
+    std: float = 0.22,
+    approach_ball_speed_far: float = 0.08,
+    approach_ball_speed_near: float = 0.22,
+    touch_ball_speed_target: float = 0.30,
+    approach_near_dist: float = 0.62,
+    approach_min_ratio: float = 0.75,
+    touch_min_ratio: float = 0.80,
+    approach_urgency_scale: float = 0.65,
+    approach_run_min_ahead: float = 0.35,
+    approach_run_max_dist: float = 1.85,
+    approach_max_dist: float = 0.55,
+    approach_ball_speed_max: float = 0.35,
+    approach_ball_stopped_max_speed: float = 0.08,
+    approach_min_x_ahead: float = 0.10,
+    approach_max_x_ahead: float = 0.85,
+    close_max_dist: float = 0.52,
+    close_x_min: float = 0.15,
+    close_x_max: float = 0.65,
+    seek_touch_min_steps: int = 2,
+    seek_touch_commit_dist: float = 0.24,
+) -> torch.Tensor:
+    """Explicit ball-speed objective for phase transition.
+
+    Logic:
+    - ``approach``: target speed ramps up as robot gets closer to the ball.
+    - ``seek_touch``/``touch``: require a higher fixed ball speed setpoint.
+    - Near-ball low speed in ``approach`` without recent contact gets extra
+      urgency suppression, pushing policy to enter ``seek_touch`` and touch.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    bundle = gather_dribble_phase_bundle(
+        env,
+        command,
+        ball_sensor_name,
+        contact_force_threshold,
+        recent_contact_window,
+        foot_cfg,
+        approach_run_min_ahead=approach_run_min_ahead,
+        approach_run_max_dist=approach_run_max_dist,
+        approach_max_dist=approach_max_dist,
+        approach_ball_speed_max=approach_ball_speed_max,
+        approach_ball_stopped_max_speed=approach_ball_stopped_max_speed,
+        approach_min_x_ahead=approach_min_x_ahead,
+        approach_max_x_ahead=approach_max_x_ahead,
+        close_max_dist=close_max_dist,
+        close_x_min=close_x_min,
+        close_x_max=close_x_max,
+        seek_touch_min_steps=seek_touch_min_steps,
+        seek_touch_commit_dist=seek_touch_commit_dist,
+    )
+
+    soccer_ball = env.scene["soccer_ball"]
+    ball_speed_xy = torch.norm(soccer_ball.data.root_lin_vel_w[:, :2], dim=-1)
+    dist_xy = torch.norm(
+        soccer_ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2], dim=-1
+    )
+
+    near_ratio = 1.0 - torch.clamp(dist_xy / max(approach_near_dist, 1e-6), 0.0, 1.0)
+    approach_target = approach_ball_speed_far + (approach_ball_speed_near - approach_ball_speed_far) * near_ratio
+    touch_target = torch.full_like(ball_speed_xy, touch_ball_speed_target)
+
+    phase_target = torch.full_like(ball_speed_xy, approach_ball_speed_far)
+    phase_target = torch.where(bundle.approach, approach_target, phase_target)
+    phase_target = torch.where(bundle.seek_touch | bundle.touch, touch_target, phase_target)
+
+    error = ball_speed_xy - phase_target
+    reward = torch.exp(-(error * error) / (max(std, 1e-6) ** 2))
+
+    min_req = torch.where(
+        bundle.approach,
+        approach_target * approach_min_ratio,
+        touch_target * touch_min_ratio,
+    ).clamp(min=1e-4)
+    speed_gate = torch.clamp(ball_speed_xy / min_req, max=1.0)
+    reward = reward * (0.35 + 0.65 * speed_gate)
+
+    recent_contact = _dribbling_recent_contact_gate(
+        env,
+        ball_sensor_name,
+        contact_force_threshold,
+        recent_contact_window,
+        command=command,
+    )
+    no_recent_contact = recent_contact <= 0.5
+    speed_deficit = torch.clamp((approach_target - ball_speed_xy) / approach_target.clamp(min=1e-4), 0.0, 1.0)
+    urgency = bundle.approach.to(torch.float32) * near_ratio * speed_deficit * no_recent_contact.to(torch.float32)
+    urgency_scale = max(0.0, min(1.0, float(approach_urgency_scale)))
+    reward = reward * (1.0 - urgency_scale * urgency)
+
+    return reward.clamp(min=0.0, max=1.0)
+
+
+def dribbling_taskframe_route_speed_requirement(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    recent_contact_window: int = 8,
+    speed_std: float = 0.25,
+    segment_progress_1: float = 0.45,
+    segment_progress_2: float = 0.80,
+    target_speed_seg1: float = 0.18,
+    target_speed_seg2: float = 0.32,
+    target_speed_seg3: float = 0.24,
+    min_speed_ratio: float = 0.75,
+    low_speed_urgency_scale: float = 0.55,
+    min_route_len: float = 0.6,
+) -> torch.Tensor:
+    """Route-conditioned ball-speed target in task frame.
+
+    The route is defined per env by ``initial_target_point_pos -> target_destination_pos``.
+    Ball speed target is piecewise over route progress ``s in [0, 1]``:
+      - segment 1: early route (e.g. from (1,1) toward (12,15))
+      - segment 2: middle route
+      - segment 3: late route
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+
+    start_xy = command.initial_target_point_pos[:, :2]
+    goal_xy = command.target_destination_pos[:, :2]
+    ball_xy = command.target_point_pos[:, :2]
+    ball_vel_xy = soccer_ball.data.root_lin_vel_w[:, :2]
+    ball_speed_xy = torch.norm(ball_vel_xy, dim=-1)
+
+    route = goal_xy - start_xy
+    route_len = torch.norm(route, dim=-1)
+    route_unit = route / route_len.unsqueeze(-1).clamp(min=1e-6)
+    valid_route = route_len >= min_route_len
+
+    rel = ball_xy - start_xy
+    route_len_sq = torch.sum(route * route, dim=-1).clamp(min=1e-6)
+    s = torch.clamp(torch.sum(rel * route, dim=-1) / route_len_sq, 0.0, 1.0)
+
+    p1 = float(max(0.0, min(0.95, segment_progress_1)))
+    p2 = float(max(p1 + 1e-3, min(0.99, segment_progress_2)))
+
+    s12 = torch.clamp((s - p1) / max(p2 - p1, 1e-6), 0.0, 1.0)
+    s23 = torch.clamp((s - p2) / max(1.0 - p2, 1e-6), 0.0, 1.0)
+    v1 = torch.full_like(s, target_speed_seg1)
+    v2 = torch.full_like(s, target_speed_seg2)
+    v3 = torch.full_like(s, target_speed_seg3)
+
+    target_speed = torch.where(s < p1, v1, v1 + (v2 - v1) * s12)
+    target_speed = torch.where(s >= p2, v2 + (v3 - v2) * s23, target_speed)
+
+    err = ball_speed_xy - target_speed
+    reward = torch.exp(-(err * err) / (max(speed_std, 1e-6) ** 2))
+
+    # Encourage speed along route direction, not lateral drift.
+    forward_along_route = torch.sum(ball_vel_xy * route_unit, dim=-1)
+    route_gate = torch.clamp(forward_along_route / ball_speed_xy.clamp(min=1e-6), min=0.0, max=1.0)
+    reward = reward * (0.4 + 0.6 * route_gate)
+
+    # When speed drops below route target and there is no recent touch, reduce reward
+    # to create urgency for seek-touch/touch.
+    recent_contact = _dribbling_recent_contact_gate(
+        env,
+        ball_sensor_name,
+        contact_force_threshold,
+        recent_contact_window,
+        command=command,
+    )
+    speed_floor = (target_speed * min_speed_ratio).clamp(min=1e-4)
+    deficit = torch.clamp((speed_floor - ball_speed_xy) / speed_floor, 0.0, 1.0)
+    urgency = deficit * (recent_contact <= 0.5).to(deficit.dtype)
+    urgency_scale = max(0.0, min(1.0, float(low_speed_urgency_scale)))
+    reward = reward * (1.0 - urgency_scale * urgency)
+
+    reward = torch.where(valid_route, reward, torch.zeros_like(reward))
+    return reward.clamp(min=0.0, max=1.0)
+
+
+# ---------------------------------------------------------------------------
 # 2) Dynamic Proximity  — ball inside the "safe zone" in front of the robot
 # ---------------------------------------------------------------------------
 
@@ -671,7 +855,11 @@ def dribbling_approach_touch_transition(
     seek_touch_min_steps: int = 2,
     seek_touch_commit_dist: float = 0.24,
 ) -> torch.Tensor:
-    """Binary bonus while in ``seek_touch`` (kick-pose setup before contact)."""
+    """Transition shaping for ``approach -> seek_touch -> touch``.
+
+    Provides dense guidance before commit, stronger reward during seek-touch hold,
+    and a one-step completion bonus on first touch right after seek-touch.
+    """
     if foot_cfg is None:
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
@@ -696,7 +884,39 @@ def dribbling_approach_touch_transition(
         seek_touch_min_steps=seek_touch_min_steps,
         seek_touch_commit_dist=seek_touch_commit_dist,
     )
-    return bundle.seek_touch.to(torch.float32)
+    reward = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    # 1) Dense pre-commit shaping while already in the near-ball setup zone.
+    pre_seek_zone = bundle.seek_touch_zone & (~bundle.seek_touch) & (~bundle.touch)
+    min_steps = max(int(seek_touch_min_steps), 1)
+    zone_progress = torch.clamp(bundle.steps_in_seek_touch_zone.to(torch.float32) / float(min_steps), 0.0, 1.0)
+    reward = torch.where(pre_seek_zone, 0.35 + 0.25 * zone_progress, reward)
+
+    # 2) Main hold reward in seek-touch (encourage stabilizing kick pose).
+    seek_hold = bundle.seek_touch & (~bundle.touch)
+    reward = torch.where(seek_hold, 0.70 + 0.30 * zone_progress, reward)
+
+    # 3) Transition-event bonuses: first entry into seek-touch, then first touch.
+    prev_seek_name = "_dribble_prev_seek_touch_mask"
+    prev_touch_name = "_dribble_prev_touch_mask"
+    prev_seek = getattr(env, prev_seek_name, None)
+    prev_touch = getattr(env, prev_touch_name, None)
+    if prev_seek is None or prev_seek.shape[0] != env.num_envs:
+        prev_seek = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    if prev_touch is None or prev_touch.shape[0] != env.num_envs:
+        prev_touch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    entered_seek = seek_hold & (~prev_seek)
+    just_touched = bundle.touch & (~prev_touch)
+    touched_after_seek = just_touched & prev_seek
+
+    reward = reward + entered_seek.to(torch.float32) * 0.15
+    reward = reward + touched_after_seek.to(torch.float32) * 0.30
+    reward = torch.clamp(reward, 0.0, 1.0)
+
+    setattr(env, prev_seek_name, seek_hold)
+    setattr(env, prev_touch_name, bundle.touch)
+    return reward
 
 
 # ---------------------------------------------------------------------------

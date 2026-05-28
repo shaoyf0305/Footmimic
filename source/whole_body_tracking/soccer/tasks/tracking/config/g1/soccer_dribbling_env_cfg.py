@@ -105,11 +105,11 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             "approach_ball_stopped_max_speed": 0.08,
             "approach_min_x_ahead": 0.10,
             "approach_max_x_ahead": 0.85,
-            "close_max_dist": 0.52,
-            "close_x_min": 0.15,
+            "close_max_dist": 0.62,
+            "close_x_min": 0.10,
             "close_x_max": 0.65,
-            "seek_touch_min_steps": 2,
-            "seek_touch_commit_dist": 0.24,
+            "seek_touch_min_steps": 1,
+            "seek_touch_commit_dist": 0.30,
         }
 
         # Phase-dependent forward speed: approach (run) / seek_touch / touch.
@@ -183,7 +183,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_approach_touch_bridge = RewTerm(
             func=mdp.dribbling_approach_touch_bridge,
-            weight=5.0,
+            weight=6.5,
             params={
                 "command_name": "motion",
                 "foot_cfg": _foot_cfg,
@@ -191,15 +191,15 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "contact_force_threshold": 1.0,
                 "recent_contact_window": 8,
                 "std": 0.18,
-                "approach_scale": 0.35,
-                "seek_touch_scale": 1.0,
+                "approach_scale": 0.50,
+                "seek_touch_scale": 1.20,
                 **_dribble_phase,
             },
         )
 
         self.rewards.dribbling_approach_touch_transition = RewTerm(
             func=mdp.dribbling_approach_touch_transition,
-            weight=2.5,
+            weight=4.0,
             params={
                 "command_name": "motion",
                 "foot_cfg": _foot_cfg,
@@ -224,6 +224,48 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
                 "min_forward_dominance": 0.45,
+            },
+        )
+
+        self.rewards.dribbling_phase_ball_speed_requirement = RewTerm(
+            func=mdp.dribbling_phase_ball_speed_requirement,
+            weight=2.5,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "recent_contact_window": 8,
+                "foot_cfg": _foot_cfg,
+                "std": 0.22,
+                "approach_ball_speed_far": 0.08,
+                "approach_ball_speed_near": 0.22,
+                "touch_ball_speed_target": 0.30,
+                "approach_near_dist": 0.62,
+                "approach_min_ratio": 0.75,
+                "touch_min_ratio": 0.80,
+                "approach_urgency_scale": 0.65,
+                **_dribble_phase,
+            },
+        )
+
+        self.rewards.dribbling_taskframe_route_speed_requirement = RewTerm(
+            func=mdp.dribbling_taskframe_route_speed_requirement,
+            weight=0.0,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "recent_contact_window": 8,
+                "speed_std": 0.25,
+                # Piecewise route speed target by progress s in [0, 1].
+                "segment_progress_1": 0.45,
+                "segment_progress_2": 0.80,
+                "target_speed_seg1": 0.18,
+                "target_speed_seg2": 0.32,
+                "target_speed_seg3": 0.24,
+                "min_speed_ratio": 0.75,
+                "low_speed_urgency_scale": 0.55,
+                "min_route_len": 0.6,
             },
         )
 
@@ -451,7 +493,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "approach_run_min_ahead": 0.35,
                 "approach_max_dist": 0.55,
                 "approach_ball_speed_max": 0.35,
-                "no_contact_pause_min_dist": 0.55,
+                "no_contact_pause_min_dist": 0.80,
                 "approach_ball_stopped_max_speed": 0.08,
             },
         )
