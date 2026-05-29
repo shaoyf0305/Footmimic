@@ -131,11 +131,11 @@ _DRIBBLE_APPROACH_BALL_SPEED_MAX = 0.35
 _DRIBBLE_APPROACH_BALL_STOPPED_MAX = 0.08
 _DRIBBLE_APPROACH_MIN_X_AHEAD = 0.10
 _DRIBBLE_APPROACH_MAX_X_AHEAD = 0.85
-_DRIBBLE_CLOSE_MAX_DIST = 0.52
-_DRIBBLE_CLOSE_X_MIN = 0.15
+_DRIBBLE_CLOSE_MAX_DIST = 0.62
+_DRIBBLE_CLOSE_X_MIN = 0.10
 _DRIBBLE_CLOSE_X_MAX = 0.65
-_DRIBBLE_SEEK_TOUCH_MIN_STEPS = 2
-_DRIBBLE_SEEK_TOUCH_COMMIT_DIST = 0.24
+_DRIBBLE_SEEK_TOUCH_MIN_STEPS = 1
+_DRIBBLE_SEEK_TOUCH_COMMIT_DIST = 0.30
 
 
 def _resolve_base_env(env):
@@ -227,10 +227,15 @@ def _get_play_overlay(env, timestep: int) -> str:
         recent_lbl = "YES" if recent_contact_t > 0.5 else "NO"
         steps_seek_zone = int(bundle.steps_in_seek_touch_zone[i].item())
         in_seek_zone = bool(bundle.seek_touch_zone[i].item())
+        prev_dist = getattr(base_env, "_dribble_prev_dist_xy", None)
+        dist_delta = ""
+        if prev_dist is not None and prev_dist.shape[0] > i:
+            d_drop = float(prev_dist[i].item()) - pelvis_ball_xy
+            dist_delta = f"  dist_drop={d_drop:+.3f} m/step"
         phase_lines = [
             f"Phase: {phase} (level={phase_level})  |  sim_touch={'YES' if has_contact_t else 'NO'}  "
             f"|  recent_touch={recent_lbl} (win={_DRIBBLE_RECENT_CONTACT_WINDOW})",
-            f"  x_ahead={x_ahead:.2f} m  dist_xy={pelvis_ball_xy:.2f} m  "
+            f"  x_ahead={x_ahead:.2f} m  dist_xy={pelvis_ball_xy:.2f} m{dist_delta}  "
             f"ball_v_xy={ball_sp_xy:.2f} m/s  seek_zone_steps={steps_seek_zone}",
         ]
         if in_seek_zone and phase != "seek_touch":

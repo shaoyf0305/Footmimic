@@ -7,7 +7,7 @@ Inherits proximity-level tracking and adds dribbling-specific rewards:
   - pelvis orientation vs motion reference (anti lean-back / arched torso)
   - ball horizontal speed excess penalty; anti-trap / anti-sustained-contact penalties
   - both ankles legal for gentle touches; anti-trap / sustained-contact block 夹球
-  - approach / seek_touch / touch phases; phased forward velocity, rapid-retouch penalty
+  - approach (chase, dist closing) / seek_touch (near-ball pose) / touch; phased forward velocity
   - gait foot tracking between touches; reduced close-proximity / foot-hover shaping
   - slightly relaxed imitation weights; reduced global body velocity tracking (slalom bleed)
   - ``ball_lost`` and tighter ``dribbling_no_contact`` termination
@@ -111,6 +111,22 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             "seek_touch_min_steps": 1,
             "seek_touch_commit_dist": 0.30,
         }
+
+        # Chase: shrink dist_xy + run toward ball (``approach`` phase only).
+        self.rewards.dribbling_approach_closing = RewTerm(
+            func=mdp.dribbling_approach_closing,
+            weight=3.5,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "recent_contact_window": 8,
+                "dist_drop_scale": 0.06,
+                "closing_vel_scale": 0.45,
+                "dist_drop_weight": 0.55,
+                **_dribble_phase,
+            },
+        )
 
         # Phase-dependent forward speed: approach (run) / seek_touch / touch.
         self.rewards.dribbling_phased_forward_velocity = RewTerm(
@@ -229,7 +245,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_phase_ball_speed_requirement = RewTerm(
             func=mdp.dribbling_phase_ball_speed_requirement,
-            weight=2.5,
+            weight=0.0,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",

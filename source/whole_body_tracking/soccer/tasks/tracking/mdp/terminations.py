@@ -36,11 +36,11 @@ def _dribble_phase_context(
     approach_min_x_ahead: float = 0.10,
     approach_max_x_ahead: float = 0.85,
     foot_cfg: SceneEntityCfg | None = None,
-    close_max_dist: float = 0.52,
-    close_x_min: float = 0.15,
+    close_max_dist: float = 0.62,
+    close_x_min: float = 0.10,
     close_x_max: float = 0.65,
-    seek_touch_min_steps: int = 2,
-    seek_touch_commit_dist: float = 0.24,
+    seek_touch_min_steps: int = 1,
+    seek_touch_commit_dist: float = 0.30,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pelvis–ball geometry and phase masks shared by dribble terminations."""
     command: MotionCommand = env.command_manager.get_term(command_name)
