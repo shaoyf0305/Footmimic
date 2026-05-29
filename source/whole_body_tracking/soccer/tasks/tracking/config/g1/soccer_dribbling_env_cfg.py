@@ -124,6 +124,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "dist_drop_scale": 0.06,
                 "closing_vel_scale": 0.45,
                 "dist_drop_weight": 0.55,
+                "max_approach_time_s": 3.0,
                 **_dribble_phase,
             },
         )
@@ -511,6 +512,20 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "approach_ball_speed_max": 0.35,
                 "no_contact_pause_min_dist": 0.80,
                 "approach_ball_stopped_max_speed": 0.08,
+            },
+        )
+
+        self.terminations.dribbling_approach_timeout = DoneTerm(
+            func=mdp.dribbling_approach_timeout,
+            params={
+                "command_name": "motion",
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "grace_steps": 50,
+                "max_approach_time_s": 3.0,
+                "recent_contact_window": 8,
+                "foot_cfg": _foot_cfg,
+                **_dribble_phase,
             },
         )
 

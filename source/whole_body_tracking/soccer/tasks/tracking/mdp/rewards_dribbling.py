@@ -21,6 +21,7 @@ from soccer.tasks.tracking.mdp.rewards import motion_relative_foot_position_erro
 from soccer.tasks.tracking.mdp.task_frame import (
     DribblePhaseBundle,
     compute_dribble_phase_bundle,
+    compute_max_approach_dist_drop_per_step,
     forward_dominance_gate,
     update_seek_touch_zone_steps,
     task_forward_offset,
@@ -295,9 +296,26 @@ def dribbling_approach_closing(
     dist_drop_scale: float = 0.06,
     closing_vel_scale: float = 0.45,
     dist_drop_weight: float = 0.55,
-    **_phase_kwargs,
+    max_approach_time_s: float = 3.0,
+    max_dist_drop_per_step: float | None = None,
+    approach_run_min_ahead: float = 0.35,
+    approach_run_max_dist: float = 1.85,
+    approach_max_dist: float = 0.55,
+    approach_ball_speed_max: float = 0.35,
+    approach_ball_stopped_max_speed: float = 0.08,
+    approach_min_x_ahead: float = 0.10,
+    approach_max_x_ahead: float = 0.85,
+    close_max_dist: float = 0.62,
+    close_x_min: float = 0.10,
+    close_x_max: float = 0.65,
+    seek_touch_min_steps: int = 1,
+    seek_touch_commit_dist: float = 0.30,
 ) -> torch.Tensor:
-    """Reward chasing the ball during ``approach``: per-step ``dist_xy`` decrease and velocity toward ball."""
+    """Reward chasing the ball during ``approach``: per-step ``dist_xy`` decrease and velocity toward ball.
+
+    ``dist_xy`` closing is capped so reward cannot spike from sprinting past the ball; the cap is
+    derived from ``max_approach_time_s`` (far chase → ``seek_touch`` zone budget).
+    """
     command: MotionCommand = env.command_manager.get_term(command_name)
     bundle = gather_dribble_phase_bundle(
         env,
@@ -306,7 +324,18 @@ def dribbling_approach_closing(
         contact_force_threshold,
         recent_contact_window,
         foot_cfg,
-        **_phase_kwargs,
+        approach_run_min_ahead=approach_run_min_ahead,
+        approach_run_max_dist=approach_run_max_dist,
+        approach_max_dist=approach_max_dist,
+        approach_ball_speed_max=approach_ball_speed_max,
+        approach_ball_stopped_max_speed=approach_ball_stopped_max_speed,
+        approach_min_x_ahead=approach_min_x_ahead,
+        approach_max_x_ahead=approach_max_x_ahead,
+        close_max_dist=close_max_dist,
+        close_x_min=close_x_min,
+        close_x_max=close_x_max,
+        seek_touch_min_steps=seek_touch_min_steps,
+        seek_touch_commit_dist=seek_touch_commit_dist,
     )
 
     soccer_ball = env.scene["soccer_ball"]
@@ -315,8 +344,17 @@ def dribbling_approach_closing(
     dist_xy = torch.norm(ball_pos_w[:, :2] - pelvis_pos_w[:, :2], dim=-1)
     prev_dist = _dribble_prev_dist_xy(env, dist_xy)
 
-    dist_drop = (prev_dist - dist_xy).clamp(min=0.0)
-    drop_rew = torch.clamp(dist_drop / max(dist_drop_scale, 1e-6), max=1.0)
+    if max_dist_drop_per_step is None:
+        max_dist_drop_per_step = compute_max_approach_dist_drop_per_step(
+            env.step_dt,
+            max_approach_time_s,
+            approach_run_max_dist,
+            close_max_dist,
+        )
+    max_drop = max(float(max_dist_drop_per_step), 1e-6)
+
+    dist_drop = (prev_dist - dist_xy).clamp(min=0.0, max=max_drop)
+    drop_rew = torch.clamp(dist_drop / max_drop, max=1.0)
 
     pelvis_index = command.robot.body_names.index("pelvis")
     pelvis_vel_xy = command.robot.data.body_lin_vel_w[:, pelvis_index, :2]
@@ -357,13 +395,12 @@ def dribbling_phased_forward_velocity(
     approach_ball_stopped_max_speed: float = 0.08,
     approach_min_x_ahead: float = 0.10,
     approach_max_x_ahead: float = 0.85,
-    close_max_dist: float = 0.52,
-    close_x_min: float = 0.15,
+    close_max_dist: float = 0.62,
+    close_x_min: float = 0.10,
     close_x_max: float = 0.65,
     seek_touch_min_steps: int = 1,
     seek_touch_commit_dist: float = 0.30,
     foot_cfg: SceneEntityCfg | None = None,
-    **_phase_kwargs,
 ) -> torch.Tensor:
     """Reward pelvis speed vs phase target: approach chase run, seek_touch / touch slow."""
     command: MotionCommand = env.command_manager.get_term(command_name)

@@ -114,6 +114,60 @@ DRIBBLE_PHASE_SEEK_TOUCH = 2
 DRIBBLE_PHASE_TOUCH = 3
 
 
+def compute_max_approach_dist_drop_per_step(
+    step_dt: float,
+    max_approach_time_s: float,
+    approach_run_max_dist: float,
+    close_max_dist: float,
+) -> float:
+    """Max per-step ``dist_xy`` decrease so far→near closing spans at least ``max_approach_time_s``."""
+    max_steps = max(int(max_approach_time_s / max(step_dt, 1e-6)), 1)
+    dist_budget = max(float(approach_run_max_dist) - float(close_max_dist), 1e-6)
+    return dist_budget / max_steps
+
+
+def update_approach_to_seek_steps(
+    env: ManagerBasedRLEnv,
+    approach: torch.Tensor,
+    seek_touch: torch.Tensor,
+    touch: torch.Tensor,
+    *,
+    buf_name: str = "_dribble_approach_to_seek_steps",
+    reached_buf_name: str = "_dribble_approach_reached_seek",
+) -> torch.Tensor:
+    """Count consecutive ``approach`` steps before first ``seek_touch`` / ``touch`` (resets on leaving approach)."""
+    step_buf = getattr(env, "episode_length_buf", None)
+    reset_ep = (
+        step_buf == 0
+        if step_buf is not None
+        else torch.zeros(approach.shape[0], dtype=torch.bool, device=approach.device)
+    )
+
+    cnt = getattr(env, buf_name, None)
+    if cnt is None or cnt.shape[0] != approach.shape[0]:
+        cnt = torch.zeros(approach.shape[0], device=approach.device, dtype=torch.int32)
+
+    reached = getattr(env, reached_buf_name, None)
+    if reached is None or reached.shape[0] != approach.shape[0]:
+        reached = torch.zeros(approach.shape[0], device=approach.device, dtype=torch.bool)
+
+    reached = reached | seek_touch | touch
+    in_approach_race = approach & (~reached)
+
+    cnt = torch.where(
+        reset_ep | reached,
+        torch.zeros_like(cnt),
+        torch.where(
+            in_approach_race,
+            cnt + 1,
+            torch.zeros_like(cnt),
+        ),
+    )
+    setattr(env, buf_name, cnt)
+    setattr(env, reached_buf_name, reached)
+    return cnt
+
+
 def update_seek_touch_zone_steps(
     env: ManagerBasedRLEnv,
     seek_touch_zone: torch.Tensor,

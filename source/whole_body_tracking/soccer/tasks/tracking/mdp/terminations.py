@@ -17,7 +17,7 @@ from soccer.tasks.tracking.mdp.rewards_dribbling import (
     soccer_ball_contact_force_magnitude,
 )
 from soccer.tasks.tracking.mdp.rewards_dribbling import gather_dribble_phase_bundle
-from soccer.tasks.tracking.mdp.task_frame import task_forward_offset
+from soccer.tasks.tracking.mdp.task_frame import task_forward_offset, update_approach_to_seek_steps
 
 from soccer.tasks.tracking.mdp.rewards import _get_body_indexes
 
@@ -241,6 +241,61 @@ def dribbling_no_ball_contact_timeout(
     setattr(env, buf_name, cnt)
 
     return cnt >= max_steps_without_contact
+
+
+def dribbling_approach_timeout(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    grace_steps: int = 50,
+    max_approach_time_s: float = 3.0,
+    max_steps_in_approach: int | None = None,
+    recent_contact_window: int = 8,
+    approach_run_min_ahead: float = 0.35,
+    approach_run_max_dist: float = 1.85,
+    approach_max_dist: float = 0.55,
+    approach_ball_speed_max: float = 0.35,
+    approach_ball_stopped_max_speed: float = 0.08,
+    approach_min_x_ahead: float = 0.10,
+    approach_max_x_ahead: float = 0.85,
+    foot_cfg: SceneEntityCfg | None = None,
+    close_max_dist: float = 0.62,
+    close_x_min: float = 0.10,
+    close_x_max: float = 0.65,
+    seek_touch_min_steps: int = 1,
+    seek_touch_commit_dist: float = 0.30,
+) -> torch.Tensor:
+    """Terminate if ``approach`` lasts too long without entering ``seek_touch``."""
+    has_contact, touch, seek_touch, approach, _, _ = _dribble_phase_context(
+        env,
+        command_name,
+        ball_sensor_name,
+        contact_force_threshold,
+        recent_contact_window,
+        approach_run_min_ahead,
+        approach_max_dist,
+        approach_ball_speed_max,
+        approach_run_max_dist=approach_run_max_dist,
+        approach_ball_stopped_max_speed=approach_ball_stopped_max_speed,
+        approach_min_x_ahead=approach_min_x_ahead,
+        approach_max_x_ahead=approach_max_x_ahead,
+        foot_cfg=foot_cfg,
+        close_max_dist=close_max_dist,
+        close_x_min=close_x_min,
+        close_x_max=close_x_max,
+        seek_touch_min_steps=seek_touch_min_steps,
+        seek_touch_commit_dist=seek_touch_commit_dist,
+    )
+
+    if max_steps_in_approach is None:
+        max_steps_in_approach = max(int(max_approach_time_s / max(env.step_dt, 1e-6)), 1)
+
+    step_buf = getattr(env, "episode_length_buf", torch.zeros(env.num_envs, device=env.device))
+    past_grace = step_buf > grace_steps
+
+    approach_steps = update_approach_to_seek_steps(env, approach, seek_touch, touch | has_contact)
+    return past_grace & approach & (approach_steps >= int(max_steps_in_approach))
 
 
 def dribbling_seek_touch_timeout(
