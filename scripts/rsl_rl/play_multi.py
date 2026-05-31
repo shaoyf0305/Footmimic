@@ -57,13 +57,10 @@ import torch
 
 from isaaclab.managers import SceneEntityCfg
 from soccer.tasks.tracking.mdp.rewards_dribbling import (
-    _dribbling_recent_contact_gate,
     _identify_contact_body,
     soccer_ball_contact_force_magnitude,
     soccer_ball_contact_net_force_w,
 )
-from soccer.tasks.tracking.mdp.rewards_dribbling import gather_dribble_phase_bundle
-from soccer.tasks.tracking.mdp.task_frame import resolve_dribble_phase_label, task_forward_offset
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -122,20 +119,6 @@ _HUD_CONTACT_BODIES = [
 _HUD_ANKLE_BODIES = ["right_ankle_roll_link", "left_ankle_roll_link"]
 _BALL_SENSOR_NAME = "soccer_ball_contact"
 _CONTACT_FORCE_THRESHOLD = 1.0
-# Match G1FlatDribblingEnvCfg termination / phased-velocity defaults.
-_DRIBBLE_RECENT_CONTACT_WINDOW = 8
-_DRIBBLE_APPROACH_RUN_MIN_AHEAD = 0.35
-_DRIBBLE_APPROACH_RUN_MAX_DIST = 1.85
-_DRIBBLE_APPROACH_MAX_DIST = 0.55
-_DRIBBLE_APPROACH_BALL_SPEED_MAX = 0.35
-_DRIBBLE_APPROACH_BALL_STOPPED_MAX = 0.08
-_DRIBBLE_APPROACH_MIN_X_AHEAD = 0.10
-_DRIBBLE_APPROACH_MAX_X_AHEAD = 0.85
-_DRIBBLE_CLOSE_MAX_DIST = 0.62
-_DRIBBLE_CLOSE_X_MIN = 0.10
-_DRIBBLE_CLOSE_X_MAX = 0.65
-_DRIBBLE_SEEK_TOUCH_MIN_STEPS = 1
-_DRIBBLE_SEEK_TOUCH_COMMIT_DIST = 0.30
 
 
 def _resolve_base_env(env):
@@ -182,71 +165,6 @@ def _get_play_overlay(env, timestep: int) -> str:
             f"Pelvis-Ball: {pelvis_ball_xy:.2f} m (xy)  |  {pelvis_ball_3d:.2f} m (3D)"
         )
 
-        force_xy = float(
-            soccer_ball_contact_force_magnitude(base_env, _BALL_SENSOR_NAME)[i].item()
-        )
-        x_ahead = float(
-            task_forward_offset(
-                soccer_ball.data.root_pos_w[i : i + 1],
-                cmd.robot_pelvis_pos_w[i : i + 1],
-            ).item()
-        )
-        has_contact_t = force_xy > _CONTACT_FORCE_THRESHOLD
-        recent_contact_t = float(
-            _dribbling_recent_contact_gate(
-                base_env,
-                _BALL_SENSOR_NAME,
-                _CONTACT_FORCE_THRESHOLD,
-                _DRIBBLE_RECENT_CONTACT_WINDOW,
-                command=cmd,
-            )[i].item()
-        )
-        foot_cfg = SceneEntityCfg("robot", body_names=_HUD_ANKLE_BODIES)
-        bundle = gather_dribble_phase_bundle(
-            base_env,
-            cmd,
-            _BALL_SENSOR_NAME,
-            _CONTACT_FORCE_THRESHOLD,
-            _DRIBBLE_RECENT_CONTACT_WINDOW,
-            foot_cfg,
-            approach_run_min_ahead=_DRIBBLE_APPROACH_RUN_MIN_AHEAD,
-            approach_run_max_dist=_DRIBBLE_APPROACH_RUN_MAX_DIST,
-            approach_max_dist=_DRIBBLE_APPROACH_MAX_DIST,
-            approach_ball_speed_max=_DRIBBLE_APPROACH_BALL_SPEED_MAX,
-            approach_ball_stopped_max_speed=_DRIBBLE_APPROACH_BALL_STOPPED_MAX,
-            approach_min_x_ahead=_DRIBBLE_APPROACH_MIN_X_AHEAD,
-            approach_max_x_ahead=_DRIBBLE_APPROACH_MAX_X_AHEAD,
-            close_max_dist=_DRIBBLE_CLOSE_MAX_DIST,
-            close_x_min=_DRIBBLE_CLOSE_X_MIN,
-            close_x_max=_DRIBBLE_CLOSE_X_MAX,
-            seek_touch_min_steps=_DRIBBLE_SEEK_TOUCH_MIN_STEPS,
-            seek_touch_commit_dist=_DRIBBLE_SEEK_TOUCH_COMMIT_DIST,
-        )
-        phase = resolve_dribble_phase_label(bundle, 0)
-        phase_level = int(bundle.phase_level[i].item())
-        recent_lbl = "YES" if recent_contact_t > 0.5 else "NO"
-        steps_seek_zone = int(bundle.steps_in_seek_touch_zone[i].item())
-        in_seek_zone = bool(bundle.seek_touch_zone[i].item())
-        prev_dist = getattr(base_env, "_dribble_prev_dist_xy", None)
-        dist_delta = ""
-        if prev_dist is not None and prev_dist.shape[0] > i:
-            d_drop = float(prev_dist[i].item()) - pelvis_ball_xy
-            dist_delta = f"  dist_drop={d_drop:+.3f} m/step"
-        phase_lines = [
-            f"Phase: {phase} (level={phase_level})  |  sim_touch={'YES' if has_contact_t else 'NO'}  "
-            f"|  recent_touch={recent_lbl} (win={_DRIBBLE_RECENT_CONTACT_WINDOW})",
-            f"  x_ahead={x_ahead:.2f} m  dist_xy={pelvis_ball_xy:.2f} m{dist_delta}  "
-            f"ball_v_xy={ball_sp_xy:.2f} m/s  seek_zone_steps={steps_seek_zone}",
-        ]
-        if in_seek_zone and phase != "seek_touch":
-            phase_lines.append(
-                f"  seek_touch pending: seek_zone_steps {steps_seek_zone}/{_DRIBBLE_SEEK_TOUCH_MIN_STEPS}"
-            )
-        if phase == "touch" and not has_contact_t:
-            phase_lines.append(
-                "  (touch w/o sim_touch: recent_touch window after last contact)"
-            )
-
         robot = base_env.scene["robot"]
         ankle_dists: list[float] = []
         for fname in _HUD_ANKLE_BODIES:
@@ -257,12 +175,10 @@ def _get_play_overlay(env, timestep: int) -> str:
             ankle_dists.append(float(np.linalg.norm(fpos - ball_pos)))
         if ankle_dists:
             lines.append(f"Ankle-Ball (min): {min(ankle_dists):.2f} m (3D)")
-            if min(ankle_dists) <= _DRIBBLE_SEEK_TOUCH_COMMIT_DIST:
-                phase_lines.append(
-                    f"  seek_touch commit: ankle dist <= {_DRIBBLE_SEEK_TOUCH_COMMIT_DIST:.2f} m"
-                )
-        lines[1:1] = phase_lines
 
+        force_xy = float(
+            soccer_ball_contact_force_magnitude(base_env, _BALL_SENSOR_NAME)[i].item()
+        )
         force_vec = soccer_ball_contact_net_force_w(base_env, _BALL_SENSOR_NAME)[i].detach().cpu().numpy()
         force_z = float(abs(force_vec[2]))
         sim_touch = force_xy > _CONTACT_FORCE_THRESHOLD
@@ -501,7 +417,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             env.unwrapped.sim.render()
         mode = "dual-view" if args_cli.dual_view else "single-view"
         print(f"[INFO] {mode} recording ({args_cli.video_length} steps) → {video_dir}")
-        print("[INFO] HUD: phase (touch/seek_touch/approach), speeds, contact, CG labels.")
+        print("[INFO] HUD: speeds, distances, contact, CG labels.")
 
     # reset environment
     # breakpoint()

@@ -125,8 +125,7 @@ def task_heading_alignment_reward(
     robot = command.robot
     pelvis_index = robot.body_names.index("pelvis")
     pelvis_quat_w = robot.data.body_quat_w[:, pelvis_index]
-    heading = task_pelvis_heading_cos_world_x(pelvis_quat_w)
-    return heading.clamp(min=0.0, max=1.0)
+    return task_pelvis_heading_cos_world_x(pelvis_quat_w).clamp(min=0.0, max=1.0)
 
 
 def waist_action_rate_l2_clip(env: ManagerBasedRLEnv, waist_cfg: SceneEntityCfg | None = None) -> torch.Tensor:
