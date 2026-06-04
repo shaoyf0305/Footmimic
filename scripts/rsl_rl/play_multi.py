@@ -16,6 +16,12 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=600, help="Length of the recorded video (in steps).")
 parser.add_argument("--dual_view", action="store_true", default=False, help="Record split-screen video (front + back view).")
+parser.add_argument(
+    "--record_all_motions",
+    action="store_true",
+    default=False,
+    help="Cycle through every motion in --motion_path once, in sorted filename order (sets sequential sampling and auto video_length).",
+)
 parser.add_argument("--path_tracing", action="store_true", default=False, help="Use Path Tracing renderer for higher quality.")
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
@@ -55,9 +61,7 @@ import pathlib
 import numpy as np
 import torch
 
-from isaaclab.managers import SceneEntityCfg
 from soccer.tasks.tracking.mdp.rewards_dribbling import (
-    _identify_contact_body,
     soccer_ball_contact_force_magnitude,
     soccer_ball_contact_net_force_w,
 )
@@ -79,6 +83,18 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
+
+def motion_frame_count(motion_file: str) -> int:
+    """Return the number of frames in a motion .npz file."""
+    data = np.load(motion_file)
+    if "joint_pos" in data:
+        return int(data["joint_pos"].shape[0])
+    for key in data.files:
+        arr = data[key]
+        if hasattr(arr, "shape") and len(arr.shape) >= 1:
+            return int(arr.shape[0])
+    raise ValueError(f"Could not infer frame count from {motion_file}")
+
 
 def get_motion_files(motion_path: str) -> list[str]:
     """
@@ -107,15 +123,6 @@ def get_motion_files(motion_path: str) -> list[str]:
         raise ValueError(f"Invalid path: {motion_path}. Must be a file or directory.")
 
 
-# Bodies checked for ball contact HUD (matches dribbling env contact reward).
-_HUD_CONTACT_BODIES = [
-    "right_ankle_roll_link",
-    "left_ankle_roll_link",
-    "right_knee_link",
-    "left_knee_link",
-    "right_wrist_yaw_link",
-    "left_wrist_yaw_link",
-]
 _HUD_ANKLE_BODIES = ["right_ankle_roll_link", "left_ankle_roll_link"]
 _BALL_SENSOR_NAME = "soccer_ball_contact"
 _CONTACT_FORCE_THRESHOLD = 1.0
@@ -138,6 +145,13 @@ def _get_play_overlay(env, timestep: int) -> str:
         base_env = _resolve_base_env(env)
         cmd = base_env.command_manager.get_term("motion")
         i = 0
+
+        if hasattr(cmd, "motion_idx") and hasattr(cmd, "motion") and hasattr(cmd.motion, "motion_name"):
+            mi = int(cmd.motion_idx[i].item())
+            names = cmd.motion.motion_name
+            n = len(names)
+            ref = names[mi] if 0 <= mi < n else f"motion_{mi}"
+            lines.insert(0, f"Ref: {ref}  ({mi + 1}/{n})")
 
         t = int(cmd.time_steps[i].item())
         motion_len = int(cmd.motion_length[i].item())
@@ -183,21 +197,10 @@ def _get_play_overlay(env, timestep: int) -> str:
         force_z = float(abs(force_vec[2]))
         sim_touch = force_xy > _CONTACT_FORCE_THRESHOLD
 
-        nearest = "-"
-        if sim_touch:
-            all_body_cfg = SceneEntityCfg("robot", body_names=_HUD_CONTACT_BODIES)
-            has_contact, _, closest_idx = _identify_contact_body(
-                base_env, cmd, _BALL_SENSOR_NAME, all_body_cfg
-            )
-            if bool(has_contact[i].item()):
-                nearest = _HUD_CONTACT_BODIES[int(closest_idx[i].item())]
-
         lines.append(
             f"Robot-Ball: {'YES' if sim_touch else 'NO'}  |  "
             f"F_xy={force_xy:.1f} N  |  F_z~{force_z:.1f} N (ground)"
         )
-        if sim_touch:
-            lines.append(f"  nearest body: {nearest}")
 
         if hasattr(cmd, "motion_has_dribble_cg_label") and bool(cmd.motion_has_dribble_cg_label[i].item()):
             ref_contact = bool(cmd.dribble_cg_contact_ref[i].item())
@@ -207,17 +210,13 @@ def _get_play_overlay(env, timestep: int) -> str:
             lines.append(
                 f"CG label: contact={int(ref_contact)} foot={foot_lbl}  ({match})"
             )
-            if hasattr(cmd, "dribble_cg_foot_ball_dist_ref"):
-                demo_dist = float(cmd.dribble_cg_foot_ball_dist_ref[i].item())
-                if demo_dist >= 0.0 and ref_foot in (0, 1):
-                    foot_name = _HUD_ANKLE_BODIES[1] if ref_foot == 0 else _HUD_ANKLE_BODIES[0]
-                    if foot_name in robot.body_names:
-                        bidx = robot.body_names.index(foot_name)
-                        fpos = robot.data.body_pos_w[i, bidx].detach().cpu().numpy()
-                        sim_dist = float(np.linalg.norm(fpos - ball_pos))
-                        lines.append(
-                            f"Foot-Ball: sim {sim_dist:.2f} m  |  demo {demo_dist:.2f} m"
-                        )
+
+        if hasattr(cmd, "dribble_cg_foot_ball_dist_ref"):
+            demo_dist = float(cmd.dribble_cg_foot_ball_dist_ref[i].item())
+            if demo_dist >= 0.0:
+                lines.append(f"Foot-Ball demo: {demo_dist:.2f} m")
+            else:
+                lines.append("Foot-Ball demo: -")
         elif hasattr(cmd, "kick_frame"):
             kf = int(cmd.kick_frame[i].item())
             margin = 5
@@ -317,6 +316,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             env_cfg.commands.motion.motion_files = motion_files
             if hasattr(env_cfg.commands.motion, "strike_motion_files"):
                 env_cfg.commands.motion.strike_motion_files = motion_files
+
+        if args_cli.record_all_motions:
+            if len(motion_files) <= 1:
+                raise ValueError("--record_all_motions requires --motion_path with multiple .npz files.")
+            env_cfg.commands.motion.sampling_strategy = "sequential"
+            total_frames = sum(motion_frame_count(f) for f in motion_files)
+            args_cli.video_length = total_frames
+            print(
+                f"[INFO] --record_all_motions: sequential playback, "
+                f"video_length={total_frames} ({len(motion_files)} clips)"
+            )
+
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
@@ -417,7 +428,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             env.unwrapped.sim.render()
         mode = "dual-view" if args_cli.dual_view else "single-view"
         print(f"[INFO] {mode} recording ({args_cli.video_length} steps) → {video_dir}")
-        print("[INFO] HUD: speeds, distances, contact, CG labels.")
+        print("[INFO] HUD: Ref name, speeds, distances, contact, CG labels.")
 
     # reset environment
     # breakpoint()

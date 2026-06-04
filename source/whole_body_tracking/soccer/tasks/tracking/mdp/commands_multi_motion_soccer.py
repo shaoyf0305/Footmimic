@@ -331,10 +331,13 @@ class MotionCommand(CommandTerm):
         self.motion_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_length = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
-        # Randomly assign initial motions.
+        # Randomly assign initial motions (sequential playback starts at 0 and cycles).
         if self.motion.num_files > 1:
-            self.motion_idx = torch.randint(0, self.motion.num_files, (self.num_envs,), 
-                                           dtype=torch.long, device=self.device)
+            if str(self.cfg.sampling_strategy).lower() == "sequential":
+                self.motion_idx = torch.arange(self.num_envs, device=self.device) % self.motion.num_files
+            else:
+                self.motion_idx = torch.randint(0, self.motion.num_files, (self.num_envs,),
+                                               dtype=torch.long, device=self.device)
         # Initialize per-environment motion lengths.
         self.motion_length[:] = self.motion.file_lengths[self.motion_idx]
 
@@ -710,7 +713,13 @@ class MotionCommand(CommandTerm):
         time_phase = torch.zeros(len(env_ids), device=self.device)
 
         self.time_steps[env_ids] = (time_phase * (self.motion_length[env_ids].float() - 1)).long()
-        
+
+    def _sequential_sampling(self, env_ids: Sequence[int]):
+        """Play the next reference clip in order (for evaluation videos)."""
+        next_idx = (self.motion_idx[env_ids] + 1) % self.motion.num_files
+        self.motion_idx[env_ids] = next_idx
+        self.motion_length[env_ids] = self.motion.file_lengths[self.motion_idx[env_ids]]
+        self.time_steps[env_ids] = 0
 
     def _compute_soccer_ball_positions(self, env_ids: Sequence[int] | torch.Tensor):
         if isinstance(env_ids, torch.Tensor):
@@ -858,6 +867,8 @@ class MotionCommand(CommandTerm):
             self._adaptive_sampling(env_ids)
         elif sampling_strategy == "uniform":
             self._uniform_sampling(env_ids)
+        elif sampling_strategy == "sequential":
+            self._sequential_sampling(env_ids)
         else:
             raise ValueError(f"Unsupported sampling_strategy: {self.cfg.sampling_strategy}")
         self._compute_soccer_ball_positions(env_ids)
