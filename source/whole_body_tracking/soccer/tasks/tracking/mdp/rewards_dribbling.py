@@ -175,14 +175,14 @@ def dribbling_velocity_tracking(
     contact_force_threshold: float = 1.0,
     recent_contact_window: int = 0,
     cg_gated_contact: bool = False,
-    min_forward_dominance: float = 0.45,
+    min_forward_dominance: float = 0.55,
 ) -> torch.Tensor:
-    """Reward alignment between the soccer ball velocity and the robot pelvis velocity.
+    """Reward matching task +X (forward) speed between ball and pelvis after a touch.
 
-    A cosine-similarity style reward: when the ball moves in the same direction
-    and at a similar speed as the robot, the reward is maximised.
+    Only the forward (+X) velocity components are compared so lateral / crab-walking
+    sync (matching ``v_y`` while ``v_x`` is small) does not score highly.
 
-    Optional **anti-cheese gates** (defaults preserve legacy behaviour):
+    Optional **anti-cheese gates**:
 
     - ``pelvis_speed_min`` / ``ball_speed_min``: multiply the reward by
       ``clamp(|v_xy| / min, max=1)`` so near-zero speeds do not yield a full
@@ -191,21 +191,23 @@ def dribbling_velocity_tracking(
       ``recent_contact_window > 0``, contact must have occurred within the last
       N steps (shared counter with forward-progress reward); otherwise the
       current step must show contact.
+    - ``min_forward_dominance``: both ball and pelvis XY velocities must be
+      sufficiently forward-dominant (task +X share of speed).
 
     Returns a value in ``[0, 1]`` per environment.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
 
-    # Ball velocity (world frame, xy only)
-    ball_vel_xy = soccer_ball.data.root_lin_vel_w[:, :2]  # (N, 2)
-    # Robot pelvis velocity (world frame, xy only)
-    pelvis_vel_xy = command.robot_anchor_lin_vel_w[:, :2]  # (N, 2)
+    ball_vel_w = soccer_ball.data.root_lin_vel_w[:, :3]
+    pelvis_vel_w = command.robot_anchor_lin_vel_w[:, :3]
+    ball_vel_xy = ball_vel_w[:, :2]
+    pelvis_vel_xy = pelvis_vel_w[:, :2]
 
-    # Squared difference as the error signal
-    vel_diff = ball_vel_xy - pelvis_vel_xy
-    error = torch.sum(vel_diff * vel_diff, dim=-1)  # (N,)
-
+    # Task-frame forward speed only — lateral crab sync must not match.
+    ball_fwd = task_forward_speed(ball_vel_w, clamp_forward=False)
+    pelvis_fwd = task_forward_speed(pelvis_vel_w, clamp_forward=False)
+    error = (ball_fwd - pelvis_fwd) ** 2
     base = torch.exp(-error / (std ** 2))
 
     pelvis_sp = torch.norm(pelvis_vel_xy, dim=-1)
@@ -228,8 +230,10 @@ def dribbling_velocity_tracking(
         )
 
     if min_forward_dominance > 0.0:
-        dominance = task_velocity_forward_dominance(pelvis_vel_xy)
-        gate = gate * forward_dominance_gate(dominance, min_forward_dominance)
+        pelvis_dom = task_velocity_forward_dominance(pelvis_vel_xy)
+        ball_dom = task_velocity_forward_dominance(ball_vel_xy)
+        gate = gate * forward_dominance_gate(pelvis_dom, min_forward_dominance)
+        gate = gate * forward_dominance_gate(ball_dom, min_forward_dominance)
 
     return base * gate
 
@@ -694,6 +698,7 @@ def dribbling_legal_foot_touch(
     all_body_cfg: SceneEntityCfg | None = None,
     num_ankle_links: int = 2,
     cg_gated: bool = False,
+    min_pelvis_heading: float = 0.0,
 ) -> torch.Tensor:
     """Reward a **new** gentle ankle touch (rising edge), not sustained trapping."""
     command: MotionCommand = env.command_manager.get_term(command_name)
@@ -713,7 +718,12 @@ def dribbling_legal_foot_touch(
         prev = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     new_touch = touch & ~prev
     setattr(env, prev_name, touch.detach().clone())
-    return new_touch.to(torch.float32)
+
+    reward = new_touch.to(torch.float32)
+    if min_pelvis_heading > 0.0:
+        heading = task_pelvis_heading_cos_world_x(command.robot_pelvis_quat_w).clamp(min=0.0, max=1.0)
+        reward = reward * forward_dominance_gate(heading, min_pelvis_heading)
+    return reward
 
 
 # ---------------------------------------------------------------------------

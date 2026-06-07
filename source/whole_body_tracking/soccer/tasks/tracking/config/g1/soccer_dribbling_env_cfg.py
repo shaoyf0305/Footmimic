@@ -10,6 +10,7 @@ Inherits proximity-level tracking and adds dribbling-specific rewards:
   - kick–chase–kick: chase reward, rapid-retouch penalty, coast penalty only when ball is close
   - gait foot tracking between touches; reduced close-proximity / foot-hover shaping
   - slightly relaxed imitation weights; reduced global body velocity tracking (slalom bleed)
+  - anti-crab: task-frame forward velocity match, heading-gated touches, stronger lateral penalty
   - ``ball_lost`` and tighter ``dribbling_no_contact`` termination
 """
 
@@ -62,11 +63,11 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             # Baseline foot tracking; ``dribbling_gait_foot_tracking`` adds stronger signal
             # between ball touches so the policy does not freeze in a kick-ready stance.
             self.rewards.motion_foot_pos.weight = 0.55
-        # Slalom demos bleed low forward speed into body velocity tracking — down-weight.
+        # Slalom demos bleed lateral speed into body velocity tracking — keep low.
         if hasattr(self.rewards, "motion_body_lin_vel"):
-            self.rewards.motion_body_lin_vel.weight = 0.3
+            self.rewards.motion_body_lin_vel.weight = 0.15
         if hasattr(self.rewards, "motion_body_ang_vel"):
-            self.rewards.motion_body_ang_vel.weight = 0.3
+            self.rewards.motion_body_ang_vel.weight = 0.15
         # Kick-style frozen proximity is not used for dribbling.
         if hasattr(self.rewards, "target_point_proximity"):
             self.rewards.target_point_proximity.weight = 0.0
@@ -83,7 +84,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
         self.rewards.dribbling_face_ball = RewTerm(
             func=mdp.dribbling_face_ball,
-            weight=2.0,
+            weight=2.5,
             params={
                 "command_name": "motion",
                 "min_distance": 0.05,
@@ -93,7 +94,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
         # Pelvis yaw vs task +X (``dribbling_face_ball`` already includes heading × ball-ahead).
         self.rewards.task_heading_alignment = RewTerm(
             func=mdp.task_heading_alignment_reward,
-            weight=1.0,
+            weight=1.8,
             params={"command_name": "motion"},
         )
 
@@ -110,12 +111,12 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
         )
         self.rewards.lateral_velocity_penalty = RewTerm(
             func=mdp.lateral_velocity_penalty,
-            weight=-0.9,
+            weight=-1.6,
             params={
                 "command_name": "motion",
                 "velocity_frame": "world",
-                "lateral_deadzone": 0.06,
-                "lateral_scale": 0.28,
+                "lateral_deadzone": 0.05,
+                "lateral_scale": 0.24,
             },
         )
 
@@ -166,7 +167,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "recent_contact_window": 8,
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
-                "min_forward_dominance": 0.45,
+                "min_forward_dominance": 0.55,
             },
         )
 
@@ -226,7 +227,8 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             func=mdp.dribbling_ball_xy_speed_excess_penalty,
             weight=-2.5,
             params={
-                "speed_cap": 2.8,
+                # Was 2.8 — no penalty at ~2.5 m/s where the robot loses the ball.
+                "speed_cap": 1.35,
                 "linear_scale": 1.2,
             },
         )
@@ -347,9 +349,11 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
-                "force_threshold": 22.0,
+                # Was 22 — hard kicks still counted as "gentle" legal touches.
+                "force_threshold": 14.0,
                 "all_body_cfg": _contact_body_cfg,
                 "num_ankle_links": _num_ankle_links,
+                "min_pelvis_heading": 0.55,
             },
         )
 
