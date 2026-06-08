@@ -9,7 +9,7 @@ Inherits proximity-level tracking and adds dribbling-specific rewards:
   - both ankles legal for gentle touches; anti-trap / sustained-contact block 夹球
   - kick–chase–kick: chase reward, rapid-retouch penalty, coast penalty only when ball is close
   - gait foot tracking between touches; reduced close-proximity / foot-hover shaping
-  - slightly relaxed imitation weights; reduced global body velocity tracking (slalom bleed)
+  - pelvis anchor + yaw-aligned upper-body vel/ori tracking (task +X frame); relaxed leg imitation weights
   - anti-crab: task-frame forward velocity match, heading-gated touches, stronger lateral penalty
   - ``ball_lost`` and tighter ``dribbling_no_contact`` termination
 """
@@ -53,6 +53,20 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             ),
         )
 
+        # Task frame uses pelvis facing world +X; align demo upper-body refs to robot pelvis yaw
+        # (default anchor ``torso_link`` leaves arms tied to demo slalom heading).
+        self.commands.motion.anchor_body_name = "pelvis"
+        _upper_body_track_names = [
+            "pelvis",
+            "torso_link",
+            "left_shoulder_roll_link",
+            "left_elbow_link",
+            "left_wrist_yaw_link",
+            "right_shoulder_roll_link",
+            "right_elbow_link",
+            "right_wrist_yaw_link",
+        ]
+
         # Slightly relax imitation so the policy can deviate toward the ball while
         # keeping torso/gait reference (touch-related rewards provide the main ball signal).
         if hasattr(self.rewards, "motion_body_pos"):
@@ -63,11 +77,29 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             # Baseline foot tracking; ``dribbling_gait_foot_tracking`` adds stronger signal
             # between ball touches so the policy does not freeze in a kick-ready stance.
             self.rewards.motion_foot_pos.weight = 0.55
-        # Slalom demos bleed lateral speed into body velocity tracking — keep low.
+        if hasattr(self.rewards, "motion_body_ori"):
+            self.rewards.motion_body_ori.params["body_names"] = _upper_body_track_names
+        # Yaw-aligned velocity match for upper body (world-frame demo vel breaks under +X task).
         if hasattr(self.rewards, "motion_body_lin_vel"):
-            self.rewards.motion_body_lin_vel.weight = 0.15
+            self.rewards.motion_body_lin_vel = RewTerm(
+                func=mdp.motion_relative_body_linear_velocity_error_exp,
+                weight=0.3,
+                params={
+                    "command_name": "motion",
+                    "std": 1.0,
+                    "body_names": _upper_body_track_names,
+                },
+            )
         if hasattr(self.rewards, "motion_body_ang_vel"):
-            self.rewards.motion_body_ang_vel.weight = 0.15
+            self.rewards.motion_body_ang_vel = RewTerm(
+                func=mdp.motion_relative_body_angular_velocity_error_exp,
+                weight=0.3,
+                params={
+                    "command_name": "motion",
+                    "std": 3.14,
+                    "body_names": _upper_body_track_names,
+                },
+            )
         # Kick-style frozen proximity is not used for dribbling.
         if hasattr(self.rewards, "target_point_proximity"):
             self.rewards.target_point_proximity.weight = 0.0

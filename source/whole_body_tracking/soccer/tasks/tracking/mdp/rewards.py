@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_error_magnitude, quat_apply, quat_inv, quat_apply_inverse
+from isaaclab.utils.math import quat_error_magnitude, quat_apply, quat_inv, quat_apply_inverse, quat_mul, yaw_quat
 
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
 from soccer.tasks.tracking.mdp.observations import get_target_point_world
@@ -191,6 +191,11 @@ def motion_relative_body_orientation_error_exp(
     return torch.exp(-error.mean(-1) / std**2)
 
 
+def _motion_anchor_yaw_delta_quat(command: MotionCommand) -> torch.Tensor:
+    """Yaw delta from demo anchor to robot anchor (matches command ``_update_command``)."""
+    return yaw_quat(quat_mul(command.robot_anchor_quat_w, quat_inv(command.anchor_quat_w)))
+
+
 def motion_global_body_linear_velocity_error_exp(
     env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
 ) -> torch.Tensor:
@@ -202,6 +207,21 @@ def motion_global_body_linear_velocity_error_exp(
     return torch.exp(-error.mean(-1) / std**2)
 
 
+def motion_relative_body_linear_velocity_error_exp(
+    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
+) -> torch.Tensor:
+    """Linear velocity match with demo velocities yaw-aligned to the robot anchor."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    body_indexes = _get_body_indexes(command, body_names)
+    delta_ori_w = _motion_anchor_yaw_delta_quat(command)
+    demo_vel = command.body_lin_vel_w[:, body_indexes]
+    ref_vel = quat_apply(delta_ori_w.unsqueeze(1).expand(-1, len(body_indexes), -1), demo_vel)
+    error = torch.sum(
+        torch.square(ref_vel - command.robot_body_lin_vel_w[:, body_indexes]), dim=-1
+    )
+    return torch.exp(-error.mean(-1) / std**2)
+
+
 def motion_global_body_angular_velocity_error_exp(
     env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
 ) -> torch.Tensor:
@@ -209,6 +229,21 @@ def motion_global_body_angular_velocity_error_exp(
     body_indexes = _get_body_indexes(command, body_names)
     error = torch.sum(
         torch.square(command.body_ang_vel_w[:, body_indexes] - command.robot_body_ang_vel_w[:, body_indexes]), dim=-1
+    )
+    return torch.exp(-error.mean(-1) / std**2)
+
+
+def motion_relative_body_angular_velocity_error_exp(
+    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
+) -> torch.Tensor:
+    """Angular velocity match with demo velocities yaw-aligned to the robot anchor."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    body_indexes = _get_body_indexes(command, body_names)
+    delta_ori_w = _motion_anchor_yaw_delta_quat(command)
+    demo_ang = command.body_ang_vel_w[:, body_indexes]
+    ref_ang = quat_apply(delta_ori_w.unsqueeze(1).expand(-1, len(body_indexes), -1), demo_ang)
+    error = torch.sum(
+        torch.square(ref_ang - command.robot_body_ang_vel_w[:, body_indexes]), dim=-1
     )
     return torch.exp(-error.mean(-1) / std**2)
 
