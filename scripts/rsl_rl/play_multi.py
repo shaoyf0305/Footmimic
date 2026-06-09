@@ -14,13 +14,18 @@ import cli_args  # isort: skip
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
-parser.add_argument("--video_length", type=int, default=600, help="Length of the recorded video (in steps).")
+parser.add_argument(
+    "--video_length",
+    type=int,
+    default=None,
+    help="Simulation steps to run (default: sum of motion frames for --motion_path, else motion length / 600).",
+)
 parser.add_argument("--dual_view", action="store_true", default=False, help="Record split-screen video (front + back view).")
 parser.add_argument(
     "--record_all_motions",
     action="store_true",
     default=False,
-    help="Cycle through every motion in --motion_path once, in sorted filename order (sets sequential sampling and auto video_length).",
+    help="Alias for default multi-file --motion_path behaviour (sequential playback, auto step count).",
 )
 parser.add_argument("--path_tracing", action="store_true", default=False, help="Use Path Tracing renderer for higher quality.")
 parser.add_argument(
@@ -29,7 +34,12 @@ parser.add_argument(
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--motion_file", type=str, default=None, help="Path to a single motion file. When specified, only this motion is played and exported.")
-parser.add_argument("--motion_path", type=str, default=None, help="The path to the directory containing motion files for random sampling (no export).")
+parser.add_argument(
+    "--motion_path",
+    type=str,
+    default=None,
+    help="Path to a motion .npz or a directory; directories are played sequentially in sorted order.",
+)
 
 parser.add_argument("--export_motion_name", type=str, default=None, help="Select one motion for exporter (required when --motion_file is used).")
 
@@ -96,6 +106,37 @@ def motion_frame_count(motion_file: str) -> int:
     raise ValueError(f"Could not infer frame count from {motion_file}")
 
 
+def _env_step_s(env_cfg) -> float:
+    """Wall-clock seconds per env step."""
+    return float(env_cfg.decimation) * float(env_cfg.sim.dt)
+
+
+def _setup_play_episode_limit(env_cfg, motion_files: list[str]) -> int:
+    """Size episodes for playback and drop the training 10 s / 500-step cap.
+
+    Returns the recommended total step count (single clip = its frame count;
+    multi-clip sequential run = sum of frame counts).
+    """
+    if not motion_files:
+        return 600
+
+    step_s = _env_step_s(env_cfg)
+    frame_counts = [motion_frame_count(f) for f in motion_files]
+    max_frames = max(frame_counts)
+
+    # Training uses episode_length_s=10 (500 steps). Playback needs at least one full clip.
+    env_cfg.episode_length_s = max_frames * step_s + 2.0
+    if hasattr(env_cfg.terminations, "time_out"):
+        env_cfg.terminations.time_out = None
+
+    if len(motion_files) > 1 and hasattr(env_cfg.commands.motion, "sampling_strategy"):
+        env_cfg.commands.motion.sampling_strategy = "sequential"
+
+    if len(motion_files) > 1:
+        return sum(frame_counts)
+    return max_frames
+
+
 def get_motion_files(motion_path: str) -> list[str]:
     """
     Get a list of motion files.
@@ -160,20 +201,17 @@ def _get_play_overlay(env, timestep: int) -> str:
         pelvis_vel = cmd.robot_anchor_lin_vel_w[i].detach().cpu().numpy()
         pelvis_pos = cmd.robot_pelvis_pos_w[i].detach().cpu().numpy()
         pelvis_sp_xy = float(np.linalg.norm(pelvis_vel[:2]))
-        pelvis_sp_3d = float(np.linalg.norm(pelvis_vel))
 
         soccer_ball = base_env.scene["soccer_ball"]
         ball_vel = soccer_ball.data.root_lin_vel_w[i].detach().cpu().numpy()
         ball_pos = soccer_ball.data.root_pos_w[i].detach().cpu().numpy()
         ball_sp_xy = float(np.linalg.norm(ball_vel[:2]))
-        ball_sp_3d = float(np.linalg.norm(ball_vel))
 
         pelvis_ball_xy = float(np.linalg.norm(ball_pos[:2] - pelvis_pos[:2]))
         pelvis_ball_3d = float(np.linalg.norm(ball_pos - pelvis_pos))
 
         lines.append(
-            f"Pelvis v_xy: {pelvis_sp_xy:.2f} m/s (|v|={pelvis_sp_3d:.2f})  |  "
-            f"Ball v_xy: {ball_sp_xy:.2f} m/s (|v|={ball_sp_3d:.2f})"
+            f"Pelvis v_xy: {pelvis_sp_xy:.2f} m/s  |  Ball v_xy: {ball_sp_xy:.2f} m/s"
         )
         lines.append(
             f"Pelvis-Ball: {pelvis_ball_xy:.2f} m (xy)  |  {pelvis_ball_3d:.2f} m (3D)"
@@ -296,11 +334,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             motion_files = [args_cli.motion_file]
             print(f"[INFO]: Using single motion file: {args_cli.motion_file}")
         elif args_cli.motion_path is not None:
-            # Multi-motion mode: random sampling for playback (no export by default).
             motion_files = get_motion_files(args_cli.motion_path)
         else:
             raise ValueError("Either --motion_file or --motion_path must be specified.")
-        
+
         # For state-machine environments: auto-split approach/strike files.
         approach_files = [f for f in motion_files if f.endswith("_approach.npz")]
         strike_files = [f for f in motion_files if f.endswith("_strike.npz")]
@@ -317,20 +354,33 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if hasattr(env_cfg.commands.motion, "strike_motion_files"):
                 env_cfg.commands.motion.strike_motion_files = motion_files
 
-        if args_cli.record_all_motions:
-            if len(motion_files) <= 1:
-                raise ValueError("--record_all_motions requires --motion_path with multiple .npz files.")
-            env_cfg.commands.motion.sampling_strategy = "sequential"
-            total_frames = sum(motion_frame_count(f) for f in motion_files)
-            args_cli.video_length = total_frames
-            print(
-                f"[INFO] --record_all_motions: sequential playback, "
-                f"video_length={total_frames} ({len(motion_files)} clips)"
-            )
-
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+
+    total_play_steps = _setup_play_episode_limit(env_cfg, motion_files)
+    if len(motion_files) > 1:
+        print(
+            f"[INFO] Sequential playback: {len(motion_files)} references, "
+            f"{total_play_steps} steps total (episode cap {env_cfg.episode_length_s:.1f}s, time_out disabled)"
+        )
+    elif motion_files:
+        print(
+            f"[INFO] Playback episode cap {env_cfg.episode_length_s:.1f}s "
+            f"({total_play_steps} frames, time_out disabled)"
+        )
+
+    if args_cli.record_all_motions and len(motion_files) <= 1:
+        raise ValueError("--record_all_motions requires --motion_path with multiple .npz files.")
+
+    play_steps = args_cli.video_length
+    if play_steps is None:
+        if len(motion_files) > 1 or args_cli.video or args_cli.dual_view:
+            play_steps = total_play_steps
+        else:
+            play_steps = None
+    elif args_cli.record_all_motions and len(motion_files) > 1:
+        print(f"[INFO] --record_all_motions: using explicit --video_length={play_steps}")
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -427,11 +477,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         for _ in range(5):
             env.unwrapped.sim.render()
         mode = "dual-view" if args_cli.dual_view else "single-view"
-        print(f"[INFO] {mode} recording ({args_cli.video_length} steps) → {video_dir}")
+        steps_label = play_steps if play_steps is not None else "unlimited"
+        print(f"[INFO] {mode} recording ({steps_label} steps) → {video_dir}")
         print("[INFO] HUD: Ref name, speeds, distances, contact, CG labels.")
+    elif play_steps is not None:
+        print(f"[INFO] Running {play_steps} steps (sequential references)")
 
     # reset environment
-    # breakpoint()
     obs, _ = env.get_observations()
     timestep = 0
     # simulate environment
@@ -447,10 +499,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             overlay = _get_play_overlay(env, timestep)
             video_recorder.capture(overlay_text=overlay)
 
-        if args_cli.video or args_cli.dual_view:
-            timestep += 1
-            if timestep == args_cli.video_length:
-                break
+        timestep += 1
+        if play_steps is not None and timestep >= play_steps:
+            break
 
     if video_recorder is not None:
         video_recorder.save()
