@@ -111,6 +111,29 @@ def _env_step_s(env_cfg) -> float:
     return float(env_cfg.decimation) * float(env_cfg.sim.dt)
 
 
+def _disable_play_terminations(env_cfg) -> list[str]:
+    """Disable all MDP termination terms so playback runs full clips for video eval."""
+    if not hasattr(env_cfg, "terminations"):
+        return []
+
+    terms = env_cfg.terminations
+    disabled: list[str] = []
+
+    for name in getattr(type(terms), "__annotations__", {}):
+        if name.startswith("_"):
+            continue
+        setattr(terms, name, None)
+        disabled.append(name)
+
+    for name in terms.__dict__:
+        if name.startswith("_") or name in disabled:
+            continue
+        setattr(terms, name, None)
+        disabled.append(name)
+
+    return sorted(set(disabled))
+
+
 def _setup_play_episode_limit(env_cfg, motion_files: list[str]) -> int:
     """Size episodes for playback and drop the training 10 s / 500-step cap.
 
@@ -126,8 +149,9 @@ def _setup_play_episode_limit(env_cfg, motion_files: list[str]) -> int:
 
     # Training uses episode_length_s=10 (500 steps). Playback needs at least one full clip.
     env_cfg.episode_length_s = max_frames * step_s + 2.0
-    if hasattr(env_cfg.terminations, "time_out"):
-        env_cfg.terminations.time_out = None
+    disabled_terms = _disable_play_terminations(env_cfg)
+    if disabled_terms:
+        print(f"[INFO] Playback: disabled terminations: {', '.join(disabled_terms)}")
 
     if len(motion_files) > 1 and hasattr(env_cfg.commands.motion, "sampling_strategy"):
         env_cfg.commands.motion.sampling_strategy = "sequential"
@@ -362,12 +386,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if len(motion_files) > 1:
         print(
             f"[INFO] Sequential playback: {len(motion_files)} references, "
-            f"{total_play_steps} steps total (episode cap {env_cfg.episode_length_s:.1f}s, time_out disabled)"
+            f"{total_play_steps} steps total (episode cap {env_cfg.episode_length_s:.1f}s, terminations off)"
         )
     elif motion_files:
         print(
             f"[INFO] Playback episode cap {env_cfg.episode_length_s:.1f}s "
-            f"({total_play_steps} frames, time_out disabled)"
+            f"({total_play_steps} frames, terminations off)"
         )
 
     if args_cli.record_all_motions and len(motion_files) <= 1:
