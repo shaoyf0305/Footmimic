@@ -12,6 +12,7 @@ from soccer.tasks.tracking.mdp.observations import get_target_point_world
 from soccer.tasks.tracking.mdp.kick_detection import KickContactTracker
 from soccer.tasks.tracking.mdp.task_frame import (
     forward_dominance_gate,
+    mimic_anchor_yaw_delta_quat,
     task_combined_lateral_speed_penalty,
     task_forward_speed,
     task_lateral_speed_penalty,
@@ -192,8 +193,12 @@ def motion_relative_body_orientation_error_exp(
 
 
 def _motion_anchor_yaw_delta_quat(command: MotionCommand) -> torch.Tensor:
-    """Yaw delta from demo anchor to robot anchor (matches command ``_update_command``)."""
-    return yaw_quat(quat_mul(command.robot_anchor_quat_w, quat_inv(command.anchor_quat_w)))
+    """Yaw delta for mimic vel terms (must match command ``_update_command``)."""
+    return mimic_anchor_yaw_delta_quat(
+        command.anchor_quat_w,
+        command.robot_anchor_quat_w,
+        align_task_frame=bool(getattr(command.cfg, "mimic_align_task_frame", False)),
+    )
 
 
 def motion_global_body_linear_velocity_error_exp(

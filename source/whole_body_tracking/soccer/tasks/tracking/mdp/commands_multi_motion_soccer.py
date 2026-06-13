@@ -25,6 +25,7 @@ from isaaclab.utils.math import (
 )
 
 from .kick_detection import KickContactTracker
+from .task_frame import mimic_anchor_yaw_delta_quat
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -951,7 +952,11 @@ class MotionCommand(CommandTerm):
 
         delta_pos_w = robot_anchor_pos_w_repeat
         delta_pos_w[..., 2] = anchor_pos_w_repeat[..., 2]
-        delta_ori_w = yaw_quat(quat_mul(robot_anchor_quat_w_repeat, quat_inv(anchor_quat_w_repeat)))
+        delta_ori_w = mimic_anchor_yaw_delta_quat(
+            anchor_quat_w_repeat,
+            robot_anchor_quat_w_repeat,
+            align_task_frame=bool(getattr(self.cfg, "mimic_align_task_frame", False)),
+        )
 
         self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
         self.body_pos_relative_w = delta_pos_w + quat_apply(delta_ori_w, self.body_pos_w - anchor_pos_w_repeat)
@@ -1024,6 +1029,8 @@ class MotionCommandCfg(CommandTermCfg):
 
     anchor_body_name: str = MISSING
     body_names: list[str] = MISSING
+    # Strip demo anchor yaw to task +X for all mimic targets (pos/ori/vel), not only pelvis.
+    mimic_align_task_frame: bool = False
 
     pose_range: dict[str, tuple[float, float]] = {}
     velocity_range: dict[str, tuple[float, float]] = {}

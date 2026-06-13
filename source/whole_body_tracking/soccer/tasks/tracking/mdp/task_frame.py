@@ -7,7 +7,28 @@ All dribbling / stage-1 locomotion terms use the same convention:
 from __future__ import annotations
 
 import torch
-from isaaclab.utils.math import quat_apply, quat_inv
+from isaaclab.utils.math import quat_apply, quat_inv, quat_mul, yaw_quat
+
+
+def mimic_anchor_yaw_delta_quat(
+    anchor_quat_w: torch.Tensor,
+    robot_anchor_quat_w: torch.Tensor,
+    *,
+    align_task_frame: bool = False,
+) -> torch.Tensor:
+    """Yaw delta for mapping demo bodies into mimic targets in world frame.
+
+    Legacy (``align_task_frame=False``): rotate the clip so demo anchor yaw matches
+    the robot anchor yaw (DeepMimic-style; arms follow robot heading, not task +X).
+
+    Task frame (``align_task_frame=True``): strip demo anchor yaw only, so torso,
+    arms, and leg offsets are expressed facing task +X. Use when the task is defined
+    in world +X but the reference motion was recorded on another heading (e.g. slalom).
+    """
+    inv_demo = quat_inv(anchor_quat_w)
+    if align_task_frame:
+        return yaw_quat(inv_demo)
+    return yaw_quat(quat_mul(robot_anchor_quat_w, inv_demo))
 
 
 def task_delta_xy(pos_w: torch.Tensor, ref_pos_w: torch.Tensor) -> torch.Tensor:

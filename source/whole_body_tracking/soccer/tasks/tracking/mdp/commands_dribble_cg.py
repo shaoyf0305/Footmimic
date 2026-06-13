@@ -23,9 +23,9 @@ from typing import TYPE_CHECKING
 import torch
 from isaaclab.managers import CommandTermCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_apply, quat_inv, quat_mul, yaw_quat
+from isaaclab.utils.math import quat_apply
 
-from soccer.tasks.tracking.mdp.task_frame import spawn_ball_ahead_env_local
+from soccer.tasks.tracking.mdp.task_frame import mimic_anchor_yaw_delta_quat, spawn_ball_ahead_env_local
 
 from .commands_multi_motion_soccer import MotionCommand, MotionCommandCfg
 
@@ -62,7 +62,11 @@ class DribbleCGMotionCommand(MotionCommand):
 
         anchor_quat = self.anchor_quat_w[env_ids]
         robot_quat = self.robot_anchor_quat_w[env_ids]
-        dq = yaw_quat(quat_mul(robot_quat, quat_inv(anchor_quat)))
+        dq = mimic_anchor_yaw_delta_quat(
+            anchor_quat,
+            robot_quat,
+            align_task_frame=bool(getattr(self.cfg, "mimic_align_task_frame", False)),
+        )
         rel = mb - ma
         return delta + quat_apply(dq, rel)
 

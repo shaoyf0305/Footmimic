@@ -9,7 +9,7 @@ Inherits proximity-level tracking and adds dribbling-specific rewards:
   - both ankles legal for gentle touches; anti-trap / sustained-contact block 夹球
   - kick–chase–kick: chase reward, rapid-retouch penalty, coast penalty only when ball is close
   - gait foot tracking between touches; reduced close-proximity / foot-hover shaping
-  - pelvis anchor + yaw-aligned upper-body vel/ori tracking (task +X frame); relaxed leg imitation weights
+  - pelvis anchor + task-frame mimic (strip demo yaw → +X for torso/arms/legs); relaxed leg imitation weights
   - anti-crab: task-frame forward velocity match, heading-gated touches, stronger lateral penalty
   - ``ball_lost`` and tighter ``dribbling_no_contact`` termination
 """
@@ -53,9 +53,10 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             ),
         )
 
-        # Task frame uses pelvis facing world +X; align demo upper-body refs to robot pelvis yaw
-        # (default anchor ``torso_link`` leaves arms tied to demo slalom heading).
+        # Pelvis anchor + task-frame mimic: strip demo yaw so torso/arms/legs refs face +X
+        # together (legacy mode only yaw-aligns to robot pelvis, leaving arms on demo heading).
         self.commands.motion.anchor_body_name = "pelvis"
+        self.commands.motion.mimic_align_task_frame = True
         _upper_body_track_names = [
             "pelvis",
             "torso_link",

@@ -16,6 +16,11 @@ marker spheres and prints CG contact / foot–ball distance in the terminal.
     python scripts/replay_npz_with_ball.py \\
         --motion_path motions/dribble-distance --device cpu
 
+    # Headless MP4 recording (SSH-friendly) with HUD overlay
+    python scripts/replay_npz_with_ball.py \\
+        --motion_path motions/dribble-distance \\
+        --headless --dual_view --no_loop --no_playlist_loop
+
     # No GPU machine — always use CPU to avoid cudaErrorNoDevice
     python scripts/replay_npz_with_ball.py \\
         --motion_path motions/dribble-distance --device cpu --real_time
@@ -25,8 +30,10 @@ from __future__ import annotations
 
 import argparse
 import collections
+import datetime
 import glob
 import os
+import sys
 import time
 
 import numpy as np
@@ -88,8 +95,38 @@ parser.add_argument(
     default=0.8,
     help="Pause between clips when playing a directory (seconds).",
 )
+parser.add_argument(
+    "--video",
+    action="store_true",
+    default=False,
+    help="Record offscreen video (single camera). Implies --headless and enables cameras.",
+)
+parser.add_argument(
+    "--dual_view",
+    action="store_true",
+    default=False,
+    help="Record split-screen front+back video with HUD overlay.",
+)
+parser.add_argument(
+    "--video_output_dir",
+    type=str,
+    default=None,
+    help="Directory for MP4 output (default: <motion_dir>/videos/replay_<timestamp>/).",
+)
+parser.add_argument(
+    "--path_tracing",
+    action="store_true",
+    default=False,
+    help="Use path-tracing renderer for higher quality (slower).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+
+if args_cli.video or args_cli.dual_view:
+    args_cli.enable_cameras = True
+    args_cli.headless = True
+    args_cli.loop = False
+    args_cli.playlist_loop = False
 
 
 def _resolve_sim_device(requested: str | None) -> str:
@@ -126,6 +163,18 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from soccer.robots.g1 import G1_CYLINDER_CFG
 from soccer.tasks.tracking.config.g1.soccer_flat_env_cfg import SOCCER_ASSET_PATH, SOCCER_BALL_RADIUS
 from soccer.tasks.tracking.mdp.commands import MotionLoader
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_SCRIPT_DIR, "rsl_rl"))
+from dual_view_recorder import DualViewRecorder  # noqa: E402
+
+
+class _ReplayRecorderEnv:
+    """Thin adapter so DualViewRecorder can follow the replay scene robot."""
+
+    def __init__(self, sim: SimulationContext, scene: InteractiveScene):
+        self.sim = sim
+        self.scene = scene
 
 
 def collect_motion_files(motion_path: str) -> list[str]:
@@ -186,6 +235,11 @@ class SoccerMotionReplayData:
         if "dribble_cg_foot_ball_dist" in data.files:
             cd = np.asarray(data["dribble_cg_foot_ball_dist"], dtype=np.float32).reshape(-1)[: self.time_step_total]
             self.cg_foot_ball_dist = torch.tensor(cd, device=device, dtype=torch.float32)
+
+        self.cg_foot = None
+        if "dribble_cg_foot" in data.files:
+            cf = np.asarray(data["dribble_cg_foot"], dtype=np.int8).reshape(-1)[: self.time_step_total]
+            self.cg_foot = torch.tensor(cf, device=device, dtype=torch.int8)
 
         self._body_index = torch.tensor([0], dtype=torch.long, device=device)
 
@@ -277,6 +331,63 @@ def _load_motion(motion_path: str, device: str) -> tuple[SoccerMotionReplayData,
     return motion, motion_legacy
 
 
+def _default_video_output_dir(motion_path: str) -> str:
+    base = motion_path if os.path.isdir(motion_path) else os.path.dirname(os.path.abspath(motion_path))
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(base, "videos", f"replay_{ts}")
+
+
+def _build_video_overlay(
+    file_idx: int,
+    motion_files: list[str],
+    motion: SoccerMotionReplayData,
+    frame_idx: int,
+) -> str:
+    lines = [
+        f"Ref: {motion.motion_name}  ({file_idx + 1}/{len(motion_files)})",
+        f"Frame: {frame_idx}/{max(motion.time_step_total - 1, 0)}  "
+        f"t={frame_idx / motion.fps:.2f}s  fps={motion.fps:.0f}",
+    ]
+    if motion.has_ball:
+        bp = motion.ball_pos_w[frame_idx].detach().cpu().numpy()
+        spd = float(torch.norm(motion.ball_lin_vel_w[frame_idx]).item())
+        lines.append(
+            f"Ball: ({bp[0]:+.2f}, {bp[1]:+.2f}, {bp[2]:.2f}) m  |v|={spd:.2f} m/s"
+        )
+    if motion.cg_contact is not None:
+        contact = int(motion.cg_contact[frame_idx].item())
+        lines.append(f"CG contact: {contact}")
+    if motion.cg_foot is not None:
+        foot_id = int(motion.cg_foot[frame_idx].item())
+        foot_lbl = {0: "L", 1: "R"}.get(foot_id, "-")
+        lines.append(f"CG foot: {foot_lbl}")
+    if motion.cg_foot_ball_dist is not None:
+        d = float(motion.cg_foot_ball_dist[frame_idx].item())
+        lines.append(f"Foot-Ball dist: {d:.3f} m" if d >= 0.0 else "Foot-Ball dist: -")
+    return "\n".join(lines)
+
+
+def _make_video_recorder(sim: SimulationContext, scene: InteractiveScene, motion: SoccerMotionReplayData):
+    output_dir = args_cli.video_output_dir or _default_video_output_dir(args_cli.motion_path)
+    recorder = DualViewRecorder(
+        env=_ReplayRecorderEnv(sim, scene),
+        output_dir=output_dir,
+        resolution=(960, 540),
+        front_offset=(4.0, 3.0, 2.5),
+        back_offset=(-4.0, -3.0, 2.5),
+        lookat_offset=0.5,
+        fps=max(1, int(round(motion.fps))),
+        path_tracing=args_cli.path_tracing,
+        dual=args_cli.dual_view,
+    )
+    recorder.setup()
+    for _ in range(5):
+        sim.render()
+    mode = "dual-view" if args_cli.dual_view else "single-view"
+    print(f"[video] {mode} recording → {output_dir}")
+    return recorder, output_dir
+
+
 def run_simulator(sim: SimulationContext, scene: InteractiveScene, motion_files: list[str]) -> None:
     robot: Articulation = scene["robot"]
     soccer_ball: RigidObject = scene["soccer_ball"]
@@ -291,18 +402,35 @@ def run_simulator(sim: SimulationContext, scene: InteractiveScene, motion_files:
     trail_markers = _make_trail_markers() if args_cli.trail_length > 0 else None
     contact_markers = _make_contact_markers()
     trail_deque: collections.deque[np.ndarray] = collections.deque()
+    record_video = args_cli.video or args_cli.dual_view
+    video_recorder = None
+    video_output_dir = ""
+    if record_video:
+        video_recorder, video_output_dir = _make_video_recorder(sim, scene, motion)
+
+    def _save_clip_video() -> None:
+        nonlocal video_recorder
+        if video_recorder is None or video_recorder.num_frames == 0:
+            return
+        stem = os.path.splitext(motion.motion_name)[0]
+        video_recorder.save(filename=f"{stem}.mp4")
 
     def _switch_clip(next_idx: int) -> None:
-        nonlocal file_idx, motion, motion_legacy, frame_dt, time_steps, trail_deque
+        nonlocal file_idx, motion, motion_legacy, frame_dt, time_steps, trail_deque, video_recorder
+        _save_clip_video()
         file_idx = next_idx
         print(f"\n[playlist] ({file_idx + 1}/{len(motion_files)}) {motion_files[file_idx]}")
         motion, motion_legacy = _load_motion(motion_files[file_idx], sim.device)
         frame_dt = 1.0 / motion.fps if motion.fps > 0 else sim_dt
         time_steps[:] = 0
         trail_deque.clear()
+        if video_recorder is not None:
+            video_recorder._fps = max(1, int(round(motion.fps)))
 
     print(f"[sim] device={sim.device}")
     print(f"[playlist] clip 1/{len(motion_files)}: {motion_files[0]}")
+    if record_video:
+        print("[video] loop/playlist_loop disabled for recording")
 
     while simulation_app.is_running():
         frame_start = time.perf_counter()
@@ -315,6 +443,7 @@ def run_simulator(sim: SimulationContext, scene: InteractiveScene, motion_files:
                     trail_deque.clear()
                 else:
                     print("\n[done] finished clip.")
+                    _save_clip_video()
                     break
             else:
                 next_idx = file_idx + 1
@@ -323,6 +452,7 @@ def run_simulator(sim: SimulationContext, scene: InteractiveScene, motion_files:
                         next_idx = 0
                     else:
                         print("\n[playlist] finished all clips.")
+                        _save_clip_video()
                         break
                 if args_cli.gap_seconds > 0:
                     time.sleep(args_cli.gap_seconds)
@@ -376,7 +506,12 @@ def run_simulator(sim: SimulationContext, scene: InteractiveScene, motion_files:
         scene.update(sim_dt)
 
         pos_lookat = root_states[0, :3].detach().cpu().numpy()
-        sim.set_camera_view(pos_lookat + np.array([2.2, 2.2, 0.55]), pos_lookat)
+        if not record_video:
+            sim.set_camera_view(pos_lookat + np.array([2.2, 2.2, 0.55]), pos_lookat)
+
+        if video_recorder is not None:
+            overlay = _build_video_overlay(file_idx, motion_files, motion, t)
+            video_recorder.capture(overlay_text=overlay)
 
         hud = f"\r[{file_idx + 1}/{len(motion_files)}] {motion.motion_name}  "
         hud += f"Frame {t:4d}/{motion.time_step_total - 1}  t={t / motion.fps:6.2f}s"
