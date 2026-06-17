@@ -288,11 +288,13 @@ class G1FlatProximityEnvCfg(G1FlatMotionEnvCfg):
             },
         )
 
-        self.motion_body_ori = RewTerm(
-        func=mdp.motion_relative_body_orientation_error_exp,
-        weight=1.0,
-        params={"command_name": "motion", "std": 0.4, 
-                "body_names" : [
+        self.rewards.motion_body_ori = RewTerm(
+            func=mdp.motion_relative_body_orientation_error_exp,
+            weight=1.0,
+            params={
+                "command_name": "motion",
+                "std": 0.4,
+                "body_names": [
                     "pelvis",
                     "left_hip_roll_link",
                     "left_knee_link",

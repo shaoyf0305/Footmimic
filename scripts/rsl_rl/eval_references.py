@@ -14,8 +14,8 @@ Example (dribbling stage-2, dribble-distance references):
     --num_rollouts 5 \\
     --headless
 
-  # Training failure terminations are OFF by default (full-clip metric eval).
-  # Re-enable only for debugging: --enable_training_terminations
+  # Default: same failure terminations as play_multi (ball_lost, ee_body_pos, …).
+  # Tracking-only full-clip metrics: add --disable_training_terminations
 
 Filter only (no Isaac Sim):
   python scripts/rsl_rl/filter_motions_from_eval.py \\
@@ -104,14 +104,14 @@ parser.add_argument(
 parser.add_argument(
     "--eval_grace_steps",
     type=int,
-    default=50,
-    help="Ignore training failure terminations for the first N steps (only if --enable_training_terminations).",
+    default=0,
+    help="Ignore failure terminations for the first N steps (0 = same as play_multi).",
 )
 parser.add_argument(
-    "--enable_training_terminations",
+    "--disable_training_terminations",
     action="store_true",
     default=False,
-    help="Keep training failure terminations during eval (not recommended; can false-fail at step 1).",
+    help="Turn off failure terminations; only measure full-clip tracking/contact (failure_rate is N/A).",
 )
 parser.add_argument(
     "--recreate_env_per_rollout",
@@ -247,6 +247,10 @@ def configure_eval_env(env_cfg, motion_files: list[str]) -> int:
         env_cfg.observations.policy.enable_corruption = False
     if hasattr(env_cfg.observations, "critic"):
         env_cfg.observations.critic.enable_corruption = False
+
+    # Match play_multi: only failure terms end the episode, not a short time_out.
+    if hasattr(env_cfg.terminations, "time_out"):
+        env_cfg.terminations.time_out = None
 
     return n_frames
 
@@ -433,7 +437,8 @@ def _rollout_once(
     base_env,
     n_frames: int,
     *,
-    grace_steps: int = 50,
+    grace_steps: int = 0,
+    check_failures: bool = True,
     obs=None,
 ) -> RolloutResult:
     if obs is None:
@@ -465,7 +470,7 @@ def _rollout_once(
         except Exception:
             pass
 
-        if steps > grace_steps:
+        if check_failures and steps > grace_steps:
             active_terms = _failure_terms_active(base_env, 0)
             if active_terms:
                 failed = True
@@ -631,7 +636,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
 
     configure_eval_env(env_cfg, motion_files)
-    if not args_cli.enable_training_terminations:
+    if not args_cli.disable_training_terminations:
+        _log("Failure terminations ON (same family as play_multi: ball_lost, ee_body_pos, …).")
+    else:
+        _log(
+            "WARNING: --disable_training_terminations — failure_rate / fail_reason_counts "
+            "are not meaningful; only full-clip tracking metrics are measured."
+        )
         disable_failure_terminations(env_cfg)
     assign_motion_files(env_cfg, motion_files)
     env_cfg.seed = args_cli.seed
@@ -644,7 +655,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         "motion_path": os.path.abspath(args_cli.motion_path),
         "num_rollouts": args_cli.num_rollouts,
         "eval_grace_steps": args_cli.eval_grace_steps,
-        "enable_training_terminations": args_cli.enable_training_terminations,
+        "termination_checks_enabled": not args_cli.disable_training_terminations,
         "thresholds": {
             "min_completion_rate": args_cli.min_completion_rate,
             "max_joint_pos_error": args_cli.max_joint_pos_error,
@@ -676,7 +687,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         policy = runner.get_inference_policy(device=base_env.device)
         _log("Policy loaded; starting per-reference rollouts.")
 
-    grace_steps = 0 if not args_cli.enable_training_terminations else args_cli.eval_grace_steps
+    check_failures = not args_cli.disable_training_terminations
+    grace_steps = args_cli.eval_grace_steps if check_failures else 0
 
     for idx, motion_file in enumerate(motion_files):
         motion_name = os.path.basename(motion_file)
@@ -713,6 +725,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 base_env,
                 n_frames,
                 grace_steps=grace_steps,
+                check_failures=check_failures,
                 obs=obs,
             )
             rollouts.append(result)

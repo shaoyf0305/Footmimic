@@ -625,6 +625,44 @@ class G1FlatMotionCGPretrainEnvCfg(G1FlatMotionEnvCfg):
             params={"command_name": "motion"},
         )
 
+        # Must match Stage-2 dribbling (pelvis + task +X). Legacy Stage-1 uses
+        # torso_link / robot-yaw mimic and global body vel — arms stay slalom-twisted
+        # after resume even when Stage-2 has mimic_align_task_frame=True.
+        self.commands.motion.anchor_body_name = "pelvis"
+        self.commands.motion.mimic_align_task_frame = True
+        _upper_body_track_names = [
+            "pelvis",
+            "torso_link",
+            "left_shoulder_roll_link",
+            "left_elbow_link",
+            "left_wrist_yaw_link",
+            "right_shoulder_roll_link",
+            "right_elbow_link",
+            "right_wrist_yaw_link",
+        ]
+        if hasattr(self.rewards, "motion_body_ori"):
+            self.rewards.motion_body_ori.params["body_names"] = _upper_body_track_names
+        if hasattr(self.rewards, "motion_body_lin_vel"):
+            self.rewards.motion_body_lin_vel = RewTerm(
+                func=mdp.motion_relative_body_linear_velocity_error_exp,
+                weight=0.3,
+                params={
+                    "command_name": "motion",
+                    "std": 1.0,
+                    "body_names": _upper_body_track_names,
+                },
+            )
+        if hasattr(self.rewards, "motion_body_ang_vel"):
+            self.rewards.motion_body_ang_vel = RewTerm(
+                func=mdp.motion_relative_body_angular_velocity_error_exp,
+                weight=0.3,
+                params={
+                    "command_name": "motion",
+                    "std": 3.14,
+                    "body_names": _upper_body_track_names,
+                },
+            )
+
         # Stage-1 objective: forward locomotion with the motion's gait style.
         # The demo is slalom-around-cones, so we drop the world-frame trajectory trackers
         # and replace them with a simple "walk forward at ~target speed" task. Motion

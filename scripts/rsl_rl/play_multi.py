@@ -42,6 +42,12 @@ parser.add_argument(
 )
 
 parser.add_argument("--export_motion_name", type=str, default=None, help="Select one motion for exporter (required when --motion_file is used).")
+parser.add_argument(
+    "--disable_training_terminations",
+    action="store_true",
+    default=False,
+    help="Disable ball_lost / ee_body_pos etc. for full-clip playback (debug only).",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -108,7 +114,30 @@ def _env_step_s(env_cfg) -> float:
     return float(env_cfg.decimation) * float(env_cfg.sim.dt)
 
 
-def _setup_play_episode_limit(env_cfg, motion_files: list[str]) -> int:
+def _disable_play_terminations(env_cfg) -> list[str]:
+    """Disable failure termination terms so playback runs full clips (v1.20 behaviour)."""
+    if not hasattr(env_cfg, "terminations"):
+        return []
+
+    terms = env_cfg.terminations
+    disabled: list[str] = []
+
+    for name in getattr(type(terms), "__annotations__", {}):
+        if name.startswith("_"):
+            continue
+        setattr(terms, name, None)
+        disabled.append(name)
+
+    for name in terms.__dict__:
+        if name.startswith("_") or name in disabled:
+            continue
+        setattr(terms, name, None)
+        disabled.append(name)
+
+    return sorted(set(disabled))
+
+
+def _setup_play_episode_limit(env_cfg, motion_files: list[str], *, keep_failure_terms: bool) -> int:
     """Size episodes for playback and drop the training 10 s / 500-step cap.
 
     Returns the recommended total step count (single clip = its frame count;
@@ -123,8 +152,14 @@ def _setup_play_episode_limit(env_cfg, motion_files: list[str]) -> int:
 
     # Training uses episode_length_s=10 (500 steps). Playback needs at least one full clip.
     env_cfg.episode_length_s = max_frames * step_s + 2.0
-    if hasattr(env_cfg.terminations, "time_out"):
-        env_cfg.terminations.time_out = None
+    if keep_failure_terms:
+        if hasattr(env_cfg.terminations, "time_out"):
+            env_cfg.terminations.time_out = None
+        print("[INFO] Playback: training failure terminations active (ball_lost, ee_body_pos, …).")
+    else:
+        disabled_terms = _disable_play_terminations(env_cfg)
+        if disabled_terms:
+            print(f"[INFO] Playback: disabled terminations: {', '.join(disabled_terms)}")
 
     if len(motion_files) > 1 and hasattr(env_cfg.commands.motion, "sampling_strategy"):
         env_cfg.commands.motion.sampling_strategy = "sequential"
@@ -342,16 +377,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
 
-    total_play_steps = _setup_play_episode_limit(env_cfg, motion_files)
+    total_play_steps = _setup_play_episode_limit(
+        env_cfg,
+        motion_files,
+        keep_failure_terms=not args_cli.disable_training_terminations,
+    )
+    term_note = ", terminations off" if args_cli.disable_training_terminations else ""
     if len(motion_files) > 1:
         print(
             f"[INFO] Sequential playback: {len(motion_files)} references, "
-            f"{total_play_steps} steps total (episode cap {env_cfg.episode_length_s:.1f}s)"
+            f"{total_play_steps} steps total (episode cap {env_cfg.episode_length_s:.1f}s{term_note})"
         )
     elif motion_files:
         print(
             f"[INFO] Playback episode cap {env_cfg.episode_length_s:.1f}s "
-            f"({total_play_steps} frames)"
+            f"({total_play_steps} frames{term_note})"
         )
 
     if args_cli.record_all_motions and len(motion_files) <= 1:
