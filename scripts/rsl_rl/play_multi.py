@@ -71,10 +71,7 @@ import pathlib
 import numpy as np
 import torch
 
-from soccer.tasks.tracking.mdp.rewards_dribbling import (
-    soccer_ball_contact_force_magnitude,
-    soccer_ball_contact_net_force_w,
-)
+from soccer.tasks.tracking.mdp.rewards_dribbling import soccer_ball_contact_force_magnitude
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -111,29 +108,6 @@ def _env_step_s(env_cfg) -> float:
     return float(env_cfg.decimation) * float(env_cfg.sim.dt)
 
 
-def _disable_play_terminations(env_cfg) -> list[str]:
-    """Disable all MDP termination terms so playback runs full clips for video eval."""
-    if not hasattr(env_cfg, "terminations"):
-        return []
-
-    terms = env_cfg.terminations
-    disabled: list[str] = []
-
-    for name in getattr(type(terms), "__annotations__", {}):
-        if name.startswith("_"):
-            continue
-        setattr(terms, name, None)
-        disabled.append(name)
-
-    for name in terms.__dict__:
-        if name.startswith("_") or name in disabled:
-            continue
-        setattr(terms, name, None)
-        disabled.append(name)
-
-    return sorted(set(disabled))
-
-
 def _setup_play_episode_limit(env_cfg, motion_files: list[str]) -> int:
     """Size episodes for playback and drop the training 10 s / 500-step cap.
 
@@ -149,9 +123,8 @@ def _setup_play_episode_limit(env_cfg, motion_files: list[str]) -> int:
 
     # Training uses episode_length_s=10 (500 steps). Playback needs at least one full clip.
     env_cfg.episode_length_s = max_frames * step_s + 2.0
-    disabled_terms = _disable_play_terminations(env_cfg)
-    if disabled_terms:
-        print(f"[INFO] Playback: disabled terminations: {', '.join(disabled_terms)}")
+    if hasattr(env_cfg.terminations, "time_out"):
+        env_cfg.terminations.time_out = None
 
     if len(motion_files) > 1 and hasattr(env_cfg.commands.motion, "sampling_strategy"):
         env_cfg.commands.motion.sampling_strategy = "sequential"
@@ -188,9 +161,28 @@ def get_motion_files(motion_path: str) -> list[str]:
         raise ValueError(f"Invalid path: {motion_path}. Must be a file or directory.")
 
 
-_HUD_ANKLE_BODIES = ["right_ankle_roll_link", "left_ankle_roll_link"]
 _BALL_SENSOR_NAME = "soccer_ball_contact"
 _CONTACT_FORCE_THRESHOLD = 1.0
+_LAST_TERM_REASON: str = "-"
+
+
+def _update_last_termination_reason(base_env, env_idx: int = 0) -> None:
+    """Track the latest failure termination from the env's termination manager."""
+    global _LAST_TERM_REASON
+    tm = getattr(base_env, "termination_manager", None)
+    if tm is None:
+        return
+    active: list[str] = []
+    for name in tm.active_terms:
+        try:
+            if tm.get_term_cfg(name).time_out:
+                continue
+            if bool(tm.get_term(name)[env_idx].item()):
+                active.append(name)
+        except Exception:
+            continue
+    if active:
+        _LAST_TERM_REASON = ", ".join(active)
 
 
 def _resolve_base_env(env):
@@ -203,9 +195,9 @@ def _resolve_base_env(env):
     return base
 
 
-def _get_play_overlay(env, timestep: int) -> str:
+def _get_play_overlay(env) -> str:
     """HUD for dual-view video: speeds, distances, contact, and CG labels."""
-    lines: list[str] = [f"Step: {timestep}"]
+    lines: list[str] = []
     try:
         base_env = _resolve_base_env(env)
         cmd = base_env.command_manager.get_term("motion")
@@ -216,7 +208,7 @@ def _get_play_overlay(env, timestep: int) -> str:
             names = cmd.motion.motion_name
             n = len(names)
             ref = names[mi] if 0 <= mi < n else f"motion_{mi}"
-            lines.insert(0, f"Ref: {ref}  ({mi + 1}/{n})")
+            lines.append(f"Ref: {ref}  ({mi + 1}/{n})")
 
         t = int(cmd.time_steps[i].item())
         motion_len = int(cmd.motion_length[i].item())
@@ -241,53 +233,21 @@ def _get_play_overlay(env, timestep: int) -> str:
             f"Pelvis-Ball: {pelvis_ball_xy:.2f} m (xy)  |  {pelvis_ball_3d:.2f} m (3D)"
         )
 
-        robot = base_env.scene["robot"]
-        ankle_dists: list[float] = []
-        for fname in _HUD_ANKLE_BODIES:
-            if fname not in robot.body_names:
-                continue
-            bidx = robot.body_names.index(fname)
-            fpos = robot.data.body_pos_w[i, bidx].detach().cpu().numpy()
-            ankle_dists.append(float(np.linalg.norm(fpos - ball_pos)))
-        if ankle_dists:
-            lines.append(f"Ankle-Ball (min): {min(ankle_dists):.2f} m (3D)")
-
         force_xy = float(
             soccer_ball_contact_force_magnitude(base_env, _BALL_SENSOR_NAME)[i].item()
         )
-        force_vec = soccer_ball_contact_net_force_w(base_env, _BALL_SENSOR_NAME)[i].detach().cpu().numpy()
-        force_z = float(abs(force_vec[2]))
         sim_touch = force_xy > _CONTACT_FORCE_THRESHOLD
 
-        lines.append(
-            f"Robot-Ball: {'YES' if sim_touch else 'NO'}  |  "
-            f"F_xy={force_xy:.1f} N  |  F_z~{force_z:.1f} N (ground)"
-        )
-
+        ankle_parts = [f"contact={'YES' if sim_touch else 'NO'}"]
         if hasattr(cmd, "motion_has_dribble_cg_label") and bool(cmd.motion_has_dribble_cg_label[i].item()):
             ref_contact = bool(cmd.dribble_cg_contact_ref[i].item())
-            ref_foot = int(cmd.dribble_cg_foot_ref[i].item())
-            foot_lbl = {0: "L", 1: "R"}.get(ref_foot, "-")
-            match = "ok" if ref_contact == sim_touch else "MISMATCH"
-            lines.append(
-                f"CG label: contact={int(ref_contact)} foot={foot_lbl}  ({match})"
-            )
+            match = "match" if ref_contact == sim_touch else "MISMATCH"
+            ankle_parts.append(f"demo={'YES' if ref_contact else 'NO'}")
+            ankle_parts.append(match)
+        lines.append(f"Ankle-Ball: {'  |  '.join(ankle_parts)}")
 
-        if hasattr(cmd, "dribble_cg_foot_ball_dist_ref"):
-            demo_dist = float(cmd.dribble_cg_foot_ball_dist_ref[i].item())
-            if demo_dist >= 0.0:
-                lines.append(f"Foot-Ball demo: {demo_dist:.2f} m")
-            else:
-                lines.append("Foot-Ball demo: -")
-        elif hasattr(cmd, "kick_frame"):
-            kf = int(cmd.kick_frame[i].item())
-            margin = 5
-            if kf < 0:
-                lines.append("Kick CG: no annotation")
-            elif t < kf - margin:
-                lines.append(f"Kick CG: 0 (approach)  |  kick_frame={kf}")
-            else:
-                lines.append(f"Kick CG: 1 (kick)  |  kick_frame={kf}")
+        _update_last_termination_reason(base_env, env_idx=i)
+        lines.append(f"Last term: {_LAST_TERM_REASON}")
 
     except Exception as e:
         lines.append(f"HUD error: {e}")
@@ -386,12 +346,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if len(motion_files) > 1:
         print(
             f"[INFO] Sequential playback: {len(motion_files)} references, "
-            f"{total_play_steps} steps total (episode cap {env_cfg.episode_length_s:.1f}s, terminations off)"
+            f"{total_play_steps} steps total (episode cap {env_cfg.episode_length_s:.1f}s)"
         )
     elif motion_files:
         print(
             f"[INFO] Playback episode cap {env_cfg.episode_length_s:.1f}s "
-            f"({total_play_steps} frames, terminations off)"
+            f"({total_play_steps} frames)"
         )
 
     if args_cli.record_all_motions and len(motion_files) <= 1:
@@ -503,24 +463,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         mode = "dual-view" if args_cli.dual_view else "single-view"
         steps_label = play_steps if play_steps is not None else "unlimited"
         print(f"[INFO] {mode} recording ({steps_label} steps) → {video_dir}")
-        print("[INFO] HUD: Ref name, speeds, distances, contact, CG labels.")
+        print("[INFO] HUD: Ref name, speeds, distances, ankle-ball contact, last term.")
     elif play_steps is not None:
         print(f"[INFO] Running {play_steps} steps (sequential references)")
 
     # reset environment
+    global _LAST_TERM_REASON
+    _LAST_TERM_REASON = "-"
     obs, _ = env.get_observations()
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
         # run everything in inference mode
         with torch.inference_mode():
-            # agent stepping
             actions = policy(obs)
             # env stepping
             obs, _, _, _ = env.step(actions)
 
         if video_recorder is not None:
-            overlay = _get_play_overlay(env, timestep)
+            overlay = _get_play_overlay(env)
             video_recorder.capture(overlay_text=overlay)
 
         timestep += 1
