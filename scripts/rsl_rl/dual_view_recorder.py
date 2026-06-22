@@ -42,6 +42,42 @@ def _get_stage():
     return omni.usd.get_context().get_stage()
 
 
+# Offsets are in the task / env-local frame: +X forward, +Y lateral, +Z up.
+# ``task_front``: camera sits on +X (ahead of the robot), look direction ~ -X (frontal).
+# ``diagonal``: legacy oblique front-right / back-left views.
+CAMERA_LAYOUTS: dict[str, dict[str, tuple[float, float, float]]] = {
+    "diagonal": {
+        "front_offset": (4.0, 3.0, 2.5),
+        "back_offset": (-4.0, -3.0, 2.5),
+    },
+    "task_front": {
+        "front_offset": (4.0, 0.0, 2.5),
+        "back_offset": (-4.0, 0.0, 2.5),
+    },
+    "task_front_side": {
+        "front_offset": (3.5, 1.5, 2.5),
+        "back_offset": (-3.5, -1.5, 2.5),
+    },
+}
+
+
+def resolve_camera_offsets(
+    layout: str = "task_front",
+    front_offset: tuple[float, float, float] | None = None,
+    back_offset: tuple[float, float, float] | None = None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Resolve front/back camera offsets from a named layout or explicit tuples."""
+    key = str(layout).lower().strip()
+    if key not in CAMERA_LAYOUTS:
+        valid = ", ".join(sorted(CAMERA_LAYOUTS))
+        raise ValueError(f"Unknown camera layout {layout!r}; expected one of: {valid}")
+    preset = CAMERA_LAYOUTS[key]
+    return (
+        front_offset if front_offset is not None else preset["front_offset"],
+        back_offset if back_offset is not None else preset["back_offset"],
+    )
+
+
 class DualViewRecorder:
     """Records a split-screen (front + back) video from dual cameras.
 
@@ -52,8 +88,9 @@ class DualViewRecorder:
         env: The Isaac Lab environment (unwrapped ManagerBasedRLEnv).
         output_dir: Directory to write the MP4 file.
         resolution: (width, height) per single camera view.
-        front_offset: Camera offset from robot for the front view (dx, dy, dz).
-        back_offset: Camera offset from robot for the back view (dx, dy, dz).
+        front_offset: Camera offset in task frame (+X fwd / +Y lat / +Z up) for the
+            left panel. With ``task_front``, the camera sits on +X and looks ~ -X.
+        back_offset: Task-frame offset for the right panel (typically on -X, looks +X).
         lookat_offset: Vertical offset for the look-at point above robot root.
         fps: Frames per second for the output video.
     """
@@ -63,8 +100,8 @@ class DualViewRecorder:
         env,
         output_dir: str,
         resolution: tuple[int, int] = (960, 540),
-        front_offset: tuple[float, float, float] = (4.0, 3.0, 2.5),
-        back_offset: tuple[float, float, float] = (-4.0, -3.0, 2.5),
+        front_offset: tuple[float, float, float] = (4.0, 0.0, 2.5),
+        back_offset: tuple[float, float, float] = (-4.0, 0.0, 2.5),
         lookat_offset: float = 0.5,
         fps: int = 30,
         path_tracing: bool = False,
@@ -128,7 +165,10 @@ class DualViewRecorder:
         os.makedirs(self._output_dir, exist_ok=True)
         mode = "dual" if self._dual else "single"
         print(f"[DualViewRecorder] Setup complete ({mode}). Resolution: {self._resolution}")
-        print(f"[DualViewRecorder] Front offset={self._front_offset}, Back offset={self._back_offset}")
+        print(
+            f"[DualViewRecorder] Task-frame offsets: front={self._front_offset} (~look -X), "
+            f"back={self._back_offset}"
+        )
 
     def capture(self, overlay_text: str | None = None):
         """Update cameras to follow robot, then capture and stitch one frame.

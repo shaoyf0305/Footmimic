@@ -22,6 +22,13 @@ parser.add_argument(
 )
 parser.add_argument("--dual_view", action="store_true", default=False, help="Record split-screen video (front + back view).")
 parser.add_argument(
+    "--cam_layout",
+    type=str,
+    default="task_front",
+    choices=["diagonal", "task_front", "task_front_side"],
+    help="Camera preset. task_front: on +X side, looks ~ -X (robot frontal); diagonal: legacy oblique.",
+)
+parser.add_argument(
     "--record_all_motions",
     action="store_true",
     default=False,
@@ -480,18 +487,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # --- Video recorder with HUD overlay (--video and/or --dual_view) ---
     video_recorder = None
     if args_cli.video or args_cli.dual_view:
-        from dual_view_recorder import DualViewRecorder
+        from dual_view_recorder import DualViewRecorder, resolve_camera_offsets
 
         tag = "dual" if args_cli.dual_view else "play"
         video_dir = os.path.join(
             log_dir, "videos", f"{tag}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
+        front_offset, back_offset = resolve_camera_offsets(layout=args_cli.cam_layout)
         video_recorder = DualViewRecorder(
             env=env.unwrapped if hasattr(env, "unwrapped") else env,
             output_dir=video_dir,
             resolution=(960, 540),
-            front_offset=(4.0, 3.0, 2.5),
-            back_offset=(-4.0, -3.0, 2.5),
+            front_offset=front_offset,
+            back_offset=back_offset,
             lookat_offset=0.5,
             fps=30,
             path_tracing=args_cli.path_tracing,

@@ -108,6 +108,13 @@ parser.add_argument(
     help="Record split-screen front+back video with HUD overlay.",
 )
 parser.add_argument(
+    "--cam_layout",
+    type=str,
+    default="task_front",
+    choices=["diagonal", "task_front", "task_front_side"],
+    help="Camera preset. task_front: on +X side, looks ~ -X (robot frontal); diagonal: legacy oblique.",
+)
+parser.add_argument(
     "--video_output_dir",
     type=str,
     default=None,
@@ -166,7 +173,7 @@ from soccer.tasks.tracking.mdp.commands import MotionLoader
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_SCRIPT_DIR, "rsl_rl"))
-from dual_view_recorder import DualViewRecorder  # noqa: E402
+from dual_view_recorder import DualViewRecorder, resolve_camera_offsets  # noqa: E402
 
 
 class _ReplayRecorderEnv:
@@ -369,12 +376,13 @@ def _build_video_overlay(
 
 def _make_video_recorder(sim: SimulationContext, scene: InteractiveScene, motion: SoccerMotionReplayData):
     output_dir = args_cli.video_output_dir or _default_video_output_dir(args_cli.motion_path)
+    front_offset, back_offset = resolve_camera_offsets(layout=args_cli.cam_layout)
     recorder = DualViewRecorder(
         env=_ReplayRecorderEnv(sim, scene),
         output_dir=output_dir,
         resolution=(960, 540),
-        front_offset=(4.0, 3.0, 2.5),
-        back_offset=(-4.0, -3.0, 2.5),
+        front_offset=front_offset,
+        back_offset=back_offset,
         lookat_offset=0.5,
         fps=max(1, int(round(motion.fps))),
         path_tracing=args_cli.path_tracing,
