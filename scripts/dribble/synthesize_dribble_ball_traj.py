@@ -12,11 +12,18 @@ Pipeline (XGen-style, football simplification):
 3. **Before first / after last segment**: interpolate from a front spawn point
    (motion frame-0 anchor + forward distance) to the first/last contact ball pose.
 
-4. **``dribble_cg_foot_ball_dist[t]``** = 3D distance from the labeled foot to the
-   synthesized ball at frame ``t`` (meters). Frames without a foot label are ``-1``.
+4. **``dribble_cg_foot_ball_dist[t]``** = XY distance from the reference foot to the
+   synthesized ball at frame ``t`` (meters). Computed on **every** frame where a
+   stitched ball trajectory exists (contact + approach gaps + tail), not only on
+   annotated contact frames.
 
-Writes ``ball_pos_w`` and ``dribble_cg_foot_ball_dist`` into each ``.npz``.
-Keeps existing ``dribble_cg_contact`` / ``dribble_cg_foot`` for compatibility.
+5. **``dribble_cg_dist_foot[t]``** = which foot the distance was measured against
+   (0 left, 1 right). On non-contact frames the *next* segment foot is used during
+   approach; before / after the clip the first / last segment foot is used.
+   ``dribble_cg_foot`` (contact annotation) is left unchanged.
+
+Writes ``ball_pos_w``, ``dribble_cg_foot_ball_dist``, and ``dribble_cg_dist_foot``
+into each ``.npz``.
 """
 
 from __future__ import annotations
@@ -76,6 +83,40 @@ def _contact_segments(contact: np.ndarray, foot: np.ndarray) -> list[tuple[int, 
     return segs
 
 
+def _ref_foot_per_frame(
+    T: int,
+    segs: list[tuple[int, int, int]],
+) -> np.ndarray:
+    """Per-frame foot id for foot–ball distance (separate from contact labels).
+
+    Contact frames use the segment foot. Gaps between touches use the *next*
+    segment foot (approach). Before the first / after the last touch use the
+    first / last segment foot.
+    """
+    ref = np.full(T, -1, dtype=np.int8)
+    if not segs:
+        return ref
+
+    for s, e, fid in segs:
+        ref[s : e + 1] = fid
+
+    s0, _, fid0 = segs[0]
+    if s0 > 0:
+        ref[:s0] = fid0
+
+    for k in range(len(segs) - 1):
+        _, e0, _ = segs[k]
+        s1, _, fid1 = segs[k + 1]
+        for t in range(e0 + 1, s1):
+            ref[t] = fid1
+
+    _, e_last, fid_last = segs[-1]
+    if e_last < T - 1:
+        ref[e_last + 1 :] = fid_last
+
+    return ref
+
+
 def synthesize_ball_trajectory(
     body_pos_w: np.ndarray,
     body_quat_w: np.ndarray,
@@ -90,11 +131,12 @@ def synthesize_ball_trajectory(
     foot_offset_y: float,
     init_forward_dist: float,
     use_foot_yaw: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return ``(ball_pos_w [T,3], foot_ball_dist [T])``."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(ball_pos_w [T,3], foot_ball_dist [T], dist_foot [T])``."""
     T = int(body_pos_w.shape[0])
     ball = np.zeros((T, 3), dtype=np.float32)
     dist = np.full(T, -1.0, dtype=np.float32)
+    dist_foot = np.full(T, -1, dtype=np.int8)
 
     segs = _contact_segments(cg_contact, cg_foot)
     phi_xy = np.array([foot_offset_x, foot_offset_y], dtype=np.float64)
@@ -160,17 +202,19 @@ def synthesize_ball_trajectory(
         if e_last < T - 1:
             ball[e_last + 1 :] = ball[e_last]
 
-    # Per-frame foot–ball distance (demo kinematics, not sim). Use XY only: ankle
-    # height is ~0.7 m while the ball sits on the ground — 3D norm is misleading.
+    # Per-frame foot–ball distance from the stitched trajectory. Use XY only:
+    # ankle height is ~0.7 m while the ball sits on the ground — 3D norm is misleading.
+    ref_foot = _ref_foot_per_frame(T, segs)
     for t in range(T):
-        fid = int(cg_foot[t])
+        fid = int(ref_foot[t])
         if fid < 0:
             continue
         fi = _foot_idx(fid)
         dxy = body_pos_w[t, fi, :2] - ball[t, :2]
         dist[t] = float(np.linalg.norm(dxy))
+        dist_foot[t] = fid
 
-    return ball, dist
+    return ball, dist, dist_foot
 
 
 def _npz_replace(npz_path: Path, updates: dict[str, np.ndarray]) -> None:
@@ -217,7 +261,7 @@ def main() -> None:
             else:
                 cg_foot = np.full(T, -1, dtype=np.int8)
 
-        ball, dist = synthesize_ball_trajectory(
+        ball, dist, dist_foot = synthesize_ball_trajectory(
             body_pos,
             body_quat,
             cg_contact,
@@ -237,11 +281,16 @@ def main() -> None:
             {
                 "ball_pos_w": ball.astype(np.float32),
                 "dribble_cg_foot_ball_dist": dist.astype(np.float32),
+                "dribble_cg_dist_foot": dist_foot.astype(np.int8),
             },
         )
         n_labeled = int(np.sum(dist >= 0))
+        n_contact = int(np.sum(cg_contact > 0))
         d_med = float(np.median(dist[dist >= 0])) if n_labeled > 0 else float("nan")
-        print(f"[OK] {f.name}: ball_pos_w {ball.shape}, foot_ball_dist labeled_frames={n_labeled}, median={d_med:.3f}m")
+        print(
+            f"[OK] {f.name}: ball_pos_w {ball.shape}, "
+            f"dist_frames={n_labeled} (contact={n_contact}), median={d_med:.3f}m"
+        )
         updated += 1
 
     print(f"[DONE] Updated {updated}/{len(files)} files.")

@@ -30,6 +30,7 @@ TRAJ_KEYS = {
     "dribble_cg_contact",
     "dribble_cg_foot",
     "dribble_cg_foot_ball_dist",
+    "dribble_cg_dist_foot",
 }
 
 

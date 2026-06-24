@@ -548,7 +548,7 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
             params={"command_name": "motion", "std": 0.32},
         )
         # Continuous CG: demo foot–ball distance (from synthesized ball_pos_w).
-        # Run scripts/rsl_rl/synthesize_dribble_ball_traj.py on labeled motions first.
+        # Run scripts/dribble/synthesize_dribble_ball_traj.py on labeled motions first.
         self.rewards.dribbling_cg_foot_ball_distance = RewTerm(
             func=mdp.dribbling_cg_foot_ball_distance_exp,
             weight=3.5,

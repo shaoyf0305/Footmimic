@@ -56,6 +56,7 @@ class MultiMotionLoader:
         dribble_cg_contact_list: list[torch.Tensor] = []
         dribble_cg_foot_list: list[torch.Tensor] = []
         dribble_cg_foot_ball_dist_list: list[torch.Tensor] = []
+        dribble_cg_dist_foot_list: list[torch.Tensor] = []
         motion_has_ball_demo_list: list[bool] = []
 
         self.fps_list = []
@@ -150,9 +151,15 @@ class MultiMotionLoader:
                 cd = np.asarray(data["dribble_cg_foot_ball_dist"], dtype=np.float32).reshape(-1)[:T]
                 cg_foot_ball_dist[: cd.shape[0]] = torch.as_tensor(cd, device=device, dtype=torch.float32)
 
+            cg_dist_foot = torch.full((T,), -1, dtype=torch.int8, device=device)
+            if "dribble_cg_dist_foot" in data.files:
+                df = np.asarray(data["dribble_cg_dist_foot"], dtype=np.int8).reshape(-1)[:T]
+                cg_dist_foot[: df.shape[0]] = torch.as_tensor(df, device=device, dtype=torch.int8)
+
             dribble_cg_contact_list.append(cg_contact)
             dribble_cg_foot_list.append(cg_foot)
             dribble_cg_foot_ball_dist_list.append(cg_foot_ball_dist)
+            dribble_cg_dist_foot_list.append(cg_dist_foot)
 
             max_T = max(max_T, jp.shape[0])
 
@@ -209,6 +216,7 @@ class MultiMotionLoader:
         self._dribble_cg_contact = pad_1d_int8(dribble_cg_contact_list, pad_value=0)
         self._dribble_cg_foot = pad_1d_int8(dribble_cg_foot_list, pad_value=-1)
         self._dribble_cg_foot_ball_dist = pad_1d_float(dribble_cg_foot_ball_dist_list, pad_value=-1.0)
+        self._dribble_cg_dist_foot = pad_1d_int8(dribble_cg_dist_foot_list, pad_value=-1)
         self.motion_has_ball_demo = torch.tensor(motion_has_ball_demo_list, dtype=torch.bool, device=self.device)
         self.motion_has_dribble_cg = torch.any(self._dribble_cg_contact > 0, dim=1)
         self.motion_has_dribble_cg_foot_ball_dist = torch.any(self._dribble_cg_foot_ball_dist >= 0.0, dim=1)
@@ -262,6 +270,11 @@ class MultiMotionLoader:
     def dribble_cg_foot_ball_dist(self) -> torch.Tensor:
         """Per-frame demo foot–ball distance (m); ``-1`` = no label."""
         return self._dribble_cg_foot_ball_dist
+
+    @property
+    def dribble_cg_dist_foot(self) -> torch.Tensor:
+        """Per-frame foot id used for distance reference: -1 none, 0 left, 1 right."""
+        return self._dribble_cg_dist_foot
 
     def get_last_frame_anchor_pos(self, motion_idx: int, anchor_body_idx: int, motion_length: int) -> torch.Tensor:
         """Get the anchor position at the last frame of the specified motion."""
@@ -550,6 +563,11 @@ class MotionCommand(CommandTerm):
     def dribble_cg_foot_ball_dist_ref(self) -> torch.Tensor:
         """Demo foot–ball distance at current frame (m); ``-1`` if unlabeled."""
         return self.motion.dribble_cg_foot_ball_dist[self.motion_idx, self.time_steps]
+
+    @property
+    def dribble_cg_dist_foot_ref(self) -> torch.Tensor:
+        """Foot id for distance reference at current frame; ``-1`` if unlabeled."""
+        return self.motion.dribble_cg_dist_foot[self.motion_idx, self.time_steps].to(torch.int64)
 
     @property
     def motion_has_dribble_cg_foot_ball_dist_label(self) -> torch.Tensor:

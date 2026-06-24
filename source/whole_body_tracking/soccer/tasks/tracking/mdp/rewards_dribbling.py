@@ -960,10 +960,14 @@ def dribbling_cg_foot_ball_distance_exp(
     """Match sim foot–ball distance to demo distance from synthesized CG trajectory.
 
     Requires ``dribble_cg_foot_ball_dist`` in motion ``.npz`` (see
-    ``scripts/rsl_rl/synthesize_dribble_ball_traj.py``). At labeled frames:
+    ``scripts/dribble/synthesize_dribble_ball_traj.py``). Active on every frame
+    with a stitched demo ball trajectory (contact **and** non-contact approach
+    gaps), not only during annotated contact segments.
 
-    - ``ref_dist`` = demo distance from retargeted foot to synthesized ball.
-    - ``sim_dist`` = distance from the labeled foot to the **sim** ball.
+    - ``ref_dist`` = demo XY distance from the reference foot to synthesized ball.
+    - Reference foot comes from ``dribble_cg_dist_foot`` when present, else
+      falls back to ``dribble_cg_foot`` (legacy contact-only labels).
+    - ``sim_dist`` = distance from that foot to the **sim** ball.
     - reward = ``exp(-(sim_dist - ref_dist)^2 / std^2)``.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
@@ -972,7 +976,12 @@ def dribbling_cg_foot_ball_distance_exp(
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
     ref_dist = command.dribble_cg_foot_ball_dist_ref
-    ref_foot = command.dribble_cg_foot_ref
+    ref_foot_dist = command.dribble_cg_dist_foot_ref
+    ref_foot = torch.where(
+        ref_foot_dist >= 0,
+        ref_foot_dist,
+        command.dribble_cg_foot_ref,
+    )
     active = labeled & (ref_dist >= 0.0) & (ref_foot >= 0)
 
     robot = env.scene[command.cfg.asset_name]
