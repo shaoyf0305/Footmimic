@@ -174,6 +174,18 @@ class G1FlatMotionEnvCfg(G1FlatEnvCfg):
         super().__post_init__()
         self.commands.motion.class_type = mdp.commands_multi_motion_soccer.MotionCommand
         self.commands.motion.sampling_strategy = "uniform"
+        # Stage-1 motion pretrain: ball at clip start (+X), robot faces +X, calm reset.
+        self.commands.motion.soccer_ball_spawn_mode = "start_ahead"
+        self.commands.motion.soccer_ball_start_ahead_distance = 0.45
+        self.commands.motion.reset_face_task_forward = True
+        self.commands.motion.reset_zero_velocity = True
+        self.commands.motion.mimic_align_task_frame = True
+        self.commands.motion.curve_offset_range = {
+            "radius": (0.0, 0.0),
+            "lateral_spawn_jitter": 0.05,
+            "height": SOCCER_BALL_RADIUS,
+        }
+        # Grace on ee_body_pos is opt-in only (long grace can encourage "stand still" policies).
         _apply_soccer_obs(self)
         _apply_soccer_scene(self)
 

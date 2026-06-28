@@ -51,13 +51,22 @@ def bad_motion_body_pos(
 
 
 def bad_motion_body_pos_z_only(
-    env: ManagerBasedRLEnv, command_name: str, threshold: float, body_names: list[str] | None = None
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    threshold: float,
+    body_names: list[str] | None = None,
+    grace_steps_after_resample: int = 0,
 ) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
 
     body_indexes = _get_body_indexes(command, body_names)
     error = torch.abs(command.body_pos_relative_w[:, body_indexes, -1] - command.robot_body_pos_w[:, body_indexes, -1])
-    return torch.any(error > threshold, dim=-1)
+    failed = torch.any(error > threshold, dim=-1)
+    if grace_steps_after_resample > 0:
+        steps = getattr(command, "_steps_since_resample", None)
+        if steps is not None:
+            failed = failed & (steps > grace_steps_after_resample)
+    return failed
 
 
 def motion_finished(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:

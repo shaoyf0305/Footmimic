@@ -25,7 +25,7 @@ from isaaclab.utils.math import (
 )
 
 from .kick_detection import KickContactTracker
-from .task_frame import mimic_anchor_yaw_delta_quat
+from .task_frame import align_body_quat_yaw_to_task_forward, mimic_anchor_yaw_delta_quat, spawn_ball_ahead_env_local
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -405,6 +405,7 @@ class MotionCommand(CommandTerm):
         self.destination_width = 0.5  # Rectangle width (y-axis).
         
         self.curve_radius_offset = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._steps_since_resample = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._radius_offset_min = None
         self._radius_offset_max = None
         curve_cfg = cfg.curve_offset_range or {}
@@ -740,6 +741,27 @@ class MotionCommand(CommandTerm):
         self.motion_length[env_ids] = self.motion.file_lengths[self.motion_idx[env_ids]]
         self.time_steps[env_ids] = 0
 
+    def _spawn_ball_at_motion_start(self, env_ids: torch.Tensor) -> None:
+        """Place the ball a fixed distance ahead of the clip's frame-0 anchor (+X)."""
+        lateral_jitter = float(self._target_lateral_spawn_jitter)
+        distance = float(getattr(self.cfg, "soccer_ball_start_ahead_distance", 0.45))
+        lateral_offset = float(getattr(self.cfg, "soccer_ball_start_ahead_lateral", 0.0))
+        base_height = float(self._target_height)
+
+        for env_id in env_ids:
+            motion_idx = int(self.motion_idx[env_id].item())
+            first_anchor = self.motion.get_first_frame_anchor_pos(motion_idx, self.motion_anchor_body_index)
+            ball_pos = spawn_ball_ahead_env_local(
+                first_anchor,
+                distance + float(self.curve_radius_offset[env_id]),
+                lateral_offset,
+                base_height,
+            )
+            if lateral_jitter > 0.0:
+                y_off = sample_uniform(-lateral_jitter, lateral_jitter, (1,), device=self.device).squeeze(0)
+                ball_pos[1] = ball_pos[1] + y_off
+            self.soccer_ball_pos[env_id] = ball_pos
+
     def _compute_soccer_ball_positions(self, env_ids: Sequence[int] | torch.Tensor):
         if isinstance(env_ids, torch.Tensor):
             ids = env_ids.to(self.device, dtype=torch.long)
@@ -747,6 +769,11 @@ class MotionCommand(CommandTerm):
             ids = torch.as_tensor(list(env_ids), dtype=torch.long, device=self.device)
 
         if ids.numel() == 0:
+            return
+
+        spawn_mode = str(getattr(self.cfg, "soccer_ball_spawn_mode", "clip_displacement")).lower().strip()
+        if spawn_mode in {"start", "start_ahead", "motion_start"}:
+            self._spawn_ball_at_motion_start(ids)
             return
 
         lateral_jitter = float(self._target_lateral_spawn_jitter)
@@ -764,7 +791,7 @@ class MotionCommand(CommandTerm):
             radius = torch.sqrt(radius_sq) if float(radius_sq) > 1e-12 else torch.tensor(0.0, device=self.device)
             radius = torch.clamp(radius + self.curve_radius_offset[env_id], min=0.0)
 
-            # Task frame: place ball along env-local +X from the motion start anchor.
+            # Legacy: displacement magnitude along +X from frame 0 (≈ clip end X for forward clips).
             target_xy = first_anchor[:2].clone()
             target_xy[0] = target_xy[0] + radius
             if lateral_jitter > 0.0:
@@ -914,6 +941,9 @@ class MotionCommand(CommandTerm):
         root_pos[env_ids] += rand_samples[:, 0:3]
         orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
         root_ori[env_ids] = quat_mul(orientations_delta, root_ori[env_ids])
+        if bool(getattr(self.cfg, "reset_face_task_forward", False)):
+            root_ori[env_ids] = align_body_quat_yaw_to_task_forward(root_ori[env_ids])
+
         range_list = [self.cfg.velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
         ranges = torch.tensor(range_list, device=self.device)
         rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
@@ -922,6 +952,11 @@ class MotionCommand(CommandTerm):
 
         joint_pos = self.joint_pos.clone()
         joint_vel = self.joint_vel.clone()
+
+        if bool(getattr(self.cfg, "reset_zero_velocity", False)):
+            root_lin_vel[env_ids] = 0.0
+            root_ang_vel[env_ids] = 0.0
+            joint_vel[env_ids] = 0.0
 
         joint_pos += sample_uniform(*self.cfg.joint_position_range, joint_pos.shape, joint_pos.device)
         soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids]
@@ -943,10 +978,12 @@ class MotionCommand(CommandTerm):
             resample_flags = resample_flags.to(device=self.device, dtype=torch.bool)
         resample_flags[env_ids] = True
         setattr(self._env, flag_name, resample_flags)
+        self._steps_since_resample[env_ids] = 0
 
     # Called every step in the IsaacLab main loop.
     def _update_command(self):
         self.kick_contact_tracker.begin_step(self)
+        self._steps_since_resample += 1
         # Increment time_steps; if a sequence ends, resample based on failure statistics.
         self.time_steps += 1
         # env_ids = torch.where(self.time_steps >= self.motion.time_step_total)[0]
@@ -1049,6 +1086,17 @@ class MotionCommandCfg(CommandTermCfg):
     body_names: list[str] = MISSING
     # Strip demo anchor yaw to task +X for all mimic targets (pos/ori/vel), not only pelvis.
     mimic_align_task_frame: bool = False
+
+    # Soccer ball spawn on motion resample (Stage-1 motion pretrain).
+    # ``clip_displacement`` (legacy): frame-0 anchor + ||last-first|| along +X (often ≈ clip end).
+    # ``start_ahead``: fixed distance along +X from frame-0 anchor.
+    soccer_ball_spawn_mode: str = "clip_displacement"
+    soccer_ball_start_ahead_distance: float = 0.45
+    soccer_ball_start_ahead_lateral: float = 0.0
+
+    # Reset pose: face task +X and drop reference velocities (reduces frame-0 ee_body_pos fails).
+    reset_face_task_forward: bool = False
+    reset_zero_velocity: bool = False
 
     pose_range: dict[str, tuple[float, float]] = {}
     velocity_range: dict[str, tuple[float, float]] = {}

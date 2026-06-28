@@ -109,6 +109,11 @@ def forward_dominance_gate(dominance: torch.Tensor, min_dominance: float) -> tor
     return torch.clamp((dominance - min_dominance) / (1.0 - min_dominance + 1e-6), min=0.0, max=1.0)
 
 
+def align_body_quat_yaw_to_task_forward(quat_w: torch.Tensor) -> torch.Tensor:
+    """Strip world yaw so the body faces task +X (keeps roll/pitch)."""
+    return quat_mul(quat_inv(yaw_quat(quat_w)), quat_w)
+
+
 def spawn_ball_ahead_env_local(
     anchor_pos: torch.Tensor,
     distance: float,
