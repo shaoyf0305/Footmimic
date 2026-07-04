@@ -167,6 +167,27 @@ class G1TerrainMotionEnvCfg(G1TerrainEnvCfg):
         _apply_soccer_scene(self)
 
 
+def _apply_stage1_pure_mimic(cfg) -> None:
+    """Stage-1 dribble pretrain: pose mimic only — no lateral/heading task terms.
+
+    Matches Stage-2 anchor convention (pelvis + task-frame yaw strip) so checkpoints
+    resume cleanly, but avoids forward/lateral velocity and heading rewards that
+    fight slalom arm swing during pretrain. Body velocity tracking is disabled
+    (noisy HMR vel + slalom lateral bleeds into upper-body references).
+    """
+    cfg.commands.motion.anchor_body_name = "pelvis"
+    cfg.commands.motion.mimic_align_task_frame = True
+
+    if hasattr(cfg.rewards, "motion_global_anchor_pos"):
+        cfg.rewards.motion_global_anchor_pos.weight = 0.0
+    if hasattr(cfg.rewards, "motion_global_anchor_ori"):
+        cfg.rewards.motion_global_anchor_ori.weight = 0.0
+    if hasattr(cfg.rewards, "motion_body_lin_vel"):
+        cfg.rewards.motion_body_lin_vel.weight = 0.0
+    if hasattr(cfg.rewards, "motion_body_ang_vel"):
+        cfg.rewards.motion_body_ang_vel.weight = 0.0
+
+
 @configclass
 class G1FlatMotionEnvCfg(G1FlatEnvCfg):
     scene: G1FlatSoccerSceneCfg = G1FlatSoccerSceneCfg(num_envs=4096, env_spacing=2.5)
@@ -179,12 +200,12 @@ class G1FlatMotionEnvCfg(G1FlatEnvCfg):
         self.commands.motion.soccer_ball_start_ahead_distance = 0.45
         self.commands.motion.reset_face_task_forward = True
         self.commands.motion.reset_zero_velocity = True
-        self.commands.motion.mimic_align_task_frame = True
         self.commands.motion.curve_offset_range = {
             "radius": (0.0, 0.0),
             "lateral_spawn_jitter": 0.05,
             "height": SOCCER_BALL_RADIUS,
         }
+        _apply_stage1_pure_mimic(self)
         # Grace on ee_body_pos is opt-in only (long grace can encourage "stand still" policies).
         _apply_soccer_obs(self)
         _apply_soccer_scene(self)
@@ -195,6 +216,10 @@ class G1FlatProximityEnvCfg(G1FlatMotionEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # Stage-2+ tasks restore default body-velocity tracking (Stage-1 zeros it).
+        self.rewards.motion_body_lin_vel.weight = 1.0
+        self.rewards.motion_body_ang_vel.weight = 1.0
 
         self.foot_cfg = SceneEntityCfg(
             "robot",

@@ -601,16 +601,12 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
 class G1FlatMotionCGPretrainEnvCfg(G1FlatMotionEnvCfg):
     """Stage-1 basic-motion pretraining env, obs-compatible with the CG dribble env.
 
-    Mirrors :class:`~soccer.tasks.tracking.config.g1.soccer_flat_env_cfg.G1FlatMotionEnvCfg`
-    in every respect (rewards / terminations / commands / scene), only adding the
-    ``anchor_ball_polar`` observation that
-    :class:`G1FlatCGDribblingEnvCfg` also adds. Keeping the observation layout
+    Inherits pure-mimic Stage-1 settings from
+    :class:`~soccer.tasks.tracking.config.g1.soccer_flat_env_cfg.G1FlatMotionEnvCfg`
+    and only adds the ``anchor_ball_polar`` observation that
+    :class:`G1FlatCGDribblingEnvCfg` also uses. Keeping the observation layout
     identical lets a checkpoint trained here be resumed by
     ``Tracking-CG-G1-Dribbling-RNN-v0`` via the standard rsl_rl ``--resume`` flow.
-
-    Use this for the Stage-1 pretrain when running CG progressive training.
-    The original :class:`G1FlatMotionEnvCfg` (``Tracking-Flat-G1-Motion-RNN-v0``)
-    is left untouched so existing non-CG checkpoints stay loadable.
     """
 
     def __post_init__(self):
@@ -622,86 +618,5 @@ class G1FlatMotionCGPretrainEnvCfg(G1FlatMotionEnvCfg):
         )
         self.observations.critic.anchor_ball_polar = ObsTerm(
             func=obs_anchor.anchor_ball_polar,
-            params={"command_name": "motion"},
-        )
-
-        # Must match Stage-2 dribbling (pelvis + task +X). Legacy Stage-1 uses
-        # torso_link / robot-yaw mimic and global body vel — arms stay slalom-twisted
-        # after resume even when Stage-2 has mimic_align_task_frame=True.
-        self.commands.motion.anchor_body_name = "pelvis"
-        self.commands.motion.mimic_align_task_frame = True
-        _upper_body_track_names = [
-            "pelvis",
-            "torso_link",
-            "left_shoulder_roll_link",
-            "left_elbow_link",
-            "left_wrist_yaw_link",
-            "right_shoulder_roll_link",
-            "right_elbow_link",
-            "right_wrist_yaw_link",
-        ]
-        if hasattr(self.rewards, "motion_body_ori"):
-            self.rewards.motion_body_ori.params["body_names"] = _upper_body_track_names
-        if hasattr(self.rewards, "motion_body_lin_vel"):
-            self.rewards.motion_body_lin_vel = RewTerm(
-                func=mdp.motion_relative_body_linear_velocity_error_exp,
-                weight=0.3,
-                params={
-                    "command_name": "motion",
-                    "std": 1.0,
-                    "body_names": _upper_body_track_names,
-                },
-            )
-        if hasattr(self.rewards, "motion_body_ang_vel"):
-            self.rewards.motion_body_ang_vel = RewTerm(
-                func=mdp.motion_relative_body_angular_velocity_error_exp,
-                weight=0.3,
-                params={
-                    "command_name": "motion",
-                    "std": 3.14,
-                    "body_names": _upper_body_track_names,
-                },
-            )
-
-        # Stage-1 objective: forward locomotion with the motion's gait style.
-        # The demo is slalom-around-cones, so we drop the world-frame trajectory trackers
-        # and replace them with a simple "walk forward at ~target speed" task. Motion
-        # style is still imitated via joint reference + anchor-relative body rewards.
-        if hasattr(self.rewards, "motion_global_anchor_pos"):
-            self.rewards.motion_global_anchor_pos.weight = 0.0
-        if hasattr(self.rewards, "motion_global_anchor_ori"):
-            self.rewards.motion_global_anchor_ori.weight = 0.0
-        # Slalom side-to-side motion bleeds into per-body world velocity / angular
-        # velocity references too: keep them at reduced weight so they only inform gait
-        # timing rather than enforcing the lateral pattern.
-        if hasattr(self.rewards, "motion_body_lin_vel"):
-            self.rewards.motion_body_lin_vel.weight = 0.3
-        if hasattr(self.rewards, "motion_body_ang_vel"):
-            self.rewards.motion_body_ang_vel.weight = 0.3
-
-        self.rewards.forward_velocity = RewTerm(
-            func=mdp.forward_velocity_reward,
-            weight=3.0,
-            params={
-                "command_name": "motion",
-                "target_speed": 0.8,
-                "std": 0.4,
-                "velocity_frame": "world",
-                "min_forward_dominance": 0.55,
-            },
-        )
-        self.rewards.lateral_velocity_penalty = RewTerm(
-            func=mdp.lateral_velocity_penalty,
-            weight=-0.8,
-            params={
-                "command_name": "motion",
-                "velocity_frame": "world",
-                "lateral_deadzone": 0.06,
-                "lateral_scale": 0.28,
-            },
-        )
-        self.rewards.task_heading_alignment = RewTerm(
-            func=mdp.task_heading_alignment_reward,
-            weight=1.5,
             params={"command_name": "motion"},
         )

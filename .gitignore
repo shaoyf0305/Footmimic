@@ -53,6 +53,7 @@ gmr/
 temp/
 pipeline/
 inputs/
+docs/
 
 *_original.*
 *_temp.*

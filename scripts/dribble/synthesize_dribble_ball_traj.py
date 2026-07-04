@@ -7,20 +7,25 @@ Pipeline (XGen-style, football simplification):
    Place the ball at the labeled ankle + a fixed offset in horizontal yaw
    (``p_ball = p_foot + R_yaw @ phi``).
 
-2. **Between segments**: linear interpolation in XY, fixed ground height.
+2. **``traj_mode=hybrid``** (recommended): **contact** frames adhere to the foot
+   (ground foot bodies + optional medial/inward offset); **gaps** linearly interpolate
+   in XY between contact endpoints; pre-first-contact approaches the first touch.
 
-3. **Before first / after last segment**: interpolate from a front spawn point
-   (motion frame-0 anchor + forward distance) to the first/last contact ball pose.
+   ``foot_follow``: ball tracks a stepping foot every frame. ``lerp``: legacy gaps +
+   anchor spawn (avoid for master data).
 
 4. **``dribble_cg_foot_ball_dist[t]``** = XY distance from the reference foot to the
    synthesized ball at frame ``t`` (meters). Computed on **every** frame where a
    stitched ball trajectory exists (contact + approach gaps + tail), not only on
    annotated contact frames.
 
-5. **``dribble_cg_dist_foot[t]``** = which foot the distance was measured against
-   (0 left, 1 right). On non-contact frames the *next* segment foot is used during
-   approach; before / after the clip the first / last segment foot is used.
-   ``dribble_cg_foot`` (contact annotation) is left unchanged.
+5. **``dribble_cg_dist_foot[t]``** = which foot the ball was placed against (0 left,
+   1 right). ``dribble_cg_foot`` (contact annotation) is left unchanged.
+
+**Foot body indices:** ``pkl_to_npz`` stores all ~30 G1 bodies. Indices 3/6 match the
+14-link *tracking subset*, not ground feet — on full clips index 3 often equals
+pelvis. Use ``--auto_foot_indices`` (default) to pick the lowest, most mobile foot
+links (``LL_FOOT`` / ``LR_FOOT`` class).
 
 Writes ``ball_pos_w``, ``dribble_cg_foot_ball_dist``, and ``dribble_cg_dist_foot``
 into each ``.npz``.
@@ -29,6 +34,7 @@ into each ``.npz``.
 from __future__ import annotations
 
 import argparse
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -83,6 +89,145 @@ def _contact_segments(contact: np.ndarray, foot: np.ndarray) -> list[tuple[int, 
     return segs
 
 
+def _resolve_anchor_body_index(num_bodies: int, anchor_body_index: int) -> int:
+    if anchor_body_index >= 0:
+        return anchor_body_index
+    return 0 if num_bodies >= 20 else 7
+
+
+def resolve_foot_body_indices(
+    body_pos_w: np.ndarray,
+    *,
+    left_foot_index: int = -1,
+    right_foot_index: int = -1,
+) -> tuple[int, int]:
+    """Return ``(left_body_idx, right_body_idx)`` into ``body_pos_w``.
+
+    For the 14-body tracking subset (from some exporters), ankles are at 3/6.
+    For full G1 clips (~30 bodies from ``pkl_to_npz``), pick the two ground foot
+    links by median height + horizontal travel (``LL_FOOT`` / ``LR_FOOT``).
+    """
+    num_bodies = int(body_pos_w.shape[1])
+    if left_foot_index >= 0 and right_foot_index >= 0:
+        return left_foot_index, right_foot_index
+
+    if num_bodies == 14:
+        return 3, 6
+
+    # Full G1 from pkl_to_npz: 30 rigid bodies; ground feet are LL_FOOT/LR_FOOT (~18/19).
+    if num_bodies >= 20 and 18 < num_bodies and 19 < num_bodies:
+        mean_y_18 = float(np.mean(body_pos_w[:, 18, 1]))
+        mean_y_19 = float(np.mean(body_pos_w[:, 19, 1]))
+        if mean_y_18 <= mean_y_19:
+            return 18, 19
+        return 19, 18
+
+    med_z = np.median(body_pos_w[:, :, 2], axis=0)
+    travel = np.ptp(body_pos_w[:, :, :2], axis=0)
+    travel = np.hypot(travel[:, 0], travel[:, 1])
+
+    candidates = [
+        i
+        for i in range(num_bodies)
+        if med_z[i] < 0.42 and travel[i] > 1.5
+    ]
+    if len(candidates) < 2:
+        order = np.argsort(med_z)
+        candidates = order[: min(6, num_bodies)].tolist()
+
+    candidates = sorted(candidates, key=lambda i: (-travel[i], med_z[i]))
+    shortlist = candidates[:4]
+    if len(shortlist) < 2:
+        shortlist = candidates[:2]
+
+    mean_y = {i: float(np.mean(body_pos_w[:, i, 1])) for i in shortlist}
+    left_idx = min(shortlist, key=lambda i: mean_y[i])
+    right_idx = max(shortlist, key=lambda i: mean_y[i])
+    if left_idx == right_idx and len(shortlist) >= 2:
+        left_idx, right_idx = shortlist[0], shortlist[1]
+    return left_idx, right_idx
+
+
+def _forward_foot_id(
+    t: int,
+    body_pos_w: np.ndarray,
+    body_quat_w: np.ndarray,
+    anchor_body_index: int,
+    left_foot_index: int,
+    right_foot_index: int,
+) -> int:
+    """Pick the foot most ahead in anchor yaw (for frame 0 / cold start)."""
+    yaw = float(_yaw_from_quat_wxyz(body_quat_w[t, anchor_body_index]))
+    c, s = np.cos(-yaw), np.sin(-yaw)
+
+    def forward_x(i: int) -> float:
+        x, y = body_pos_w[t, i, 0], body_pos_w[t, i, 1]
+        return c * x - s * y
+
+    lf = forward_x(left_foot_index)
+    rf = forward_x(right_foot_index)
+    return 0 if lf >= rf else 1
+
+
+def _foot_id_for_frame(
+    t: int,
+    cg_contact: np.ndarray,
+    cg_foot: np.ndarray,
+    body_pos_w: np.ndarray,
+    body_quat_w: np.ndarray,
+    ball: np.ndarray,
+    *,
+    left_foot_index: int,
+    right_foot_index: int,
+    anchor_body_index: int,
+) -> int:
+    """Choose left (0) or right (1) foot from actual body kinematics."""
+    lp = body_pos_w[t, left_foot_index, :2]
+    rp = body_pos_w[t, right_foot_index, :2]
+
+    if t > 0:
+        bprev = ball[t - 1, :2]
+        dl = float(np.linalg.norm(lp - bprev))
+        dr = float(np.linalg.norm(rp - bprev))
+        closest = 0 if dl <= dr else 1
+    else:
+        closest = _forward_foot_id(
+            t, body_pos_w, body_quat_w, anchor_body_index, left_foot_index, right_foot_index
+        )
+
+    if cg_contact[t] > 0 and cg_foot[t] >= 0:
+        labeled = int(cg_foot[t])
+        if t > 0:
+            d_lab = dl if labeled == 0 else dr
+            d_oth = dr if labeled == 0 else dl
+            if d_oth + 0.04 < d_lab:
+                return closest
+        return labeled
+    return closest
+
+
+def _inward_xy(
+    t: int,
+    fid: int,
+    body_pos_w: np.ndarray,
+    left_foot_index: int,
+    right_foot_index: int,
+    magnitude: float,
+) -> np.ndarray:
+    """Unit inward (medial) offset in XY: left foot → toward right, vice versa."""
+    if magnitude <= 0.0:
+        return np.zeros(2, dtype=np.float64)
+    lp = body_pos_w[t, left_foot_index, :2]
+    rp = body_pos_w[t, right_foot_index, :2]
+    foot = lp if fid == 0 else rp
+    other = rp if fid == 0 else lp
+    inward = other - foot
+    norm = float(np.linalg.norm(inward))
+    if norm < 1e-6:
+        return np.zeros(2, dtype=np.float64)
+    return magnitude * (inward / norm)
+
+
 def _ref_foot_per_frame(
     T: int,
     segs: list[tuple[int, int, int]],
@@ -129,84 +274,155 @@ def synthesize_ball_trajectory(
     ball_radius: float,
     foot_offset_x: float,
     foot_offset_y: float,
+    foot_inner_offset: float,
     init_forward_dist: float,
     use_foot_yaw: bool,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return ``(ball_pos_w [T,3], foot_ball_dist [T], dist_foot [T])``."""
+    traj_mode: str = "hybrid",
+    auto_foot_indices: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    """Return ``(ball_pos_w [T,3], foot_ball_dist [T], dist_foot [T], L_idx, R_idx)``."""
     T = int(body_pos_w.shape[0])
+    num_bodies = int(body_pos_w.shape[1])
     ball = np.zeros((T, 3), dtype=np.float32)
     dist = np.full(T, -1.0, dtype=np.float32)
     dist_foot = np.full(T, -1, dtype=np.int8)
 
+    if auto_foot_indices and (left_foot_index < 0 or right_foot_index < 0):
+        left_foot_index, right_foot_index = resolve_foot_body_indices(
+            body_pos_w,
+            left_foot_index=left_foot_index,
+            right_foot_index=right_foot_index,
+        )
+    anchor_body_index = _resolve_anchor_body_index(num_bodies, anchor_body_index)
+
     segs = _contact_segments(cg_contact, cg_foot)
-    phi_xy = np.array([foot_offset_x, foot_offset_y], dtype=np.float64)
+    ref_foot = _ref_foot_per_frame(T, segs)
+    mode = str(traj_mode).lower().strip()
+    placement_foot = np.full(T, -1, dtype=np.int8)
 
     def _foot_idx(fid: int) -> int:
         return left_foot_index if fid == 0 else right_foot_index
 
     def _place_contact_frame(t: int, fid: int) -> None:
+        """Adhere ball to foot: forward offset in foot yaw + medial (inward) shift."""
         fi = _foot_idx(fid)
-        foot_p = body_pos_w[t, fi]
+        foot_p = body_pos_w[t, fi, :2]
         if use_foot_yaw and body_quat_w is not None:
             yaw = _yaw_from_quat_wxyz(body_quat_w[t, fi])
         else:
             yaw = _yaw_from_quat_wxyz(body_quat_w[t, anchor_body_index])
-        off_xy = _yaw_rotate_xy(np.asarray([yaw]), phi_xy)[0]
-        ball[t, 0] = foot_p[0] + off_xy[0]
-        ball[t, 1] = foot_p[1] + off_xy[1]
+        phi_fwd = np.array([foot_offset_x, foot_offset_y], dtype=np.float64)
+        off_fwd = _yaw_rotate_xy(np.asarray([yaw]), phi_fwd)[0]
+        off_in = _inward_xy(t, fid, body_pos_w, left_foot_index, right_foot_index, foot_inner_offset)
+        ball_xy = foot_p + off_fwd + off_in
+        ball[t, 0] = ball_xy[0]
+        ball[t, 1] = ball_xy[1]
         ball[t, 2] = ball_radius
+        placement_foot[t] = fid
 
-    # Contact frames: anchor placement
-    for s, e, fid in segs:
-        for t in range(s, e + 1):
-            _place_contact_frame(t, fid)
-
-    # Between segments: XY lerp
-    for k in range(len(segs) - 1):
-        s0, e0, _ = segs[k]
-        s1, _, _ = segs[k + 1]
-        if s1 <= e0 + 1:
-            continue
-        p0 = ball[e0, :2]
-        p1 = ball[s1, :2]
-        gap = s1 - e0
-        for j, t in enumerate(range(e0 + 1, s1)):
-            alpha = float(j) / float(gap)
+    def _lerp_gap(t0: int, t1: int, p0: np.ndarray, p1: np.ndarray, fid: int) -> None:
+        """Linear XY blend for frames ``t0+1 .. t1-1`` (exclusive endpoints)."""
+        if t1 <= t0 + 1:
+            return
+        gap = t1 - t0
+        for j, t in enumerate(range(t0 + 1, t1)):
+            alpha = float(j + 1) / float(gap)
             ball[t, :2] = (1.0 - alpha) * p0 + alpha * p1
             ball[t, 2] = ball_radius
+            placement_foot[t] = fid
 
-    # Before first contact: from spawn in front of frame-0 anchor
-    if segs:
+    def _fill_hybrid_gaps() -> None:
+        if not segs:
+            return
+
+        for s, e, fid in segs:
+            for t in range(s, e + 1):
+                seg_fid = int(cg_foot[t]) if cg_foot[t] >= 0 else fid
+                _place_contact_frame(t, seg_fid)
+
+        for k in range(len(segs) - 1):
+            s0, e0, _ = segs[k]
+            s1, _, fid1 = segs[k + 1]
+            _lerp_gap(e0, s1, ball[e0, :2], ball[s1, :2], fid1)
+
         s0, _, fid0 = segs[0]
-        anchor0 = body_pos_w[0, anchor_body_index]
-        yaw0 = _yaw_from_quat_wxyz(body_quat_w[0, anchor_body_index])
-        spawn_xy = anchor0[:2] + _yaw_rotate_xy(np.asarray([yaw0]), np.array([init_forward_dist, 0.0]))[0]
         if s0 > 0:
-            p1 = ball[s0, :2]
-            for t in range(s0):
-                alpha = float(t + 1) / float(s0 + 1)
-                ball[t, :2] = (1.0 - alpha) * spawn_xy + alpha * p1
-                ball[t, 2] = ball_radius
-    else:
-        # No contact labels: single spawn in front of anchor
-        anchor0 = body_pos_w[0, anchor_body_index]
-        yaw0 = _yaw_from_quat_wxyz(body_quat_w[0, anchor_body_index])
-        off = _yaw_rotate_xy(np.asarray([yaw0]), np.array([init_forward_dist, 0.0]))[0]
-        ball[:, 0] = anchor0[0] + off[0]
-        ball[:, 1] = anchor0[1] + off[1]
-        ball[:, 2] = ball_radius
+            _place_contact_frame(0, fid0)
+            p_start = ball[0, :2].copy()
+            _lerp_gap(-1, s0, p_start, ball[s0, :2], fid0)
+            ball[0, :2] = p_start
+            placement_foot[0] = fid0
 
-    # After last contact: hold last pose (rolling can be added later)
-    if segs:
-        _, e_last, _ = segs[-1]
+        _, e_last, fid_last = segs[-1]
         if e_last < T - 1:
-            ball[e_last + 1 :] = ball[e_last]
+            ball[e_last + 1 :, :2] = ball[e_last, :2]
+            ball[e_last + 1 :, 2] = ball_radius
+            placement_foot[e_last + 1 :] = fid_last
 
-    # Per-frame foot–ball distance from the stitched trajectory. Use XY only:
-    # ankle height is ~0.7 m while the ball sits on the ground — 3D norm is misleading.
-    ref_foot = _ref_foot_per_frame(T, segs)
+    def _spawn_no_contact() -> None:
+        for t in range(T):
+            fid = _forward_foot_id(
+                t, body_pos_w, body_quat_w, anchor_body_index, left_foot_index, right_foot_index
+            )
+            _place_contact_frame(t, fid)
+
+    if mode == "hybrid":
+        if segs:
+            _fill_hybrid_gaps()
+        else:
+            _spawn_no_contact()
+    elif mode == "foot_follow":
+        if segs:
+            for t in range(T):
+                fid = _foot_id_for_frame(
+                    t,
+                    cg_contact,
+                    cg_foot,
+                    body_pos_w,
+                    body_quat_w,
+                    ball,
+                    left_foot_index=left_foot_index,
+                    right_foot_index=right_foot_index,
+                    anchor_body_index=anchor_body_index,
+                )
+                _place_contact_frame(t, fid)
+        else:
+            _spawn_no_contact()
+    elif mode == "lerp":
+        for s, e, fid in segs:
+            for t in range(s, e + 1):
+                _place_contact_frame(t, fid)
+
+        for k in range(len(segs) - 1):
+            s0, e0, _ = segs[k]
+            s1, _, fid1 = segs[k + 1]
+            _lerp_gap(e0, s1, ball[e0, :2], ball[s1, :2], fid1)
+
+        if segs:
+            s0, _, fid0 = segs[0]
+            anchor0 = body_pos_w[0, anchor_body_index]
+            yaw0 = _yaw_from_quat_wxyz(body_quat_w[0, anchor_body_index])
+            spawn_xy = anchor0[:2] + _yaw_rotate_xy(np.asarray([yaw0]), np.array([init_forward_dist, 0.0]))[0]
+            if s0 > 0:
+                _lerp_gap(-1, s0, spawn_xy, ball[s0, :2], fid0)
+                ball[0, :2] = spawn_xy
+                placement_foot[0] = fid0
+        else:
+            _spawn_no_contact()
+
+        if segs:
+            _, e_last, fid_last = segs[-1]
+            if e_last < T - 1:
+                ball[e_last + 1 :, :2] = ball[e_last, :2]
+                ball[e_last + 1 :, 2] = ball_radius
+                placement_foot[e_last + 1 :] = fid_last
+    else:
+        raise ValueError(f"Unsupported traj_mode={traj_mode!r}; use 'hybrid', 'foot_follow', or 'lerp'.")
+
     for t in range(T):
-        fid = int(ref_foot[t])
+        fid = int(placement_foot[t])
+        if fid < 0:
+            fid = int(ref_foot[t])
         if fid < 0:
             continue
         fi = _foot_idx(fid)
@@ -214,7 +430,7 @@ def synthesize_ball_trajectory(
         dist[t] = float(np.linalg.norm(dxy))
         dist_foot[t] = fid
 
-    return ball, dist, dist_foot
+    return ball, dist, dist_foot, left_foot_index, right_foot_index
 
 
 def _npz_replace(npz_path: Path, updates: dict[str, np.ndarray]) -> None:
@@ -227,24 +443,57 @@ def _npz_replace(npz_path: Path, updates: dict[str, np.ndarray]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Synthesize ball_pos_w + foot-ball distance from CG labels")
     parser.add_argument("--motion_path", type=str, required=True, help="Directory or single .npz")
-    parser.add_argument("--ball_radius", type=float, default=0.11)
-    parser.add_argument("--foot_offset_x", type=float, default=0.12, help="Ball ahead of foot (m) in yaw frame")
-    parser.add_argument("--foot_offset_y", type=float, default=0.0, help="Lateral offset (m) in yaw frame")
-    parser.add_argument("--init_forward_dist", type=float, default=0.45, help="Pre-contact spawn distance (m)")
-    parser.add_argument("--left_foot_index", type=int, default=3)
-    parser.add_argument("--right_foot_index", type=int, default=6)
-    parser.add_argument("--anchor_body_index", type=int, default=7, help="torso_link index in body_pos_w")
     parser.add_argument(
-        "--use_foot_yaw",
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Write updated npz copies here (source files are left unchanged).",
+    )
+    parser.add_argument("--ball_radius", type=float, default=0.11)
+    parser.add_argument("--foot_offset_x", type=float, default=0.06, help="Ball ahead of foot (m) in foot yaw frame")
+    parser.add_argument("--foot_offset_y", type=float, default=0.0, help="Extra lateral offset (m) in foot yaw frame")
+    parser.add_argument(
+        "--foot_inner_offset",
+        type=float,
+        default=0.035,
+        help="Medial shift (m) toward the other foot during contact adhere (0=disable).",
+    )
+    parser.add_argument("--init_forward_dist", type=float, default=0.45, help="Pre-contact spawn distance (m, lerp mode only)")
+    parser.add_argument("--left_foot_index", type=int, default=-1, help="Left foot body index (-1 = auto)")
+    parser.add_argument("--right_foot_index", type=int, default=-1, help="Right foot body index (-1 = auto)")
+    parser.add_argument("--anchor_body_index", type=int, default=-1, help="Anchor body for yaw fallback (-1 = pelvis/torso auto)")
+    parser.add_argument(
+        "--no_auto_foot_indices",
         action="store_true",
-        help="Use foot quaternion yaw for offset (default: anchor/torso yaw)",
+        help="Use fixed --left_foot_index/--right_foot_index (default 3/6) instead of auto-detect.",
+    )
+    parser.add_argument(
+        "--traj_mode",
+        type=str,
+        default="hybrid",
+        choices=("hybrid", "foot_follow", "lerp"),
+        help="hybrid: contact adhere + gap lerp; foot_follow: always track foot; lerp: legacy.",
+    )
+    parser.add_argument(
+        "--no_foot_yaw",
+        action="store_true",
+        help="Use anchor/torso yaw for offset (default: foot quaternion yaw).",
     )
     args = parser.parse_args()
 
-    files = _collect_npz_files(Path(args.motion_path))
+    src_root = Path(args.motion_path)
+    out_root = Path(args.output_dir) if args.output_dir else None
+    if out_root is not None:
+        out_root.mkdir(parents=True, exist_ok=True)
+
+    files = _collect_npz_files(src_root)
     updated = 0
     for f in files:
-        with np.load(f, allow_pickle=True) as d:
+        target = (out_root / f.name) if out_root is not None else f
+        if out_root is not None:
+            shutil.copy2(f, target)
+
+        with np.load(target, allow_pickle=True) as d:
             if "body_pos_w" not in d.files or "body_quat_w" not in d.files:
                 print(f"[SKIP] {f.name}: missing body_pos_w / body_quat_w")
                 continue
@@ -261,23 +510,29 @@ def main() -> None:
             else:
                 cg_foot = np.full(T, -1, dtype=np.int8)
 
-        ball, dist, dist_foot = synthesize_ball_trajectory(
+        li = 3 if args.no_auto_foot_indices and args.left_foot_index < 0 else args.left_foot_index
+        ri = 6 if args.no_auto_foot_indices and args.right_foot_index < 0 else args.right_foot_index
+
+        ball, dist, dist_foot, li, ri = synthesize_ball_trajectory(
             body_pos,
             body_quat,
             cg_contact,
             cg_foot,
-            left_foot_index=args.left_foot_index,
-            right_foot_index=args.right_foot_index,
+            left_foot_index=li,
+            right_foot_index=ri,
             anchor_body_index=args.anchor_body_index,
             ball_radius=args.ball_radius,
             foot_offset_x=args.foot_offset_x,
             foot_offset_y=args.foot_offset_y,
+            foot_inner_offset=args.foot_inner_offset,
             init_forward_dist=args.init_forward_dist,
-            use_foot_yaw=args.use_foot_yaw,
+            use_foot_yaw=not args.no_foot_yaw,
+            traj_mode=args.traj_mode,
+            auto_foot_indices=not args.no_auto_foot_indices,
         )
 
         _npz_replace(
-            f,
+            target,
             {
                 "ball_pos_w": ball.astype(np.float32),
                 "dribble_cg_foot_ball_dist": dist.astype(np.float32),
@@ -288,7 +543,7 @@ def main() -> None:
         n_contact = int(np.sum(cg_contact > 0))
         d_med = float(np.median(dist[dist >= 0])) if n_labeled > 0 else float("nan")
         print(
-            f"[OK] {f.name}: ball_pos_w {ball.shape}, "
+            f"[OK] {target.name}: feet L/R={li}/{ri} ball {ball.shape}, "
             f"dist_frames={n_labeled} (contact={n_contact}), median={d_med:.3f}m"
         )
         updated += 1
