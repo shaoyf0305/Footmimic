@@ -167,13 +167,39 @@ class G1TerrainMotionEnvCfg(G1TerrainEnvCfg):
         _apply_soccer_scene(self)
 
 
-def _apply_stage1_pure_mimic(cfg) -> None:
-    """Stage-1 dribble pretrain: pose mimic only — no lateral/heading task terms.
+# Stage-1 body groups: legs/torso vs arms (upper-body ori is de-emphasised under task-frame slalom).
+_STAGE1_LOCOMOTION_BODY_NAMES = [
+    "pelvis",
+    "left_hip_roll_link",
+    "left_knee_link",
+    "right_hip_roll_link",
+    "right_knee_link",
+    "torso_link",
+]
+_STAGE1_UPPER_BODY_NAMES = [
+    "left_shoulder_roll_link",
+    "left_elbow_link",
+    "left_wrist_yaw_link",
+    "right_shoulder_roll_link",
+    "right_elbow_link",
+    "right_wrist_yaw_link",
+]
+_STAGE1_LEG_VEL_BODY_NAMES = [
+    "left_hip_roll_link",
+    "left_knee_link",
+    "left_ankle_roll_link",
+    "right_hip_roll_link",
+    "right_knee_link",
+    "right_ankle_roll_link",
+]
 
-    Matches Stage-2 anchor convention (pelvis + task-frame yaw strip) so checkpoints
-    resume cleanly, but avoids forward/lateral velocity and heading rewards that
-    fight slalom arm swing during pretrain. Body velocity tracking is disabled
-    (noisy HMR vel + slalom lateral bleeds into upper-body references).
+
+def _apply_stage1_mimic_pretrain(cfg) -> None:
+    """Stage-1 dribble pretrain: layered mimic + demo-root velocity (no lateral/heading task terms).
+
+    Matches Stage-2 anchor convention (pelvis + task-frame yaw strip). Locomotion follows
+    the reference anchor velocity (including slalom lateral); upper-body orientation is
+    soft so arms are not twisted by task-frame slalom refs.
     """
     cfg.commands.motion.anchor_body_name = "pelvis"
     cfg.commands.motion.mimic_align_task_frame = True
@@ -187,6 +213,58 @@ def _apply_stage1_pure_mimic(cfg) -> None:
     if hasattr(cfg.rewards, "motion_body_ang_vel"):
         cfg.rewards.motion_body_ang_vel.weight = 0.0
 
+    if hasattr(cfg.rewards, "motion_body_pos"):
+        cfg.rewards.motion_body_pos.weight = 1.0
+        cfg.rewards.motion_body_pos.params["body_names"] = _STAGE1_LOCOMOTION_BODY_NAMES
+    if hasattr(cfg.rewards, "motion_body_ori"):
+        cfg.rewards.motion_body_ori.weight = 1.0
+        cfg.rewards.motion_body_ori.params["body_names"] = _STAGE1_LOCOMOTION_BODY_NAMES
+
+    cfg.rewards.motion_upper_body_pos = RewTerm(
+        func=mdp.motion_relative_body_position_error_exp,
+        weight=0.85,
+        params={"command_name": "motion", "std": 0.3, "body_names": _STAGE1_UPPER_BODY_NAMES},
+    )
+    cfg.rewards.motion_upper_body_ori = RewTerm(
+        func=mdp.motion_relative_body_orientation_error_exp,
+        weight=0.35,
+        params={"command_name": "motion", "std": 0.4, "body_names": _STAGE1_UPPER_BODY_NAMES},
+    )
+    cfg.rewards.motion_leg_lin_vel = RewTerm(
+        func=mdp.motion_relative_body_linear_velocity_error_exp,
+        weight=0.4,
+        params={"command_name": "motion", "std": 1.0, "body_names": _STAGE1_LEG_VEL_BODY_NAMES},
+    )
+    cfg.rewards.motion_leg_ang_vel = RewTerm(
+        func=mdp.motion_relative_body_angular_velocity_error_exp,
+        weight=0.4,
+        params={"command_name": "motion", "std": 3.14, "body_names": _STAGE1_LEG_VEL_BODY_NAMES},
+    )
+    cfg.rewards.motion_anchor_lin_vel = RewTerm(
+        func=mdp.motion_anchor_lin_vel_tracking_exp,
+        weight=2.2,
+        params={"command_name": "motion", "std": 1.0},
+    )
+    cfg.rewards.motion_anchor_pos_z = RewTerm(
+        func=mdp.motion_anchor_pos_z_error_exp,
+        weight=0.6,
+        params={"command_name": "motion", "std": 0.15},
+    )
+    cfg.rewards.motion_foot_pos = RewTerm(
+        func=mdp.motion_relative_foot_position_error_exp,
+        weight=0.7,
+        params={
+            "command_name": "motion",
+            "std": 0.3,
+            "foot_body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
+        },
+    )
+
+    if hasattr(cfg.terminations, "ee_body_pos"):
+        cfg.terminations.ee_body_pos.params["grace_steps_after_resample"] = 20
+    if hasattr(cfg.terminations, "anchor_pos_z"):
+        cfg.terminations.anchor_pos_z.params["threshold"] = 0.32
+
 
 @configclass
 class G1FlatMotionEnvCfg(G1FlatEnvCfg):
@@ -195,7 +273,7 @@ class G1FlatMotionEnvCfg(G1FlatEnvCfg):
         super().__post_init__()
         self.commands.motion.class_type = mdp.commands_multi_motion_soccer.MotionCommand
         self.commands.motion.sampling_strategy = "uniform"
-        # Stage-1 motion pretrain: ball at clip start (+X), robot faces +X, calm reset.
+        # Flat motion + ball scene defaults (Stage-1/Stage-2 siblings override rewards separately).
         self.commands.motion.soccer_ball_spawn_mode = "start_ahead"
         self.commands.motion.soccer_ball_start_ahead_distance = 0.45
         self.commands.motion.reset_face_task_forward = True
@@ -205,10 +283,22 @@ class G1FlatMotionEnvCfg(G1FlatEnvCfg):
             "lateral_spawn_jitter": 0.05,
             "height": SOCCER_BALL_RADIUS,
         }
-        _apply_stage1_pure_mimic(self)
-        # Grace on ee_body_pos is opt-in only (long grace can encourage "stand still" policies).
         _apply_soccer_obs(self)
         _apply_soccer_scene(self)
+
+
+@configclass
+class G1FlatMotionPretrainEnvCfg(G1FlatMotionEnvCfg):
+    """Stage-1 flat motion pretrain (``Tracking-Flat-G1-Motion-RNN-v0``).
+
+    Sibling of :class:`G1FlatProximityEnvCfg` under :class:`G1FlatMotionEnvCfg`:
+    shared scene/commands live on the base; mimic-pretrain rewards/terminations
+    are applied here only.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_stage1_mimic_pretrain(self)
 
 
 @configclass
@@ -216,10 +306,6 @@ class G1FlatProximityEnvCfg(G1FlatMotionEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-
-        # Stage-2+ tasks restore default body-velocity tracking (Stage-1 zeros it).
-        self.rewards.motion_body_lin_vel.weight = 1.0
-        self.rewards.motion_body_ang_vel.weight = 1.0
 
         self.foot_cfg = SceneEntityCfg(
             "robot",

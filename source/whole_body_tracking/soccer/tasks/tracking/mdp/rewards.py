@@ -201,6 +201,22 @@ def _motion_anchor_yaw_delta_quat(command: MotionCommand) -> torch.Tensor:
     )
 
 
+def motion_anchor_pos_z_error_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
+    """Soft reward for matching demo anchor height (Z only)."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    error = torch.square(command.anchor_pos_w[:, 2] - command.robot_anchor_pos_w[:, 2])
+    return torch.exp(-error / max(std, 1e-6) ** 2)
+
+
+def motion_anchor_lin_vel_tracking_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
+    """Match demo anchor linear velocity in the mimic yaw frame (includes slalom lateral)."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    delta_ori_w = _motion_anchor_yaw_delta_quat(command)
+    ref_vel = quat_apply(delta_ori_w, command.anchor_lin_vel_w)
+    error = torch.sum(torch.square(ref_vel - command.robot_anchor_lin_vel_w), dim=-1)
+    return torch.exp(-error / max(std, 1e-6) ** 2)
+
+
 def motion_global_body_linear_velocity_error_exp(
     env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
 ) -> torch.Tensor:

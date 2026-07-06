@@ -25,7 +25,7 @@ from isaaclab.utils import configclass
 from soccer.tasks.tracking import mdp
 from soccer.tasks.tracking.mdp import observations_anchor as obs_anchor
 from soccer.tasks.tracking.mdp.commands_dribble_cg import DribbleCGMotionCommand
-from .soccer_flat_env_cfg import G1FlatMotionEnvCfg, G1FlatProximityEnvCfg
+from .soccer_flat_env_cfg import G1FlatMotionPretrainEnvCfg, G1FlatProximityEnvCfg
 
 
 @configclass
@@ -598,15 +598,12 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
 
 
 @configclass
-class G1FlatMotionCGPretrainEnvCfg(G1FlatMotionEnvCfg):
-    """Stage-1 basic-motion pretraining env, obs-compatible with the CG dribble env.
+class G1FlatMotionCGPretrainEnvCfg(G1FlatMotionPretrainEnvCfg):
+    """Stage-1 CG motion pretrain (``Tracking-CG-G1-Motion-RNN-v0``).
 
-    Inherits pure-mimic Stage-1 settings from
-    :class:`~soccer.tasks.tracking.config.g1.soccer_flat_env_cfg.G1FlatMotionEnvCfg`
-    and only adds the ``anchor_ball_polar`` observation that
-    :class:`G1FlatCGDribblingEnvCfg` also uses. Keeping the observation layout
-    identical lets a checkpoint trained here be resumed by
-    ``Tracking-CG-G1-Dribbling-RNN-v0`` via the standard rsl_rl ``--resume`` flow.
+    Extends :class:`~soccer.tasks.tracking.config.g1.soccer_flat_env_cfg.G1FlatMotionPretrainEnvCfg`
+    with ``anchor_ball_polar`` so checkpoints resume into
+    :class:`G1FlatCGDribblingEnvCfg` via the standard rsl_rl ``--resume`` flow.
     """
 
     def __post_init__(self):
