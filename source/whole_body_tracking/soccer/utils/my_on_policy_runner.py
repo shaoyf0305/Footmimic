@@ -6,6 +6,7 @@ from rsl_rl.runners.on_policy_runner import OnPolicyRunner
 from isaaclab_rl.rsl_rl import export_policy_as_onnx
 
 import wandb
+from soccer.utils.checkpoint_loading import load_checkpoint_with_obs_expand
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
 
@@ -44,3 +45,7 @@ class MotionOnPolicyRunner(OnPolicyRunner):
             if self.registry_name is not None:
                 wandb.run.use_artifact(self.registry_name)
                 self.registry_name = None
+
+    def load(self, path: str, *args, **kwargs):
+        """Resume training; auto-expand obs when loading forward ckpt into follow/control."""
+        return load_checkpoint_with_obs_expand(self, path, **kwargs)

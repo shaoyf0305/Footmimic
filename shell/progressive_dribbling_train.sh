@@ -15,7 +15,13 @@
 #   - Default: Tracking-Flat-G1-Dribbling-RNN-v0
 #   - --cg:            Tracking-CG-G1-Dribbling-RNN-forward  (fixed +X velocity)
 #   - --cg-follow:     Tracking-CG-G1-Dribbling-RNN-follow  (demo root vel, per-frame)
-#   - --cg-control:    Tracking-CG-G1-Dribbling-RNN-control  (sampled vx/vy/wz, time-hold)
+#   - --cg-control:    Tracking-CG-G1-Dribbling-RNN-control  (sampled speed/heading/duration)
+#
+# Resume v1.20 forward checkpoint into follow/control (skip Stage 1):
+#   python scripts/rsl_rl/train_multi.py --task Tracking-CG-G1-Dribbling-RNN-follow \
+#     --motion_path "$MOTION_PATH" --load_run "<v1.20_run_dir>" --run_name v120_follow \
+#     --experiment_name g1_dribbling --resume True --num_envs 2000 --headless
+#   (same with ...-control). Obs expansion is automatic on --resume.
 #   - Heuristic-only CG (no labels): pass task explicitly, e.g.
 #       --task Tracking-CG-Heuristic-G1-Dribbling-RNN-v0
 #

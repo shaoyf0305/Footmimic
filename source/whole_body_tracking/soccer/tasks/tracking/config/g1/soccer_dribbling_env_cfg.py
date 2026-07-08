@@ -687,6 +687,8 @@ class G1FlatCGDribblingFollowEnvCfg(G1FlatCGDribblingEnvCfg):
     """CG Stage-2 **follow**: time-varying velocity command from demo root vel each frame.
 
     Pose/style from motion reference; speed + turn from ``anchor_lin_vel_w`` / ``anchor_ang_vel_w``.
+    Supports warm-start from ``Tracking-CG-G1-Dribbling-RNN-forward`` (v1.20) via obs expansion
+    on ``--resume`` (+6 policy/critic dims: lin/ang vel cmd).
 
     Gym id: ``Tracking-CG-G1-Dribbling-RNN-follow``.
     """
@@ -702,6 +704,8 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatCGDribblingEnvCfg):
 
     Reference motion teaches **pose / gait / CG touch timing** only. Locomotion is driven by
     a sampled ``(speed, heading, duration)`` command — not ``anchor_lin_vel_w`` from the clip.
+    Supports warm-start from ``Tracking-CG-G1-Dribbling-RNN-forward`` (v1.20) via obs expansion
+    on ``--resume`` (+9 policy/critic dims: lin/ang vel cmd + polar cmd).
 
     Gym id: ``Tracking-CG-G1-Dribbling-RNN-control``.
     """

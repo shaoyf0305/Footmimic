@@ -144,6 +144,7 @@ from rsl_rl.runners import OnPolicyRunner
 
 import soccer.tasks  # noqa: F401
 from soccer.tasks.tracking.mdp.rewards_dribbling import soccer_ball_contact_force_magnitude
+from soccer.utils.checkpoint_loading import load_checkpoint_with_obs_expand
 
 TRACKING_METRIC_KEYS = (
     "error_anchor_pos",
@@ -683,7 +684,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = _make_eval_env()
         base_env = _resolve_base_env(env)
         runner = OnPolicyRunner(env, agent_dict, log_dir=None, device=agent_cfg.device)
-        runner.load(resume_path)
+        load_checkpoint_with_obs_expand(runner, resume_path)
         policy = runner.get_inference_policy(device=base_env.device)
         _log("Policy loaded; starting per-reference rollouts.")
 
@@ -704,7 +705,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 env = _make_eval_env()
                 base_env = _resolve_base_env(env)
                 runner = OnPolicyRunner(env, agent_dict, log_dir=None, device=agent_cfg.device)
-                runner.load(resume_path)
+                load_checkpoint_with_obs_expand(runner, resume_path)
                 policy = runner.get_inference_policy(device=base_env.device)
 
             # Fresh RNN hidden state per rollout.
