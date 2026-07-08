@@ -85,6 +85,16 @@ gym.register(
     },
 )
 
+gym.register(
+    id="Tracking-Flat-G1-Motion-RNN-task",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_flat_env_cfg.G1FlatMotionTaskPretrainEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatRecurrentPPORunnerCfg",
+    },
+)
+
 
 ###  Stage 2
 gym.register(
@@ -190,24 +200,86 @@ gym.register(
 )
 
 gym.register(
-    id="Tracking-CG-G1-Dribbling-RNN-v0",
+    id="Tracking-CG-G1-Dribbling-RNN-forward",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatCGDribblingEnvCfg,
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatCGDribblingForwardEnvCfg,
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
     },
 )
 
-# CG progressive Stage 1: basic motion pretrain with the same anchor_ball_polar
-# observation as G1FlatCGDribblingEnvCfg, so its checkpoint can be resumed by
-# Tracking-CG-G1-Dribbling-RNN-v0.
+gym.register(
+    id="Tracking-CG-G1-Dribbling-RNN-follow",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatCGDribblingFollowEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-CG-G1-Dribbling-RNN-control",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatCGDribblingControlEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
+    },
+)
+
+# Alias for older scripts / checkpoints (same env as -forward).
+gym.register(
+    id="Tracking-CG-G1-Dribbling-RNN-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatCGDribblingForwardEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
+    },
+)
+
+# CG progressive Stage 1: obs-compatible with G1FlatCGDribblingEnvCfg (anchor_ball_polar).
+#   -task:  original Stage-1 (gym id ``...-v0``): forward/lateral/heading task terms
+#   -mimic: later split (gym id ``...-v1``): layered mimic-only pretrain
+gym.register(
+    id="Tracking-CG-G1-Motion-RNN-mimic",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatMotionCGPretrainMimicEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-CG-G1-Motion-RNN-task",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatMotionCGPretrainTaskEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
+    },
+)
+
+# Historical gym ids (same obs layout; reward recipe differs task vs mimic).
 gym.register(
     id="Tracking-CG-G1-Motion-RNN-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatMotionCGPretrainEnvCfg,
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatMotionCGPretrainTaskEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Tracking-CG-G1-Motion-RNN-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatMotionCGPretrainMimicEnvCfg,
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
     },
 )

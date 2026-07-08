@@ -201,6 +201,20 @@ def _motion_anchor_yaw_delta_quat(command: MotionCommand) -> torch.Tensor:
     )
 
 
+def _locomotion_lin_vel_command_w(command: MotionCommand) -> torch.Tensor:
+    if hasattr(command, "locomotion_lin_vel_command_w"):
+        return command.locomotion_lin_vel_command_w()
+    delta_ori_w = _motion_anchor_yaw_delta_quat(command)
+    return quat_apply(delta_ori_w, command.anchor_lin_vel_w)
+
+
+def _locomotion_ang_vel_command_w(command: MotionCommand) -> torch.Tensor:
+    if hasattr(command, "locomotion_ang_vel_command_w"):
+        return command.locomotion_ang_vel_command_w()
+    delta_ori_w = _motion_anchor_yaw_delta_quat(command)
+    return quat_apply(delta_ori_w, command.anchor_ang_vel_w)
+
+
 def motion_anchor_pos_z_error_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
     """Soft reward for matching demo anchor height (Z only)."""
     command: MotionCommand = env.command_manager.get_term(command_name)
@@ -209,11 +223,18 @@ def motion_anchor_pos_z_error_exp(env: ManagerBasedRLEnv, command_name: str, std
 
 
 def motion_anchor_lin_vel_tracking_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
-    """Match demo anchor linear velocity in the mimic yaw frame (includes slalom lateral)."""
+    """Match active locomotion linear-velocity command (reference or manual)."""
     command: MotionCommand = env.command_manager.get_term(command_name)
-    delta_ori_w = _motion_anchor_yaw_delta_quat(command)
-    ref_vel = quat_apply(delta_ori_w, command.anchor_lin_vel_w)
+    ref_vel = _locomotion_lin_vel_command_w(command)
     error = torch.sum(torch.square(ref_vel - command.robot_anchor_lin_vel_w), dim=-1)
+    return torch.exp(-error / max(std, 1e-6) ** 2)
+
+
+def motion_anchor_ang_vel_tracking_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
+    """Match active locomotion angular-velocity command (reference or manual)."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    ref_ang = _locomotion_ang_vel_command_w(command)
+    error = torch.sum(torch.square(ref_ang - command.robot_anchor_ang_vel_w), dim=-1)
     return torch.exp(-error / max(std, 1e-6) ** 2)
 
 

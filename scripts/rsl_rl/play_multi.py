@@ -55,6 +55,64 @@ parser.add_argument(
     default=False,
     help="Disable ball_lost / ee_body_pos etc. for full-clip playback (debug only).",
 )
+parser.add_argument(
+    "--locomotion_cmd_vx",
+    type=float,
+    default=None,
+    help="Manual locomotion cmd: task +X linear speed (m/s). Implies manual mode at play time.",
+)
+parser.add_argument(
+    "--locomotion_cmd_vy",
+    type=float,
+    default=None,
+    help="Manual locomotion cmd: task +Y lateral speed (m/s).",
+)
+parser.add_argument(
+    "--locomotion_cmd_vz",
+    type=float,
+    default=None,
+    help="Manual locomotion cmd: vertical linear speed (m/s).",
+)
+parser.add_argument(
+    "--locomotion_cmd_wx",
+    type=float,
+    default=None,
+    help="Manual locomotion cmd: roll rate (rad/s).",
+)
+parser.add_argument(
+    "--locomotion_cmd_wy",
+    type=float,
+    default=None,
+    help="Manual locomotion cmd: pitch rate (rad/s).",
+)
+parser.add_argument(
+    "--locomotion_cmd_speed",
+    type=float,
+    nargs="+",
+    default=None,
+    help="Polar cmd speed(s) in m/s. Multiple values = multi-segment sequence (with heading + duration).",
+)
+parser.add_argument(
+    "--locomotion_cmd_heading",
+    type=float,
+    nargs="+",
+    default=None,
+    help="Polar cmd heading(s) rad from task +X. Must match length of --locomotion_cmd_speed.",
+)
+parser.add_argument(
+    "--locomotion_cmd_duration",
+    type=float,
+    nargs="+",
+    default=None,
+    help="Hold duration(s) in seconds per segment. Must match length of --locomotion_cmd_speed.",
+)
+parser.add_argument(
+    "--locomotion_cmd_wz",
+    type=float,
+    nargs="*",
+    default=None,
+    help="Optional yaw rate (rad/s) per polar segment; one value broadcasts to all segments.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -237,6 +295,106 @@ def _resolve_base_env(env):
     return base
 
 
+def _apply_play_locomotion_command(env, args_cli) -> bool:
+    """Apply CLI locomotion: multi-segment polar sequence or legacy vx/vy/wz."""
+    polar_set = (
+        args_cli.locomotion_cmd_speed is not None
+        or args_cli.locomotion_cmd_heading is not None
+        or args_cli.locomotion_cmd_duration is not None
+    )
+    cartesian_fields = (
+        args_cli.locomotion_cmd_vx,
+        args_cli.locomotion_cmd_vy,
+        args_cli.locomotion_cmd_vz,
+        args_cli.locomotion_cmd_wx,
+        args_cli.locomotion_cmd_wy,
+    )
+    if not polar_set and all(v is None for v in cartesian_fields):
+        return False
+
+    base_env = _resolve_base_env(env)
+    cmd = base_env.command_manager.get_term("motion")
+    if not hasattr(cmd, "set_locomotion_manual_command"):
+        print("[WARN] Task motion command has no manual locomotion API; --locomotion_cmd_* ignored.")
+        return False
+
+    if polar_set and hasattr(cmd, "set_locomotion_polar_command"):
+        speeds = args_cli.locomotion_cmd_speed
+        headings = args_cli.locomotion_cmd_heading
+        durations = args_cli.locomotion_cmd_duration
+
+        if speeds is None:
+            speeds = [float(torch.norm(cmd.locomotion_manual_lin_vel[0, :2]).item())]
+        if headings is None:
+            headings = [
+                float(
+                    torch.atan2(cmd.locomotion_manual_lin_vel[0, 1], cmd.locomotion_manual_lin_vel[0, 0]).item()
+                )
+            ]
+        if durations is None:
+            durations = [2.0]
+
+        n = len(speeds)
+        if len(headings) != n or len(durations) != n:
+            raise ValueError(
+                f"--locomotion_cmd_speed ({n}), --locomotion_cmd_heading ({len(headings)}), "
+                f"and --locomotion_cmd_duration ({len(durations)}) must have the same length."
+            )
+
+        wz_raw = args_cli.locomotion_cmd_wz
+        if wz_raw is None or len(wz_raw) == 0:
+            wz_list = [0.0] * n
+        elif len(wz_raw) == 1:
+            wz_list = [float(wz_raw[0])] * n
+        elif len(wz_raw) == n:
+            wz_list = [float(w) for w in wz_raw]
+        else:
+            raise ValueError(
+                f"--locomotion_cmd_wz must be omitted, length 1 (broadcast), or match speed count ({n})."
+            )
+
+        if n > 1 and hasattr(cmd, "set_locomotion_polar_sequence"):
+            segments = [(speeds[i], headings[i], durations[i], wz_list[i]) for i in range(n)]
+            cmd.set_locomotion_polar_sequence(segments)
+            print(f"[INFO] Locomotion sequence ({n} segments):")
+            for i, (sp, hd, dur, wz) in enumerate(segments):
+                print(f"  [{i + 1}] speed={sp:.3f} m/s  heading={hd:.3f} rad  duration={dur:.2f} s  wz={wz:.3f}")
+            return True
+
+        cmd.set_locomotion_command_mode("manual")
+        cmd.set_locomotion_polar_command(
+            speed=speeds[0],
+            heading=headings[0],
+            duration_s=durations[0],
+            wz=wz_list[0],
+        )
+        print(
+            f"[INFO] Locomotion polar cmd: speed={speeds[0]:.3f} m/s  heading={headings[0]:.3f} rad  "
+            f"duration={durations[0]:.2f} s  wz={wz_list[0]:.3f} rad/s"
+        )
+        return True
+
+    cmd.set_locomotion_command_mode("manual")
+
+    cur_lin = cmd.locomotion_manual_lin_vel[0].tolist()
+    cur_ang = cmd.locomotion_manual_ang_vel[0].tolist()
+    lin = [
+        cur_lin[0] if args_cli.locomotion_cmd_vx is None else args_cli.locomotion_cmd_vx,
+        cur_lin[1] if args_cli.locomotion_cmd_vy is None else args_cli.locomotion_cmd_vy,
+        cur_lin[2] if args_cli.locomotion_cmd_vz is None else args_cli.locomotion_cmd_vz,
+    ]
+    ang = [
+        cur_ang[0] if args_cli.locomotion_cmd_wx is None else args_cli.locomotion_cmd_wx,
+        cur_ang[1] if args_cli.locomotion_cmd_wy is None else args_cli.locomotion_cmd_wy,
+        cur_ang[2],
+    ]
+    cmd.set_locomotion_manual_command(lin_vel=lin, ang_vel=ang)
+    print(
+        f"[INFO] Locomotion manual cmd: lin_vel={lin} m/s  ang_vel={ang} rad/s  (task +X/+Y/+Z)"
+    )
+    return True
+
+
 def _get_play_overlay(env) -> str:
     """HUD for dual-view video: speeds, distances, contact, and CG labels."""
     lines: list[str] = []
@@ -271,6 +429,21 @@ def _get_play_overlay(env) -> str:
         lines.append(
             f"Pelvis v_xy: {pelvis_sp_xy:.2f} m/s  |  Ball v_xy: {ball_sp_xy:.2f} m/s"
         )
+
+        if hasattr(cmd, "locomotion_lin_vel_command_w"):
+            mode = getattr(cmd, "locomotion_command_mode", "?")
+            lcmd = cmd.locomotion_lin_vel_command_w()[i].detach().cpu().numpy()
+            hold = int(cmd._locomotion_cmd_hold_steps_remaining[i].item()) if hasattr(cmd, "_locomotion_cmd_hold_steps_remaining") else -1
+            seg_note = ""
+            if hasattr(cmd, "_locomotion_segment_plans") and cmd._locomotion_segment_plans[i]:
+                seg_idx = int(cmd._locomotion_segment_idx[i].item()) + 1
+                seg_note = f"  seg {seg_idx}/{len(cmd._locomotion_segment_plans[i])}"
+            lines.append(
+                f"Loco ({mode}{seg_note}): spd={cmd.locomotion_cmd_speed[i].item():.2f} "
+                f"hdg={cmd.locomotion_cmd_heading[i].item():.2f} rad  hold={hold} steps  "
+                f"v=({lcmd[0]:.2f},{lcmd[1]:.2f})"
+            )
+
         lines.append(
             f"Pelvis-Ball: {pelvis_ball_xy:.2f} m (xy)  |  {pelvis_ball_3d:.2f} m (3D)"
         )
@@ -424,6 +597,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
+
+    _apply_play_locomotion_command(env, args_cli)
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)

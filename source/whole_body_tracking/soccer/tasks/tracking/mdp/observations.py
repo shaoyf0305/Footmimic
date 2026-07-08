@@ -8,6 +8,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms, quat_apply, quat_inv
 
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
+from soccer.tasks.tracking.mdp.task_frame import mimic_anchor_yaw_delta_quat
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -88,6 +89,55 @@ def motion_anchor_ang_vel(env: ManagerBasedEnv, command_name: str) -> torch.Tens
     command: MotionCommand = env.command_manager.get_term(command_name)
 
     return command.anchor_ang_vel_w.view(env.num_envs, -1)
+
+
+def _motion_anchor_yaw_delta_quat_obs(command: MotionCommand) -> torch.Tensor:
+    """Yaw delta for locomotion commands (matches mimic vel reward terms)."""
+    return mimic_anchor_yaw_delta_quat(
+        command.anchor_quat_w,
+        command.robot_anchor_quat_w,
+        align_task_frame=bool(getattr(command.cfg, "mimic_align_task_frame", False)),
+    )
+
+
+def motion_anchor_lin_vel_command(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Locomotion linear-velocity command exposed to the policy (reference or manual).
+
+    Task frame: +X forward, +Y lateral, +Z up (world-parallel on flat ground).
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    if hasattr(command, "locomotion_lin_vel_command_w"):
+        return command.locomotion_lin_vel_command_w().view(env.num_envs, -1)
+    delta_ori_w = _motion_anchor_yaw_delta_quat_obs(command)
+    ref_vel = quat_apply(delta_ori_w, command.anchor_lin_vel_w)
+    return ref_vel.view(env.num_envs, -1)
+
+
+def motion_anchor_ang_vel_command(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Locomotion angular-velocity command (reference or manual), rad/s in task frame."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    if hasattr(command, "locomotion_ang_vel_command_w"):
+        return command.locomotion_ang_vel_command_w().view(env.num_envs, -1)
+    delta_ori_w = _motion_anchor_yaw_delta_quat_obs(command)
+    ref_ang = quat_apply(delta_ori_w, command.anchor_ang_vel_w)
+    return ref_ang.view(env.num_envs, -1)
+
+
+def motion_locomotion_polar_command(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Active locomotion command as ``[speed, cos(heading), sin(heading)]`` (task +X heading).
+
+    Speed in m/s; heading radians from +X (0=forward, +pi/2=+Y). Independent of demo root vel
+    when ``locomotion_command_mode`` is ``resampled`` or ``manual``.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    if hasattr(command, "locomotion_cmd_speed") and hasattr(command, "locomotion_cmd_heading"):
+        speed = command.locomotion_cmd_speed
+        heading = command.locomotion_cmd_heading
+    else:
+        lin = command.locomotion_lin_vel_command_w() if hasattr(command, "locomotion_lin_vel_command_w") else command.anchor_lin_vel_w
+        speed = torch.norm(lin[:, :2], dim=-1)
+        heading = torch.atan2(lin[:, 1], lin[:, 0])
+    return torch.stack([speed, torch.cos(heading), torch.sin(heading)], dim=-1)
 
 
 def _get_motion_command(env: ManagerBasedEnv, command_name: str) -> MotionCommand:

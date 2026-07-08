@@ -25,7 +25,11 @@ from isaaclab.utils import configclass
 from soccer.tasks.tracking import mdp
 from soccer.tasks.tracking.mdp import observations_anchor as obs_anchor
 from soccer.tasks.tracking.mdp.commands_dribble_cg import DribbleCGMotionCommand
-from .soccer_flat_env_cfg import G1FlatMotionPretrainEnvCfg, G1FlatProximityEnvCfg
+from .soccer_flat_env_cfg import (
+    G1FlatMotionPretrainEnvCfg,
+    G1FlatMotionTaskPretrainEnvCfg,
+    G1FlatProximityEnvCfg,
+)
 
 
 @configclass
@@ -597,23 +601,154 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
         self.rewards.dribbling_rapid_retouch_penalty.params["min_steps_between_touches"] = 26
 
 
-@configclass
-class G1FlatMotionCGPretrainEnvCfg(G1FlatMotionPretrainEnvCfg):
-    """Stage-1 CG motion pretrain (``Tracking-CG-G1-Motion-RNN-v0``).
+def _apply_dribbling_locomotion_velocity_terms(cfg) -> None:
+    """Shared follow/control Stage-2: track active locomotion cmd + expose it in obs."""
+    cfg.rewards.forward_velocity.weight = 0.0
+    cfg.rewards.lateral_velocity_penalty.weight = 0.0
+    cfg.rewards.task_heading_alignment.weight = 0.0
+    if hasattr(cfg.rewards, "dribbling_face_ball"):
+        cfg.rewards.dribbling_face_ball.weight = 1.0
 
-    Extends :class:`~soccer.tasks.tracking.config.g1.soccer_flat_env_cfg.G1FlatMotionPretrainEnvCfg`
-    with ``anchor_ball_polar`` so checkpoints resume into
-    :class:`G1FlatCGDribblingEnvCfg` via the standard rsl_rl ``--resume`` flow.
+    cfg.rewards.motion_anchor_lin_vel = RewTerm(
+        func=mdp.motion_anchor_lin_vel_tracking_exp,
+        weight=2.5,
+        params={"command_name": "motion", "std": 1.0},
+    )
+    cfg.rewards.motion_anchor_ang_vel = RewTerm(
+        func=mdp.motion_anchor_ang_vel_tracking_exp,
+        weight=0.8,
+        params={"command_name": "motion", "std": 2.0},
+    )
+
+    if hasattr(cfg.rewards, "dribbling_velocity_tracking"):
+        cfg.rewards.dribbling_velocity_tracking.params["min_forward_dominance"] = 0.0
+
+    cfg.observations.policy.motion_anchor_lin_vel_cmd = ObsTerm(
+        func=mdp.motion_anchor_lin_vel_command,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.critic.motion_anchor_lin_vel_cmd = ObsTerm(
+        func=mdp.motion_anchor_lin_vel_command,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.policy.motion_anchor_ang_vel_cmd = ObsTerm(
+        func=mdp.motion_anchor_ang_vel_command,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.critic.motion_anchor_ang_vel_cmd = ObsTerm(
+        func=mdp.motion_anchor_ang_vel_command,
+        params={"command_name": "motion"},
+    )
+
+
+def _apply_dribbling_follow_velocity_terms(cfg) -> None:
+    """Follow: per-frame demo root velocity command (time-varying with the clip)."""
+    _apply_dribbling_locomotion_velocity_terms(cfg)
+    cfg.commands.motion.locomotion_command_mode = "reference"
+
+
+def _apply_dribbling_control_velocity_terms(cfg) -> None:
+    """Control: external speed/heading/duration — ref provides pose/gait/CG only, not root vel."""
+    _apply_dribbling_locomotion_velocity_terms(cfg)
+    cfg.commands.motion.locomotion_command_mode = "resampled"
+    cfg.commands.motion.locomotion_cmd_speed_range = (0.25, 0.65)
+    cfg.commands.motion.locomotion_cmd_heading_range = (-0.75, 0.75)
+    cfg.commands.motion.locomotion_cmd_duration_range = (1.5, 3.0)
+    cfg.commands.motion.locomotion_cmd_wz_range = (0.0, 0.0)
+
+    # Do not pull linear/angular vel from demo bodies — velocity comes from the command only.
+    if hasattr(cfg.rewards, "motion_body_lin_vel"):
+        cfg.rewards.motion_body_lin_vel.weight = 0.0
+    if hasattr(cfg.rewards, "motion_body_ang_vel"):
+        cfg.rewards.motion_body_ang_vel.weight = 0.0
+
+    cfg.observations.policy.motion_locomotion_polar_cmd = ObsTerm(
+        func=mdp.motion_locomotion_polar_command,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.critic.motion_locomotion_polar_cmd = ObsTerm(
+        func=mdp.motion_locomotion_polar_command,
+        params={"command_name": "motion"},
+    )
+
+
+@configclass
+class G1FlatCGDribblingForwardEnvCfg(G1FlatCGDribblingEnvCfg):
+    """CG Stage-2 with fixed task +X velocity / anti-lateral terms (baseline forward dribble).
+
+    Gym id: ``Tracking-CG-G1-Dribbling-RNN-forward`` (alias: ``...-v0``).
+    """
+
+    pass
+
+
+@configclass
+class G1FlatCGDribblingFollowEnvCfg(G1FlatCGDribblingEnvCfg):
+    """CG Stage-2 **follow**: time-varying velocity command from demo root vel each frame.
+
+    Pose/style from motion reference; speed + turn from ``anchor_lin_vel_w`` / ``anchor_ang_vel_w``.
+
+    Gym id: ``Tracking-CG-G1-Dribbling-RNN-follow``.
     """
 
     def __post_init__(self):
         super().__post_init__()
+        _apply_dribbling_follow_velocity_terms(self)
 
-        self.observations.policy.anchor_ball_polar = ObsTerm(
-            func=obs_anchor.anchor_ball_polar,
-            params={"command_name": "motion"},
-        )
-        self.observations.critic.anchor_ball_polar = ObsTerm(
-            func=obs_anchor.anchor_ball_polar,
-            params={"command_name": "motion"},
-        )
+
+@configclass
+class G1FlatCGDribblingControlEnvCfg(G1FlatCGDribblingEnvCfg):
+    """CG Stage-2 **control**: external speed + direction + duration (independent of demo root vel).
+
+    Reference motion teaches **pose / gait / CG touch timing** only. Locomotion is driven by
+    a sampled ``(speed, heading, duration)`` command — not ``anchor_lin_vel_w`` from the clip.
+
+    Gym id: ``Tracking-CG-G1-Dribbling-RNN-control``.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dribbling_control_velocity_terms(self)
+
+
+def _apply_cg_pretrain_obs(cfg) -> None:
+    """``anchor_ball_polar`` on policy/critic — required for CG Stage-2 resume."""
+    cfg.observations.policy.anchor_ball_polar = ObsTerm(
+        func=obs_anchor.anchor_ball_polar,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.critic.anchor_ball_polar = ObsTerm(
+        func=obs_anchor.anchor_ball_polar,
+        params={"command_name": "motion"},
+    )
+
+
+@configclass
+class G1FlatMotionCGPretrainMimicEnvCfg(G1FlatMotionPretrainEnvCfg):
+    """Stage-1 CG mimic pretrain (``Tracking-CG-G1-Motion-RNN-mimic`` / ``...-v1``).
+
+    Later split: layered mimic only (no forward/lateral/heading task terms).
+    Obs-compatible with :class:`G1FlatCGDribblingForwardEnvCfg` for rsl_rl ``--resume``
+    (follow/control Stage-2 add ``motion_anchor_*_vel_cmd`` obs on top).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_cg_pretrain_obs(self)
+
+
+@configclass
+class G1FlatMotionCGPretrainTaskEnvCfg(G1FlatMotionTaskPretrainEnvCfg):
+    """Stage-1 CG task pretrain (``Tracking-CG-G1-Motion-RNN-task`` / ``...-v0``).
+
+    Original CG Stage-1: upper-body mimic + ``forward_velocity`` /
+    ``lateral_velocity_penalty`` / ``task_heading_alignment``. Same obs layout as mimic.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_cg_pretrain_obs(self)
+
+
+# Backward-compatible alias (historical gym id ``Tracking-CG-G1-Motion-RNN-v0`` = task).
+G1FlatMotionCGPretrainEnvCfg = G1FlatMotionCGPretrainTaskEnvCfg

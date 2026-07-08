@@ -266,6 +266,84 @@ def _apply_stage1_mimic_pretrain(cfg) -> None:
         cfg.terminations.anchor_pos_z.params["threshold"] = 0.32
 
 
+# Upper-body mimic set used by the task-frame Stage-1 variant (v2 CG pretrain style).
+_STAGE1_TASK_UPPER_BODY_NAMES = [
+    "pelvis",
+    "torso_link",
+    "left_shoulder_roll_link",
+    "left_elbow_link",
+    "left_wrist_yaw_link",
+    "right_shoulder_roll_link",
+    "right_elbow_link",
+    "right_wrist_yaw_link",
+]
+
+
+def _apply_stage1_task_pretrain(cfg) -> None:
+    """Stage-1 pretrain with task +X velocity / heading (legacy v2 CG style).
+
+    Keeps default full-body ``motion_body_pos`` from :class:`TrackingEnvCfg`, restricts
+    orientation mimic to the upper body, and adds forward-speed / anti-lateral task terms
+    instead of layered leg-vs-arm mimic splits.
+    """
+    cfg.commands.motion.anchor_body_name = "pelvis"
+    cfg.commands.motion.mimic_align_task_frame = True
+
+    if hasattr(cfg.rewards, "motion_global_anchor_pos"):
+        cfg.rewards.motion_global_anchor_pos.weight = 0.0
+    if hasattr(cfg.rewards, "motion_global_anchor_ori"):
+        cfg.rewards.motion_global_anchor_ori.weight = 0.0
+
+    if hasattr(cfg.rewards, "motion_body_ori"):
+        cfg.rewards.motion_body_ori.params["body_names"] = _STAGE1_TASK_UPPER_BODY_NAMES
+
+    cfg.rewards.motion_body_lin_vel = RewTerm(
+        func=mdp.motion_relative_body_linear_velocity_error_exp,
+        weight=0.3,
+        params={
+            "command_name": "motion",
+            "std": 1.0,
+            "body_names": _STAGE1_TASK_UPPER_BODY_NAMES,
+        },
+    )
+    cfg.rewards.motion_body_ang_vel = RewTerm(
+        func=mdp.motion_relative_body_angular_velocity_error_exp,
+        weight=0.3,
+        params={
+            "command_name": "motion",
+            "std": 3.14,
+            "body_names": _STAGE1_TASK_UPPER_BODY_NAMES,
+        },
+    )
+
+    cfg.rewards.forward_velocity = RewTerm(
+        func=mdp.forward_velocity_reward,
+        weight=3.0,
+        params={
+            "command_name": "motion",
+            "target_speed": 0.8,
+            "std": 0.4,
+            "velocity_frame": "world",
+            "min_forward_dominance": 0.55,
+        },
+    )
+    cfg.rewards.lateral_velocity_penalty = RewTerm(
+        func=mdp.lateral_velocity_penalty,
+        weight=-0.8,
+        params={
+            "command_name": "motion",
+            "velocity_frame": "world",
+            "lateral_deadzone": 0.06,
+            "lateral_scale": 0.28,
+        },
+    )
+    cfg.rewards.task_heading_alignment = RewTerm(
+        func=mdp.task_heading_alignment_reward,
+        weight=1.5,
+        params={"command_name": "motion"},
+    )
+
+
 @configclass
 class G1FlatMotionEnvCfg(G1FlatEnvCfg):
     scene: G1FlatSoccerSceneCfg = G1FlatSoccerSceneCfg(num_envs=4096, env_spacing=2.5)
@@ -299,6 +377,19 @@ class G1FlatMotionPretrainEnvCfg(G1FlatMotionEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         _apply_stage1_mimic_pretrain(self)
+
+
+@configclass
+class G1FlatMotionTaskPretrainEnvCfg(G1FlatMotionEnvCfg):
+    """Stage-1 flat motion pretrain with task +X velocity / heading (``*-Motion-RNN-task``).
+
+    Sibling of :class:`G1FlatMotionPretrainEnvCfg`: same scene/commands, but uses
+    :func:`_apply_stage1_task_pretrain` instead of layered mimic-only rewards.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_stage1_task_pretrain(self)
 
 
 @configclass

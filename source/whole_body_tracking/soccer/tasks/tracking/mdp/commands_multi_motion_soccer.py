@@ -406,6 +406,34 @@ class MotionCommand(CommandTerm):
         
         self.curve_radius_offset = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self._steps_since_resample = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # Locomotion velocity command (task / world-parallel +X/+Y/+Z). ``reference`` reads
+        # demo anchor vel; ``manual`` uses ``locomotion_manual_*`` (editable at runtime).
+        self._locomotion_command_mode = str(getattr(cfg, "locomotion_command_mode", "reference"))
+        manual_lin = getattr(cfg, "locomotion_manual_lin_vel", (0.55, 0.0, 0.0))
+        manual_ang = getattr(cfg, "locomotion_manual_ang_vel", (0.0, 0.0, 0.0))
+        self.locomotion_manual_lin_vel = (
+            torch.tensor(manual_lin, device=self.device, dtype=torch.float32)
+            .unsqueeze(0)
+            .expand(self.num_envs, -1)
+            .clone()
+        )
+        self.locomotion_manual_ang_vel = (
+            torch.tensor(manual_ang, device=self.device, dtype=torch.float32)
+            .unsqueeze(0)
+            .expand(self.num_envs, -1)
+            .clone()
+        )
+        self._locomotion_cmd_steps_since_resample = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._locomotion_cmd_hold_steps_remaining = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.locomotion_cmd_speed = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.locomotion_cmd_heading = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._locomotion_segment_plans: list[list[tuple[float, float, float, float]]] = [[] for _ in range(self.num_envs)]
+        self._locomotion_segment_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._locomotion_segment_hold_last = True
+        if self._locomotion_command_mode == "resampled":
+            all_env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+            self._sample_locomotion_commands(all_env_ids)
         self._radius_offset_min = None
         self._radius_offset_max = None
         curve_cfg = cfg.curve_offset_range or {}
@@ -475,6 +503,261 @@ class MotionCommand(CommandTerm):
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
         return self.motion.body_ang_vel_w[self.motion_idx, self.time_steps, self.motion_anchor_body_index]
+
+    @property
+    def locomotion_command_mode(self) -> str:
+        return self._locomotion_command_mode
+
+    def set_locomotion_command_mode(self, mode: str) -> None:
+        if mode not in {"reference", "resampled", "manual"}:
+            raise ValueError(
+                f"locomotion_command_mode must be 'reference', 'resampled', or 'manual', got {mode!r}"
+            )
+        self._locomotion_command_mode = mode
+
+    def _env_step_dt_s(self) -> float:
+        return float(self._env.cfg.decimation) * float(self._env.cfg.sim.dt)
+
+    def _duration_s_to_steps(self, duration_s: float | torch.Tensor) -> torch.Tensor:
+        step_dt = max(self._env_step_dt_s(), 1e-6)
+        if isinstance(duration_s, torch.Tensor):
+            return torch.clamp((duration_s / step_dt).long(), min=1)
+        return torch.tensor(max(1, int(round(float(duration_s) / step_dt))), device=self.device, dtype=torch.long)
+
+    def _apply_polar_locomotion(
+        self,
+        env_ids: torch.Tensor,
+        speed: torch.Tensor,
+        heading: torch.Tensor,
+        wz: torch.Tensor,
+    ) -> None:
+        """Write speed/heading (task +X heading rad) into manual vel buffers."""
+        vx = speed * torch.cos(heading)
+        vy = speed * torch.sin(heading)
+        self.locomotion_manual_lin_vel[env_ids, 0] = vx
+        self.locomotion_manual_lin_vel[env_ids, 1] = vy
+        self.locomotion_manual_lin_vel[env_ids, 2] = 0.0
+        self.locomotion_manual_ang_vel[env_ids, 0] = 0.0
+        self.locomotion_manual_ang_vel[env_ids, 1] = 0.0
+        self.locomotion_manual_ang_vel[env_ids, 2] = wz
+        self.locomotion_cmd_speed[env_ids] = speed
+        self.locomotion_cmd_heading[env_ids] = heading
+
+    def _sample_locomotion_commands(self, env_ids: torch.Tensor | Sequence[int]) -> None:
+        """Sample speed + heading (+ optional wz) and a random hold duration per env."""
+        if isinstance(env_ids, Sequence) and not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.as_tensor(list(env_ids), dtype=torch.long, device=self.device)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        if env_ids.numel() == 0:
+            return
+
+        speed_range = getattr(self.cfg, "locomotion_cmd_speed_range", (0.25, 0.65))
+        heading_range = getattr(self.cfg, "locomotion_cmd_heading_range", (-0.75, 0.75))
+        duration_range = getattr(self.cfg, "locomotion_cmd_duration_range", (1.5, 3.0))
+        wz_range = getattr(self.cfg, "locomotion_cmd_wz_range", (0.0, 0.0))
+
+        n = env_ids.numel()
+        speed = sample_uniform(speed_range[0], speed_range[1], (n,), device=self.device)
+        heading = sample_uniform(heading_range[0], heading_range[1], (n,), device=self.device)
+        wz = sample_uniform(wz_range[0], wz_range[1], (n,), device=self.device)
+        duration_s = sample_uniform(duration_range[0], duration_range[1], (n,), device=self.device)
+
+        self._apply_polar_locomotion(env_ids, speed, heading, wz)
+        self._locomotion_cmd_hold_steps_remaining[env_ids] = self._duration_s_to_steps(duration_s)
+
+    def _apply_locomotion_segment(self, env_id: int, seg_idx: int) -> None:
+        plan = self._locomotion_segment_plans[env_id]
+        if not plan or seg_idx < 0 or seg_idx >= len(plan):
+            return
+        speed, heading, duration_s, wz = plan[seg_idx]
+        eid = torch.tensor([env_id], device=self.device, dtype=torch.long)
+        self._apply_polar_locomotion(
+            eid,
+            torch.tensor([speed], device=self.device, dtype=torch.float32),
+            torch.tensor([heading], device=self.device, dtype=torch.float32),
+            torch.tensor([wz], device=self.device, dtype=torch.float32),
+        )
+        self._locomotion_cmd_hold_steps_remaining[env_id] = int(self._duration_s_to_steps(duration_s).item())
+        self._locomotion_segment_idx[env_id] = seg_idx
+
+    def _advance_locomotion_segments(self, env_ids: torch.Tensor) -> None:
+        for env_id in env_ids.tolist():
+            plan = self._locomotion_segment_plans[env_id]
+            if not plan:
+                continue
+            cur = int(self._locomotion_segment_idx[env_id].item())
+            next_idx = cur + 1
+            if next_idx >= len(plan):
+                if self._locomotion_segment_hold_last:
+                    next_idx = len(plan) - 1
+                else:
+                    next_idx = 0
+            self._apply_locomotion_segment(env_id, next_idx)
+
+    def _update_locomotion_command_timers(self) -> None:
+        self._locomotion_cmd_hold_steps_remaining -= 1
+        due_mask = self._locomotion_cmd_hold_steps_remaining <= 0
+        if not torch.any(due_mask):
+            return
+        env_ids = due_mask.nonzero(as_tuple=False).flatten()
+
+        if self._locomotion_command_mode == "resampled":
+            self._sample_locomotion_commands(env_ids)
+            return
+
+        if self._locomotion_command_mode == "manual":
+            manual_advance = []
+            for env_id in env_ids.tolist():
+                if self._locomotion_segment_plans[env_id]:
+                    manual_advance.append(env_id)
+            if manual_advance:
+                self._advance_locomotion_segments(
+                    torch.tensor(manual_advance, device=self.device, dtype=torch.long)
+                )
+
+    def set_locomotion_polar_sequence(
+        self,
+        segments: Sequence[tuple[float, float, float] | tuple[float, float, float, float]],
+        env_ids: torch.Tensor | Sequence[int] | None = None,
+        hold_last: bool = True,
+    ) -> None:
+        """Queue piecewise polar commands: each segment is ``(speed, heading, duration_s[, wz])``.
+
+        Segments run in order; when ``hold_last=True`` the final segment repeats after the queue ends.
+        """
+        if env_ids is None:
+            env_id_list = list(range(self.num_envs))
+        elif isinstance(env_ids, torch.Tensor):
+            env_id_list = env_ids.tolist()
+        else:
+            env_id_list = list(env_ids)
+
+        normalized: list[tuple[float, float, float, float]] = []
+        for seg in segments:
+            if len(seg) == 3:
+                normalized.append((float(seg[0]), float(seg[1]), float(seg[2]), 0.0))
+            elif len(seg) >= 4:
+                normalized.append((float(seg[0]), float(seg[1]), float(seg[2]), float(seg[3])))
+            else:
+                raise ValueError(f"Each segment needs (speed, heading, duration_s[, wz]); got {seg!r}")
+
+        if not normalized:
+            raise ValueError("locomotion polar sequence must contain at least one segment")
+
+        self._locomotion_segment_hold_last = hold_last
+        for env_id in env_id_list:
+            self._locomotion_segment_plans[env_id] = normalized
+            self._apply_locomotion_segment(env_id, 0)
+        self.set_locomotion_command_mode("manual")
+
+    def _update_locomotion_command_resample(self) -> None:
+        """Backward-compatible alias."""
+        self._update_locomotion_command_timers()
+
+    def set_locomotion_polar_command(
+        self,
+        speed: float | torch.Tensor,
+        heading: float | torch.Tensor,
+        duration_s: float | torch.Tensor | None = None,
+        wz: float | torch.Tensor = 0.0,
+        env_ids: torch.Tensor | slice | None = None,
+    ) -> None:
+        """Set locomotion by speed (m/s) and heading (rad from task +X) for a hold duration.
+
+        ``heading=0`` → +X forward; ``heading=+pi/2`` → +Y lateral. Independent of demo root vel.
+        ``duration_s=None`` holds until the next manual/resample update.
+        """
+        if env_ids is None:
+            env_ids_t = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        elif isinstance(env_ids, slice):
+            env_ids_t = torch.arange(self.num_envs, device=self.device, dtype=torch.long)[env_ids]
+        else:
+            env_ids_t = env_ids.to(device=self.device, dtype=torch.long)
+
+        if env_ids_t.numel() == 0:
+            return
+
+        n = env_ids_t.numel()
+        if not isinstance(speed, torch.Tensor):
+            speed = torch.full((n,), float(speed), device=self.device, dtype=torch.float32)
+        if not isinstance(heading, torch.Tensor):
+            heading = torch.full((n,), float(heading), device=self.device, dtype=torch.float32)
+        if not isinstance(wz, torch.Tensor):
+            wz = torch.full((n,), float(wz), device=self.device, dtype=torch.float32)
+
+        self._apply_polar_locomotion(env_ids_t, speed, heading, wz)
+        if duration_s is not None:
+            if not isinstance(duration_s, torch.Tensor):
+                hold_steps = self._duration_s_to_steps(float(duration_s))
+                self._locomotion_cmd_hold_steps_remaining[env_ids_t] = hold_steps
+            else:
+                self._locomotion_cmd_hold_steps_remaining[env_ids_t] = self._duration_s_to_steps(duration_s)
+        for env_id in env_ids_t.tolist():
+            self._locomotion_segment_plans[env_id] = []
+
+    def set_locomotion_manual_command(
+        self,
+        lin_vel: Sequence[float] | torch.Tensor | None = None,
+        ang_vel: Sequence[float] | torch.Tensor | None = None,
+        env_ids: torch.Tensor | slice | None = None,
+    ) -> None:
+        """Set manual locomotion command in task frame (+X fwd, +Y lat, +Z up; rad/s for ang)."""
+        if env_ids is None:
+            env_ids = slice(None)
+
+        if lin_vel is not None:
+            if not isinstance(lin_vel, torch.Tensor):
+                lin_vel = torch.tensor(lin_vel, device=self.device, dtype=torch.float32)
+            if lin_vel.dim() == 1:
+                self.locomotion_manual_lin_vel[env_ids] = lin_vel.unsqueeze(0).expand(
+                    self.locomotion_manual_lin_vel[env_ids].shape[0], -1
+                )
+            else:
+                self.locomotion_manual_lin_vel[env_ids] = lin_vel
+            xy = self.locomotion_manual_lin_vel[env_ids, :2]
+            self.locomotion_cmd_speed[env_ids] = torch.norm(xy, dim=-1)
+            self.locomotion_cmd_heading[env_ids] = torch.atan2(xy[:, 1], xy[:, 0])
+
+        if ang_vel is not None:
+            if not isinstance(ang_vel, torch.Tensor):
+                ang_vel = torch.tensor(ang_vel, device=self.device, dtype=torch.float32)
+            if ang_vel.dim() == 1:
+                self.locomotion_manual_ang_vel[env_ids] = ang_vel.unsqueeze(0).expand(
+                    self.locomotion_manual_ang_vel[env_ids].shape[0], -1
+                )
+            else:
+                self.locomotion_manual_ang_vel[env_ids] = ang_vel
+
+    def reference_locomotion_lin_vel_w(self) -> torch.Tensor:
+        """Demo anchor linear velocity in task-aligned world frame (mimic yaw delta)."""
+        delta_ori_w = mimic_anchor_yaw_delta_quat(
+            self.anchor_quat_w,
+            self.robot_anchor_quat_w,
+            align_task_frame=bool(getattr(self.cfg, "mimic_align_task_frame", False)),
+        )
+        return quat_apply(delta_ori_w, self.anchor_lin_vel_w)
+
+    def reference_locomotion_ang_vel_w(self) -> torch.Tensor:
+        """Demo anchor angular velocity in task-aligned world frame."""
+        delta_ori_w = mimic_anchor_yaw_delta_quat(
+            self.anchor_quat_w,
+            self.robot_anchor_quat_w,
+            align_task_frame=bool(getattr(self.cfg, "mimic_align_task_frame", False)),
+        )
+        return quat_apply(delta_ori_w, self.anchor_ang_vel_w)
+
+    def locomotion_lin_vel_command_w(self) -> torch.Tensor:
+        """Active locomotion linear-velocity command (reference, resampled, or manual)."""
+        if self._locomotion_command_mode in {"manual", "resampled"}:
+            return self.locomotion_manual_lin_vel
+        return self.reference_locomotion_lin_vel_w()
+
+    def locomotion_ang_vel_command_w(self) -> torch.Tensor:
+        """Active locomotion angular-velocity command (reference, resampled, or manual)."""
+        if self._locomotion_command_mode in {"manual", "resampled"}:
+            return self.locomotion_manual_ang_vel
+        return self.reference_locomotion_ang_vel_w()
 
     @property
     def robot_joint_pos(self) -> torch.Tensor:
@@ -979,10 +1262,13 @@ class MotionCommand(CommandTerm):
         resample_flags[env_ids] = True
         setattr(self._env, flag_name, resample_flags)
         self._steps_since_resample[env_ids] = 0
+        if self._locomotion_command_mode == "resampled":
+            self._sample_locomotion_commands(env_ids)
 
     # Called every step in the IsaacLab main loop.
     def _update_command(self):
         self.kick_contact_tracker.begin_step(self)
+        self._update_locomotion_command_timers()
         self._steps_since_resample += 1
         # Increment time_steps; if a sequence ends, resample based on failure statistics.
         self.time_steps += 1
@@ -1086,6 +1372,29 @@ class MotionCommandCfg(CommandTermCfg):
     body_names: list[str] = MISSING
     # Strip demo anchor yaw to task +X for all mimic targets (pos/ori/vel), not only pelvis.
     mimic_align_task_frame: bool = False
+
+    # Locomotion velocity command for follow / control Stage-2 envs.
+    # ``reference``: per-frame demo anchor root vel (follow).
+    # ``resampled``: random speed/heading/duration — independent of demo root vel (control).
+    # ``manual``: fixed polar/xy command via ``set_locomotion_polar_command`` (play/debug).
+    locomotion_command_mode: str = "reference"
+    locomotion_manual_lin_vel: tuple[float, float, float] = (0.55, 0.0, 0.0)
+    locomotion_manual_ang_vel: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    locomotion_resample_interval_s: float = 2.0  # legacy fallback if duration_range unset
+    locomotion_cmd_speed_range: tuple[float, float] = (0.25, 0.65)
+    locomotion_cmd_heading_range: tuple[float, float] = (-0.75, 0.75)
+    locomotion_cmd_duration_range: tuple[float, float] = (1.5, 3.0)
+    locomotion_cmd_wz_range: tuple[float, float] = (0.0, 0.0)
+    locomotion_cmd_lin_vel_range: dict[str, tuple[float, float]] = {
+        "x": (0.25, 0.65),
+        "y": (-0.25, 0.25),
+        "z": (0.0, 0.0),
+    }
+    locomotion_cmd_ang_vel_range: dict[str, tuple[float, float]] = {
+        "roll": (0.0, 0.0),
+        "pitch": (0.0, 0.0),
+        "yaw": (-0.35, 0.35),
+    }
 
     # Soccer ball spawn on motion resample (Stage-1 motion pretrain).
     # ``clip_displacement`` (legacy): frame-0 anchor + ||last-first|| along +X (often ≈ clip end).
