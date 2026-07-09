@@ -611,17 +611,20 @@ def _apply_dribbling_locomotion_velocity_terms(cfg) -> None:
 
     cfg.rewards.motion_anchor_lin_vel = RewTerm(
         func=mdp.motion_anchor_lin_vel_tracking_exp,
-        weight=2.5,
-        params={"command_name": "motion", "std": 1.0},
+        weight=5.0,
+        params={"command_name": "motion", "std": 0.8},
     )
     cfg.rewards.motion_anchor_ang_vel = RewTerm(
         func=mdp.motion_anchor_ang_vel_tracking_exp,
-        weight=0.8,
+        weight=1.0,
         params={"command_name": "motion", "std": 2.0},
     )
 
+    # In follow/control the velocity target comes from motion_anchor_lin_vel (above).
+    # dribbling_velocity_tracking rewards task +X sync specifically, which conflicts
+    # with arbitrary-heading follow/control — zero it out.
     if hasattr(cfg.rewards, "dribbling_velocity_tracking"):
-        cfg.rewards.dribbling_velocity_tracking.params["min_forward_dominance"] = 0.0
+        cfg.rewards.dribbling_velocity_tracking.weight = 0.0
 
     cfg.observations.policy.motion_anchor_lin_vel_cmd = ObsTerm(
         func=mdp.motion_anchor_lin_vel_command,

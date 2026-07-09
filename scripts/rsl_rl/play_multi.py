@@ -434,15 +434,67 @@ def _get_play_overlay(env) -> str:
         if hasattr(cmd, "locomotion_lin_vel_command_w"):
             mode = getattr(cmd, "locomotion_command_mode", "?")
             lcmd = cmd.locomotion_lin_vel_command_w()[i].detach().cpu().numpy()
-            hold = int(cmd._locomotion_cmd_hold_steps_remaining[i].item()) if hasattr(cmd, "_locomotion_cmd_hold_steps_remaining") else -1
+
+            # heading / arrow helpers — ASCII-only for safe video font rendering
+            _ARROWS = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"]
+            def _arrow(rad):
+                idx = int(((-float(rad)) / (2 * np.pi) * 8 + 0.5) % 8)
+                return _ARROWS[idx]
+            def _deg(rad):
+                return float(rad) * 180.0 / np.pi
+
+            # For reference (follow) mode locomotion_cmd_speed/heading are not updated;
+            # derive them from the velocity command vector instead.
+            if mode == "reference":
+                cmd_spd = float(np.linalg.norm(lcmd[:2]))
+                cmd_hdg = float(np.arctan2(lcmd[1], lcmd[0]))
+            else:
+                cmd_spd = cmd.locomotion_cmd_speed[i].item()
+                cmd_hdg = cmd.locomotion_cmd_heading[i].item()
+
+            # tracking quality: cosine similarity of xy velocity vectors
+            cmd_xy = lcmd[:2]
+            rob_xy = pelvis_vel[:2]
+            cmd_norm = float(np.linalg.norm(cmd_xy))
+            rob_norm = float(np.linalg.norm(rob_xy))
+            if cmd_norm > 0.05 and rob_norm > 0.05:
+                cos_sim = float(np.dot(cmd_xy, rob_xy) / (cmd_norm * rob_norm))
+                track_str = f"  track={max(0.0, cos_sim) * 100:3.0f}%"
+            else:
+                track_str = "  track= n/a"
+
+            # segment / hold info
             seg_note = ""
             if hasattr(cmd, "_locomotion_segment_plans") and cmd._locomotion_segment_plans[i]:
                 seg_idx = int(cmd._locomotion_segment_idx[i].item()) + 1
-                seg_note = f"  seg {seg_idx}/{len(cmd._locomotion_segment_plans[i])}"
+                seg_note = f" seg {seg_idx}/{len(cmd._locomotion_segment_plans[i])}"
+            hold_str = ""
+            if mode != "reference" and hasattr(cmd, "_locomotion_cmd_hold_steps_remaining"):
+                hold_str = f"  hold={int(cmd._locomotion_cmd_hold_steps_remaining[i].item()):4d}"
+
+            # fixed-width columns so digits don't shift layout
+            # col widths: spd 4, deg 4, dir 2, track 7, hold 9
             lines.append(
-                f"Loco ({mode}{seg_note}): spd={cmd.locomotion_cmd_speed[i].item():.2f} "
-                f"hdg={cmd.locomotion_cmd_heading[i].item():.2f} rad  hold={hold} steps  "
-                f"v=({lcmd[0]:.2f},{lcmd[1]:.2f})"
+                f"Loco cmd ({mode}{seg_note}):"
+                f"  {cmd_spd:4.2f} m/s"
+                f"  {_deg(cmd_hdg):+4.0f}deg {_arrow(cmd_hdg):<2s}"
+                f"{track_str}"
+                f"{hold_str}"
+            )
+
+            # actual robot velocity vs command
+            actual_hdg = float(np.arctan2(pelvis_vel[1], pelvis_vel[0]))
+            hdg_err_deg = float((_deg(actual_hdg) - _deg(cmd_hdg) + 180) % 360 - 180)
+            vx_err = float(pelvis_vel[0] - lcmd[0])
+            vy_err = float(pelvis_vel[1] - lcmd[1])
+
+            lines.append(
+                f"Robot actual        :"
+                f"  {pelvis_sp_xy:4.2f} m/s"
+                f"  {_deg(actual_hdg):+4.0f}deg {_arrow(actual_hdg):<2s}"
+                f"  hdg_err={hdg_err_deg:+4.0f}deg"
+                f"  vx_err={vx_err:+5.2f}"
+                f"  vy_err={vy_err:+5.2f}"
             )
 
         lines.append(
