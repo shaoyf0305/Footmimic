@@ -414,6 +414,9 @@ def _get_play_overlay(env) -> str:
         t = int(cmd.time_steps[i].item())
         motion_len = int(cmd.motion_length[i].item())
         lines.append(f"Motion frame: {t}/{max(motion_len - 1, 0)}")
+        if hasattr(cmd, "style_phase_wrap_count"):
+            wraps = int(cmd.style_phase_wrap_count[i].item())
+            lines.append(f"Style wraps: {wraps}")
 
         pelvis_vel = cmd.robot_anchor_lin_vel_w[i].detach().cpu().numpy()
         pelvis_pos = cmd.robot_pelvis_pos_w[i].detach().cpu().numpy()
@@ -513,6 +516,16 @@ def _get_play_overlay(env) -> str:
             ankle_parts.append(f"demo={'YES' if ref_contact else 'NO'}")
             ankle_parts.append(match)
         lines.append(f"Ankle-Ball: {'  |  '.join(ankle_parts)}")
+
+        if hasattr(base_env, "_dribbling_no_contact_count"):
+            no_contact_count = float(base_env._dribbling_no_contact_count[i].item())
+            recovery = bool(base_env._dribbling_no_contact_recovery_active[i].item())
+            closing = float(base_env._dribbling_no_contact_closing_speed[i].item())
+            lines.append(
+                f"No-contact: count={no_contact_count:5.1f}"
+                f"  recovery={'YES' if recovery else 'NO'}"
+                f"  closing={closing:+.2f} m/s"
+            )
 
         _update_last_termination_reason(base_env, env_idx=i)
         lines.append(f"Last term: {_LAST_TERM_REASON}")

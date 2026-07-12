@@ -341,7 +341,12 @@ class MotionCommand(CommandTerm):
             else:
                 self.motion_kick_leg_names.append("unknown")
 
-        self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # ``time_steps`` remains a backwards-compatible alias used by legacy
+        # rewards, terminations, and HUD code for the current demo frame.  The
+        # episode clock stays in ``env.episode_length_buf``.
+        self.style_phase_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.time_steps = self.style_phase_steps
+        self.style_phase_wrap_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_length = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
@@ -425,6 +430,7 @@ class MotionCommand(CommandTerm):
             .clone()
         )
         self._locomotion_cmd_steps_since_resample = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._locomotion_cmd_steps_since_change = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._locomotion_cmd_hold_steps_remaining = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.locomotion_cmd_speed = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.locomotion_cmd_heading = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
@@ -466,43 +472,43 @@ class MotionCommand(CommandTerm):
 
     @property
     def joint_pos(self) -> torch.Tensor:
-        return self.motion.joint_pos[self.motion_idx, self.time_steps]
+        return self.motion.joint_pos[self.motion_idx, self.style_phase_steps]
 
     @property
     def joint_vel(self) -> torch.Tensor:
-        return self.motion.joint_vel[self.motion_idx, self.time_steps]
+        return self.motion.joint_vel[self.motion_idx, self.style_phase_steps]
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        return self.motion.body_pos_w[self.motion_idx, self.time_steps] + self._env.scene.env_origins[:, None, :]
+        return self.motion.body_pos_w[self.motion_idx, self.style_phase_steps] + self._env.scene.env_origins[:, None, :]
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        return self.motion.body_quat_w[self.motion_idx, self.time_steps]
+        return self.motion.body_quat_w[self.motion_idx, self.style_phase_steps]
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.body_lin_vel_w[self.motion_idx, self.time_steps]
+        return self.motion.body_lin_vel_w[self.motion_idx, self.style_phase_steps]
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.body_ang_vel_w[self.motion_idx, self.time_steps]
+        return self.motion.body_ang_vel_w[self.motion_idx, self.style_phase_steps]
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
-        return self.motion.body_pos_w[self.motion_idx, self.time_steps, self.motion_anchor_body_index] + self._env.scene.env_origins
+        return self.motion.body_pos_w[self.motion_idx, self.style_phase_steps, self.motion_anchor_body_index] + self._env.scene.env_origins
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
-        return self.motion.body_quat_w[self.motion_idx, self.time_steps, self.motion_anchor_body_index]
+        return self.motion.body_quat_w[self.motion_idx, self.style_phase_steps, self.motion_anchor_body_index]
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.body_lin_vel_w[self.motion_idx, self.time_steps, self.motion_anchor_body_index]
+        return self.motion.body_lin_vel_w[self.motion_idx, self.style_phase_steps, self.motion_anchor_body_index]
 
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.body_ang_vel_w[self.motion_idx, self.time_steps, self.motion_anchor_body_index]
+        return self.motion.body_ang_vel_w[self.motion_idx, self.style_phase_steps, self.motion_anchor_body_index]
 
     @property
     def locomotion_command_mode(self) -> str:
@@ -542,6 +548,7 @@ class MotionCommand(CommandTerm):
         self.locomotion_manual_ang_vel[env_ids, 2] = wz
         self.locomotion_cmd_speed[env_ids] = speed
         self.locomotion_cmd_heading[env_ids] = heading
+        self._locomotion_cmd_steps_since_change[env_ids] = 0
 
     def _sample_locomotion_commands(self, env_ids: torch.Tensor | Sequence[int]) -> None:
         """Sample speed + heading (+ optional wz) and a random hold duration per env."""
@@ -1024,6 +1031,16 @@ class MotionCommand(CommandTerm):
         self.motion_length[env_ids] = self.motion.file_lengths[self.motion_idx[env_ids]]
         self.time_steps[env_ids] = 0
 
+    def _wrap_style_phase(self, env_ids: Sequence[int] | torch.Tensor) -> None:
+        """Loop the current demo phase without resetting the task scene."""
+        ids = self._to_env_id_tensor(env_ids)
+        if ids.numel() == 0:
+            return
+        self.style_phase_steps[ids] = torch.remainder(
+            self.style_phase_steps[ids], self.motion_length[ids].clamp(min=1)
+        )
+        self.style_phase_wrap_count[ids] += 1
+
     def _spawn_ball_at_motion_start(self, env_ids: torch.Tensor) -> None:
         """Place the ball a fixed distance ahead of the clip's frame-0 anchor (+X)."""
         lateral_jitter = float(self._target_lateral_spawn_jitter)
@@ -1190,6 +1207,11 @@ class MotionCommand(CommandTerm):
         if env_ids.numel() == 0:
             return
 
+        # In style-looping control this method is reached only for a real
+        # episode reset, so restart the per-episode diagnostic counter.
+        if not bool(getattr(self.cfg, "motion_clip_end_resample", True)):
+            self.style_phase_wrap_count[env_ids] = 0
+
         self._sample_soccer_offset(env_ids)
         sampling_strategy = str(self.cfg.sampling_strategy).lower()
         if sampling_strategy == "adaptive":
@@ -1270,11 +1292,16 @@ class MotionCommand(CommandTerm):
         self.kick_contact_tracker.begin_step(self)
         self._update_locomotion_command_timers()
         self._steps_since_resample += 1
-        # Increment time_steps; if a sequence ends, resample based on failure statistics.
-        self.time_steps += 1
-        # env_ids = torch.where(self.time_steps >= self.motion.time_step_total)[0]
-        env_ids = torch.where(self.time_steps >= self.motion_length)[0]
-        self._resample_command(env_ids)
+        # Advance the demo style phase.  Legacy tasks retain full clip-end
+        # resampling; control opts into a style-only wrap so its task scene and
+        # external locomotion command remain continuous.
+        self.style_phase_steps += 1
+        self._locomotion_cmd_steps_since_change += 1
+        env_ids = torch.where(self.style_phase_steps >= self.motion_length)[0]
+        if bool(getattr(self.cfg, "motion_clip_end_resample", True)):
+            self._resample_command(env_ids)
+        else:
+            self._wrap_style_phase(env_ids)
         
         # Update target point each step using current ball position.
         self._update_target_points_from_sim()
@@ -1372,6 +1399,9 @@ class MotionCommandCfg(CommandTermCfg):
     body_names: list[str] = MISSING
     # Strip demo anchor yaw to task +X for all mimic targets (pos/ori/vel), not only pelvis.
     mimic_align_task_frame: bool = False
+    # Legacy behavior resamples the full command and scene when a demo clip
+    # ends.  Control disables this so the clip becomes a looping style phase.
+    motion_clip_end_resample: bool = True
 
     # Locomotion velocity command for follow / control Stage-2 envs.
     # ``reference``: per-frame demo anchor root vel (follow).

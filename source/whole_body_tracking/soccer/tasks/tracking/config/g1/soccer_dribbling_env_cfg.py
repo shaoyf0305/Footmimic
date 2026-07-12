@@ -654,10 +654,25 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     """Control: external speed/heading/duration — ref provides pose/gait/CG only, not root vel."""
     _apply_dribbling_locomotion_velocity_terms(cfg)
     cfg.commands.motion.locomotion_command_mode = "resampled"
+    # A control episode owns the task clock.  Demo time is a looping style
+    # phase and must not reset the robot, ball, or locomotion command.
+    cfg.commands.motion.motion_clip_end_resample = False
     cfg.commands.motion.locomotion_cmd_speed_range = (0.25, 0.65)
     cfg.commands.motion.locomotion_cmd_heading_range = (-0.75, 0.75)
     cfg.commands.motion.locomotion_cmd_duration_range = (1.5, 3.0)
     cfg.commands.motion.locomotion_cmd_wz_range = (0.0, 0.0)
+
+    # Keep the no-contact termination, but give an actual command-change
+    # recovery attempt a bounded extra window.  The counter only slows while
+    # the ball is recoverable and the pelvis is closing distance.
+    cfg.terminations.dribbling_no_contact.params.update(
+        {
+            "recovery_window_steps": 75,
+            "recovery_max_distance": 0.85,
+            "recovery_min_closing_speed": 0.05,
+            "recovery_counter_increment": 0.25,
+        }
+    )
 
     # Do not pull linear/angular vel from demo bodies — velocity comes from the command only.
     if hasattr(cfg.rewards, "motion_body_lin_vel"):
