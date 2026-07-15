@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_error_magnitude
+from isaaclab.utils.math import quat_apply, quat_error_magnitude
 
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
 from soccer.tasks.tracking.mdp.rewards import motion_relative_foot_position_error_exp
@@ -157,6 +157,36 @@ def _dribbling_recent_contact_gate(
     )
     setattr(env, buf_name, cnt)
     return (cnt <= int(recent_contact_window)).to(torch.float32)
+
+
+def _command_direction_xy(command: MotionCommand) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the active locomotion direction and speed in world XY.
+
+    The task frame is fixed to world ``+X`` for the legacy forward task.  In
+    control, however, the direction must come from the active external command
+    so that reward geometry rotates together with a requested heading.
+    """
+    if hasattr(command, "locomotion_lin_vel_command_w"):
+        command_vel_xy = command.locomotion_lin_vel_command_w()[:, :2]
+    else:
+        command_vel_xy = command.anchor_lin_vel_w[:, :2]
+    speed = torch.norm(command_vel_xy, dim=-1)
+    fallback = torch.zeros_like(command_vel_xy)
+    fallback[:, 0] = 1.0
+    direction = torch.where(
+        (speed > 1.0e-4).unsqueeze(-1),
+        command_vel_xy / speed.unsqueeze(-1).clamp(min=1.0e-4),
+        fallback,
+    )
+    return direction, speed
+
+
+def _command_frame_components(vector_xy: torch.Tensor, direction_xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project XY vectors onto the commanded forward and lateral axes."""
+    forward = torch.sum(vector_xy * direction_xy, dim=-1)
+    lateral_axis = torch.stack((-direction_xy[:, 1], direction_xy[:, 0]), dim=-1)
+    lateral = torch.sum(vector_xy * lateral_axis, dim=-1)
+    return forward, lateral
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +348,48 @@ def dribbling_dynamic_proximity(
         proximity_reward = proximity_reward * damp
 
     return proximity_reward
+
+
+def dribbling_command_dynamic_proximity(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    near_dist: float = 0.2,
+    far_dist: float = 0.5,
+    penalty_std: float = 0.15,
+    pelvis_speed_min: float = 0.0,
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    no_contact_zone_damping: float = 1.0,
+    zone_lateral_abs_max: float = 0.18,
+) -> torch.Tensor:
+    """Keep the ball in a safe corridor ahead along the requested heading."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+    direction_xy, _ = _command_direction_xy(command)
+    offset_xy = soccer_ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
+    forward_offset, lateral_offset = _command_frame_components(offset_xy, direction_xy)
+
+    forward_error = torch.where(
+        forward_offset < near_dist,
+        near_dist - forward_offset,
+        torch.where(forward_offset > far_dist, forward_offset - far_dist, torch.zeros_like(forward_offset)),
+    )
+    total_error = forward_error.square() + lateral_offset.square()
+    reward = torch.exp(-total_error / max(penalty_std, 1.0e-6) ** 2)
+
+    if pelvis_speed_min > 0.0:
+        pelvis_speed = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
+        reward = reward * torch.clamp(pelvis_speed / pelvis_speed_min, max=1.0)
+
+    if no_contact_zone_damping < 1.0 - 1.0e-6:
+        in_corridor = (
+            (forward_offset >= near_dist)
+            & (forward_offset <= far_dist)
+            & (torch.abs(lateral_offset) <= zone_lateral_abs_max)
+        )
+        no_touch = soccer_ball_contact_force_magnitude(env, ball_sensor_name) <= contact_force_threshold
+        reward = torch.where(in_corridor & no_touch, reward * no_contact_zone_damping, reward)
+    return reward
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +665,57 @@ def dribbling_ball_forward_progress_reward(
         )
 
     return base * gate
+
+
+def dribbling_command_ball_progress_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    min_forward_speed: float = 0.2,
+    command_speed_ratio: float = 0.50,
+    speed_scale: float = 0.25,
+    lateral_ratio_max: float = 0.70,
+    pelvis_speed_min: float = 0.06,
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 0.5,
+    require_recent_contact: bool = True,
+    recent_contact_window: int = 10,
+    cg_gated_contact: bool = False,
+) -> torch.Tensor:
+    """Reward recent-contact ball progress along the active command direction.
+
+    ``command_speed_ratio`` makes high-speed commands demand proportionally
+    faster ball progress without asking the ball to exactly match pelvis speed.
+    A lateral gate prevents a sideways kick from scoring as forward dribbling.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+    direction_xy, command_speed = _command_direction_xy(command)
+    forward_speed, lateral_speed = _command_frame_components(soccer_ball.data.root_lin_vel_w[:, :2], direction_xy)
+
+    required_speed = torch.maximum(
+        torch.full_like(command_speed, float(min_forward_speed)),
+        command_speed * float(command_speed_ratio),
+    )
+    progress = torch.clamp(
+        (forward_speed - required_speed) / max(speed_scale, 1.0e-6), min=0.0, max=1.0
+    )
+    lateral_ratio = torch.abs(lateral_speed) / forward_speed.clamp(min=1.0e-4)
+    direction_gate = torch.clamp(
+        1.0 - lateral_ratio / max(lateral_ratio_max, 1.0e-6), min=0.0, max=1.0
+    )
+
+    pelvis_speed = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
+    gate = torch.clamp(pelvis_speed / max(pelvis_speed_min, 1.0e-6), max=1.0)
+    if require_recent_contact:
+        gate = gate * _dribbling_recent_contact_gate(
+            env,
+            ball_sensor_name,
+            contact_force_threshold,
+            recent_contact_window,
+            command=command,
+            cg_gated=cg_gated_contact,
+        )
+    return progress * direction_gate * gate
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +1002,24 @@ def dribbling_ball_trapped_penalty(
     return (too_close | behind | popped).to(torch.float32)
 
 
+def dribbling_command_ball_trapped_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    min_forward_x: float = 0.18,
+    max_ball_height: float = 0.20,
+) -> torch.Tensor:
+    """Penalize a trapped ball using the active command axis, not world ``+X``."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+    direction_xy, _ = _command_direction_xy(command)
+    offset_xy = soccer_ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
+    forward_offset, _ = _command_frame_components(offset_xy, direction_xy)
+    too_close = forward_offset < min_forward_x
+    behind = forward_offset < 0.0
+    popped = soccer_ball.data.root_pos_w[:, 2] > max_ball_height
+    return (too_close | behind | popped).to(torch.float32)
+
+
 def dribbling_sustained_contact_penalty(
     env: ManagerBasedRLEnv,
     ball_sensor_name: str = "soccer_ball_contact",
@@ -1073,6 +1214,35 @@ def dribbling_chase_ball_reward(
     return speed_rew * active.to(torch.float32)
 
 
+def dribbling_command_chase_ball_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    min_ball_ahead: float = 0.25,
+    max_chase_xy_dist: float = 1.1,
+    pelvis_forward_speed_min: float = 0.22,
+    forward_speed_scale: float = 0.45,
+) -> torch.Tensor:
+    """Reward closing on a nearby ball ahead along the active command direction."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+    direction_xy, _ = _command_direction_xy(command)
+    offset_xy = soccer_ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
+    ball_ahead, _ = _command_frame_components(offset_xy, direction_xy)
+    dist_xy = torch.norm(offset_xy, dim=-1)
+    pelvis_forward, _ = _command_frame_components(command.robot_anchor_lin_vel_w[:, :2], direction_xy)
+
+    speed_reward = torch.clamp(
+        (pelvis_forward - pelvis_forward_speed_min) / max(forward_speed_scale, 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
+    active = no_ball & (ball_ahead >= min_ball_ahead) & (dist_xy <= max_chase_xy_dist)
+    return speed_reward * active.to(torch.float32)
+
+
 def dribbling_rapid_retouch_penalty(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
@@ -1156,3 +1326,29 @@ def dribbling_face_ball(
     )
     pelvis_forward = task_pelvis_heading_cos_world_x(pelvis_quat_w).clamp(min=0.0, max=1.0)
     return ball_ahead * pelvis_forward
+
+
+def dribbling_command_face_ball(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    min_distance: float = 0.05,
+) -> torch.Tensor:
+    """Reward ball placement and pelvis yaw aligned with the requested heading."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+    direction_xy, _ = _command_direction_xy(command)
+    offset_xy = soccer_ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
+    ball_forward, _ = _command_frame_components(offset_xy, direction_xy)
+    distance = torch.norm(offset_xy, dim=-1)
+    ball_ahead = torch.where(
+        distance > float(min_distance),
+        (ball_forward / distance.clamp(min=1.0e-4)).clamp(min=0.0, max=1.0),
+        torch.ones_like(distance),
+    )
+
+    local_forward = torch.zeros(env.num_envs, 3, device=env.device, dtype=offset_xy.dtype)
+    local_forward[:, 0] = 1.0
+    pelvis_forward_xy = quat_apply(command.robot_pelvis_quat_w, local_forward)[:, :2]
+    pelvis_forward_xy = pelvis_forward_xy / torch.norm(pelvis_forward_xy, dim=-1, keepdim=True).clamp(min=1.0e-4)
+    heading_alignment = torch.sum(pelvis_forward_xy * direction_xy, dim=-1).clamp(min=0.0, max=1.0)
+    return ball_ahead * heading_alignment

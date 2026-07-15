@@ -657,10 +657,49 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     # A control episode owns the task clock.  Demo time is a looping style
     # phase and must not reset the robot, ball, or locomotion command.
     cfg.commands.motion.motion_clip_end_resample = False
-    cfg.commands.motion.locomotion_cmd_speed_range = (0.25, 0.65)
+    # 1.5 m/s is a normal control target, not an out-of-distribution play-only
+    # command.  Long holds force the policy to keep control across turns.
+    cfg.commands.motion.locomotion_cmd_speed_range = (0.40, 1.50)
     cfg.commands.motion.locomotion_cmd_heading_range = (-0.75, 0.75)
-    cfg.commands.motion.locomotion_cmd_duration_range = (1.5, 3.0)
+    cfg.commands.motion.locomotion_cmd_duration_range = (3.0, 6.0)
     cfg.commands.motion.locomotion_cmd_wz_range = (0.0, 0.0)
+
+    # A turn or recovery necessarily departs from the instantaneous demo pose.
+    # Keep these references as soft rewards, but never end a control episode
+    # because of a style-tracking height/orientation error.  Real falls and
+    # ball-task failures remain active terminations.
+    for term_name in ("ee_body_pos", "anchor_pos_z", "anchor_ori"):
+        if hasattr(cfg.terminations, term_name):
+            setattr(cfg.terminations, term_name, None)
+
+    # Rotate every forward-geometry dribbling term into the active command
+    # frame.  The legacy functions keep their fixed +X semantics for forward
+    # and follow; only control receives these replacements.
+    cfg.rewards.dribbling_dynamic_proximity.func = mdp.dribbling_command_dynamic_proximity
+    cfg.rewards.dribbling_ball_forward_progress.func = mdp.dribbling_command_ball_progress_reward
+    cfg.rewards.dribbling_ball_trapped_penalty.func = mdp.dribbling_command_ball_trapped_penalty
+    cfg.rewards.dribbling_chase_ball.func = mdp.dribbling_command_chase_ball_reward
+    cfg.rewards.dribbling_face_ball.func = mdp.dribbling_command_face_ball
+    cfg.rewards.dribbling_ball_forward_progress.params.update(
+        {
+            "command_speed_ratio": 0.50,
+            "lateral_ratio_max": 0.70,
+        }
+    )
+    # The legacy legal-touch gate checks pelvis heading against world +X.
+    # Command-frame face-ball shaping above now supplies the heading signal.
+    cfg.rewards.dribbling_legal_foot_touch.params["min_pelvis_heading"] = 0.0
+
+    # CG labels remain a weak cadence/style prior only.  Their per-frame touch
+    # timing must not compete with a command-triggered turn or ball recovery.
+    cfg.rewards.dribbling_legal_foot_touch.params["cg_gated"] = False
+    cfg.rewards.dribbling_rapid_retouch_penalty.params["cg_gated"] = False
+    if hasattr(cfg.rewards, "dribbling_cg_contact_consistency"):
+        cfg.rewards.dribbling_cg_contact_consistency.weight = 1.0
+    if hasattr(cfg.rewards, "dribbling_cg_premature_contact"):
+        cfg.rewards.dribbling_cg_premature_contact.weight = 0.0
+    if hasattr(cfg.rewards, "dribbling_cg_foot_consistency"):
+        cfg.rewards.dribbling_cg_foot_consistency.weight = 0.5
 
     # Keep the no-contact termination, but give an actual command-change
     # recovery attempt a bounded extra window.  The counter only slows while

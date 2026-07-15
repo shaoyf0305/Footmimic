@@ -113,6 +113,12 @@ parser.add_argument(
     default=None,
     help="Optional yaw rate (rad/s) per polar segment; one value broadcasts to all segments.",
 )
+parser.add_argument(
+    "--locomotion_cmd_loop",
+    action="store_true",
+    default=False,
+    help="Loop a multi-segment polar command from the final segment back to the first.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -356,10 +362,12 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
 
         if n > 1 and hasattr(cmd, "set_locomotion_polar_sequence"):
             segments = [(speeds[i], headings[i], durations[i], wz_list[i]) for i in range(n)]
-            cmd.set_locomotion_polar_sequence(segments)
+            cmd.set_locomotion_polar_sequence(segments, hold_last=not args_cli.locomotion_cmd_loop)
             print(f"[INFO] Locomotion sequence ({n} segments):")
             for i, (sp, hd, dur, wz) in enumerate(segments):
                 print(f"  [{i + 1}] speed={sp:.3f} m/s  heading={hd:.3f} rad  duration={dur:.2f} s  wz={wz:.3f}")
+            if args_cli.locomotion_cmd_loop:
+                print("  looping: final segment -> first segment")
             return True
 
         cmd.set_locomotion_command_mode("manual")
