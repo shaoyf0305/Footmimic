@@ -32,6 +32,20 @@ from .soccer_flat_env_cfg import (
 )
 
 
+# Control-only regularization.  The play ablation showed that wrists need a
+# strong reference prior, elbows a weaker one, and shoulders should remain
+# free for balance recovery during a turn.
+_CONTROL_WRIST_JOINT_NAMES = [
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+]
+_CONTROL_ELBOW_JOINT_NAMES = ["left_elbow_joint", "right_elbow_joint"]
+
+
 @configclass
 class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
     """Flat-ground dribbling environment."""
@@ -732,6 +746,51 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         cfg.rewards.motion_body_pos.weight = 0.45
     if hasattr(cfg.rewards, "motion_body_ori"):
         cfg.rewards.motion_body_ori.weight = 0.35
+
+    # Direct wrist/elbow reference terms replace the ineffective indirect
+    # correction from whole-body orientation mimic.  The wrist term is tighter;
+    # elbows retain more freedom because the play ablation showed they help
+    # compensate for turn dynamics.  Keep shoulders unconstrained here: a
+    # full-upper-body clamp caused repeated no-contact failures.
+    cfg.rewards.control_wrist_joint_ref = RewTerm(
+        func=mdp.motion_joint_position_error_exp,
+        weight=0.60,
+        params={
+            "command_name": "motion",
+            "joint_names": _CONTROL_WRIST_JOINT_NAMES,
+            "std": 0.40,
+        },
+    )
+    cfg.rewards.control_elbow_joint_ref = RewTerm(
+        func=mdp.motion_joint_position_error_exp,
+        weight=0.20,
+        params={
+            "command_name": "motion",
+            "joint_names": _CONTROL_ELBOW_JOINT_NAMES,
+            "std": 0.55,
+        },
+    )
+    # Position tracking alone can still permit large, saturated PD targets.
+    # Penalize target/reference error softly and with a bounded logarithm so a
+    # resumed checkpoint receives a finite correction rather than a hard clamp.
+    cfg.rewards.control_wrist_target_ref = RewTerm(
+        func=mdp.motion_joint_target_reference_log_penalty,
+        weight=-0.08,
+        params={
+            "command_name": "motion",
+            "joint_names": _CONTROL_WRIST_JOINT_NAMES,
+            "target_std": 0.40,
+        },
+    )
+    cfg.rewards.control_elbow_target_ref = RewTerm(
+        func=mdp.motion_joint_target_reference_log_penalty,
+        weight=-0.02,
+        params={
+            "command_name": "motion",
+            "joint_names": _CONTROL_ELBOW_JOINT_NAMES,
+            "target_std": 0.55,
+        },
+    )
 
     cfg.observations.policy.motion_locomotion_polar_cmd = ObsTerm(
         func=mdp.motion_locomotion_polar_command,

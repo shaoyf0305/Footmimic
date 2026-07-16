@@ -53,6 +53,122 @@ def action_rate_l2_clip(env: ManagerBasedRLEnv) -> torch.Tensor:
     return reward.clamp(max=100.0)
 
 
+def _joint_position_action_targets(
+    env: ManagerBasedRLEnv,
+    command: MotionCommand,
+    joint_names: list[str],
+    action_term_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return position-action targets and motion-reference positions for selected joints.
+
+    ``JointPositionAction`` receives normalized policy actions but applies joint
+    targets after its internal scale/offset transform.  Rewarding the transformed
+    targets, rather than raw actions, keeps this term valid if action scaling is
+    changed later.
+    """
+    robot = command.robot
+    action_term = env.action_manager.get_term(action_term_name)
+    cache_name = "_motion_reference_target_joint_cache"
+    target_cache = getattr(action_term, cache_name, {})
+    cache_key = tuple(joint_names)
+    cached_indices = target_cache.get(cache_key)
+    if cached_indices is None:
+        robot_joint_ids, found_names = robot.find_joints(joint_names, preserve_order=True)
+        if len(robot_joint_ids) != len(joint_names):
+            raise ValueError(
+                f"Could not resolve all requested joints: expected {joint_names}, found {found_names}."
+            )
+        action_joint_ids = getattr(action_term, "_joint_ids", None)
+        if action_joint_ids is None:
+            action_joint_ids = getattr(action_term, "joint_ids", None)
+        if action_joint_ids is None:
+            raise RuntimeError(f"Action term '{action_term_name}' does not expose controlled joint ids.")
+        if isinstance(action_joint_ids, slice):
+            action_joint_ids = torch.arange(robot.num_joints, device=env.device)
+        action_joint_ids = torch.as_tensor(action_joint_ids, dtype=torch.long, device=env.device)
+        robot_to_action = {
+            int(robot_id): action_id for action_id, robot_id in enumerate(action_joint_ids.tolist())
+        }
+        try:
+            action_ids = torch.as_tensor(
+                [robot_to_action[int(robot_id)] for robot_id in robot_joint_ids],
+                dtype=torch.long,
+                device=env.device,
+            )
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Action term '{action_term_name}' does not control robot joint id {exc.args[0]}."
+            ) from exc
+        cached_indices = (
+            torch.as_tensor(robot_joint_ids, dtype=torch.long, device=env.device),
+            action_ids,
+        )
+        target_cache[cache_key] = cached_indices
+        setattr(action_term, cache_name, target_cache)
+    robot_joint_ids, action_ids = cached_indices
+
+    raw_actions = getattr(action_term, "raw_actions", None)
+    if raw_actions is None:
+        raw_actions = getattr(action_term, "_raw_actions", None)
+    scale = getattr(action_term, "_scale", None)
+    offset = getattr(action_term, "_offset", None)
+    if raw_actions is None or scale is None or offset is None:
+        raise RuntimeError(f"Action term '{action_term_name}' does not expose raw actions, scale, and offset.")
+
+    targets = raw_actions[:, action_ids] * scale[:, action_ids] + offset[:, action_ids]
+    reference = command.joint_pos[:, robot_joint_ids]
+    return targets, reference
+
+
+def motion_joint_position_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    joint_names: list[str],
+    std: float,
+) -> torch.Tensor:
+    """Reward selected robot joints for staying near the current motion reference.
+
+    This is intentionally joint-level.  The existing body-orientation term is
+    averaged across torso, legs, arms, and wrists, so a wrist-only exploit can
+    receive almost no corrective signal in the control task.
+    """
+    if std <= 0.0:
+        raise ValueError("std must be positive.")
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    robot_joint_ids, found_names = command.robot.find_joints(joint_names, preserve_order=True)
+    if len(robot_joint_ids) != len(joint_names):
+        raise ValueError(
+            f"Could not resolve all requested joints: expected {joint_names}, found {found_names}."
+        )
+    joint_error = command.robot.data.joint_pos[:, robot_joint_ids] - command.joint_pos[:, robot_joint_ids]
+    error = torch.mean(torch.square(joint_error), dim=1)
+    return torch.exp(-error / std**2)
+
+
+def motion_joint_target_reference_log_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    joint_names: list[str],
+    target_std: float,
+    action_term_name: str = "joint_pos",
+    max_penalty: float = 10.0,
+) -> torch.Tensor:
+    """Penalize persistent selected-joint position targets away from reference.
+
+    The logarithmic form is quadratic near the reference and bounded for the
+    current checkpoint's saturated actions.  It therefore discourages sustained
+    wrist/elbow target exploits without destabilizing the first resumed updates.
+    """
+    if target_std <= 0.0:
+        raise ValueError("target_std must be positive.")
+    if max_penalty <= 0.0:
+        raise ValueError("max_penalty must be positive.")
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    targets, reference = _joint_position_action_targets(env, command, joint_names, action_term_name)
+    normalized_sq_error = torch.square((targets - reference) / target_std)
+    return torch.mean(torch.log1p(normalized_sq_error), dim=1).clamp(max=max_penalty)
+
+
 def forward_velocity_reward(
     env: ManagerBasedRLEnv,
     target_speed: float = 0.8,

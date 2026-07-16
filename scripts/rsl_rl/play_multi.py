@@ -147,6 +147,16 @@ parser.add_argument(
         "from the current reference. Omit to use the checkpoint actions unchanged."
     ),
 )
+parser.add_argument(
+    "--upper_body_constraint_group",
+    type=str,
+    choices=["wrists", "wrists_elbows", "upper_body"],
+    default="upper_body",
+    help=(
+        "Joints affected by --upper_body_reference_margin: wrists; wrists_elbows; or all "
+        "shoulders, elbows, and wrists (default)."
+    ),
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -317,6 +327,28 @@ _ARM_DIAGNOSTIC_JOINT_NAMES = [
     "right_wrist_yaw_joint",
 ]
 
+_UPPER_BODY_CONSTRAINT_JOINT_GROUPS = {
+    "wrists": [
+        "left_wrist_roll_joint",
+        "left_wrist_pitch_joint",
+        "left_wrist_yaw_joint",
+        "right_wrist_roll_joint",
+        "right_wrist_pitch_joint",
+        "right_wrist_yaw_joint",
+    ],
+    "wrists_elbows": [
+        "left_elbow_joint",
+        "right_elbow_joint",
+        "left_wrist_roll_joint",
+        "left_wrist_pitch_joint",
+        "left_wrist_yaw_joint",
+        "right_wrist_roll_joint",
+        "right_wrist_pitch_joint",
+        "right_wrist_yaw_joint",
+    ],
+    "upper_body": _ARM_DIAGNOSTIC_JOINT_NAMES,
+}
+
 _FOOT_DIAGNOSTIC_BODY_NAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
 
@@ -337,6 +369,32 @@ def _update_last_termination_reason(base_env, env_idx: int = 0) -> None:
             continue
     if active:
         _LAST_TERM_REASON = ", ".join(active)
+
+
+def _active_failure_termination_reason(base_env, env_idx: int = 0) -> str:
+    """Return all currently active non-timeout termination terms for one env."""
+    tm = getattr(base_env, "termination_manager", None)
+    if tm is None:
+        return ""
+    active: list[str] = []
+    for name in tm.active_terms:
+        try:
+            if tm.get_term_cfg(name).time_out:
+                continue
+            if bool(tm.get_term(name)[env_idx].item()):
+                active.append(name)
+        except Exception:
+            continue
+    return ", ".join(active)
+
+
+def _reward_term_values(base_env, env_idx: int = 0) -> np.ndarray:
+    """Read the reward manager's per-term contribution for the most recent step."""
+    reward_manager = getattr(base_env, "reward_manager", None)
+    values = getattr(reward_manager, "_step_reward", None)
+    if values is None:
+        return np.empty(0, dtype=np.float32)
+    return values[env_idx].detach().cpu().numpy().copy()
 
 
 def _resolve_base_env(env):
@@ -362,7 +420,7 @@ def _get_joint_position_action_term(base_env):
     return action_term, torch.as_tensor(action_joint_ids, dtype=torch.long, device=base_env.device)
 
 
-def _create_upper_body_reference_constraint(env, margin: float) -> dict:
+def _create_upper_body_reference_constraint(env, margin: float, group: str) -> dict:
     """Prepare a play-only joint-target clamp around the current arm reference."""
     if margin < 0.0:
         raise ValueError("--upper_body_reference_margin must be non-negative.")
@@ -371,9 +429,10 @@ def _create_upper_body_reference_constraint(env, margin: float) -> dict:
     command = base_env.command_manager.get_term("motion")
     robot = base_env.scene[command.cfg.asset_name]
     action_term, action_joint_ids = _get_joint_position_action_term(base_env)
-    robot_joint_ids, found_names = robot.find_joints(_ARM_DIAGNOSTIC_JOINT_NAMES, preserve_order=True)
-    if len(robot_joint_ids) != len(_ARM_DIAGNOSTIC_JOINT_NAMES):
-        raise RuntimeError(f"Could not resolve all upper-body joints; found {found_names}.")
+    joint_names = _UPPER_BODY_CONSTRAINT_JOINT_GROUPS[group]
+    robot_joint_ids, found_names = robot.find_joints(joint_names, preserve_order=True)
+    if len(robot_joint_ids) != len(joint_names):
+        raise RuntimeError(f"Could not resolve all {group} constraint joints; found {found_names}.")
 
     robot_to_action = {int(robot_id): action_id for action_id, robot_id in enumerate(action_joint_ids.tolist())}
     try:
@@ -387,6 +446,8 @@ def _create_upper_body_reference_constraint(env, margin: float) -> dict:
         raise RuntimeError("The joint_pos action term does not expose scale/offset required for target clamping.")
 
     return {
+        "group": group,
+        "joint_names": np.asarray(joint_names),
         "margin": float(margin),
         "robot_joint_ids": torch.as_tensor(robot_joint_ids, dtype=torch.long, device=base_env.device),
         "action_ids": torch.as_tensor(action_ids, dtype=torch.long, device=base_env.device),
@@ -422,7 +483,7 @@ def _constrain_upper_body_actions(env, actions: torch.Tensor, constraint: dict) 
     return constrained_actions
 
 
-def _create_arm_diagnostic(env, log_dir: str, stride: int) -> dict:
+def _create_arm_diagnostic(env, log_dir: str, stride: int, constraint: dict | None = None) -> dict:
     """Prepare a compact, per-step arm-control trace for one playback env."""
     if stride <= 0:
         raise ValueError("--arm_diagnostic_stride must be positive.")
@@ -442,11 +503,17 @@ def _create_arm_diagnostic(env, log_dir: str, stride: int) -> dict:
     output_path = os.path.join(
         output_dir, f"arm_diagnostic_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.npz"
     )
+    reward_manager = getattr(base_env, "reward_manager", None)
+    reward_term_names = np.asarray(getattr(reward_manager, "_term_names", []))
     return {
         "path": output_path,
         "stride": int(stride),
         "joint_ids": torch.as_tensor(joint_ids, dtype=torch.long, device=base_env.device),
         "joint_names": np.asarray(_ARM_DIAGNOSTIC_JOINT_NAMES),
+        "reward_term_names": reward_term_names,
+        "constraint_group": "none" if constraint is None else constraint["group"],
+        "constraint_margin": np.nan if constraint is None else float(constraint["margin"]),
+        "constraint_joint_names": np.asarray([]) if constraint is None else constraint["joint_names"],
         "step": [],
         "motion_idx": [],
         "style_phase": [],
@@ -466,8 +533,12 @@ def _create_arm_diagnostic(env, log_dir: str, stride: int) -> dict:
         "pelvis_xy_speed": [],
         "foot_reference_position_error": [],
         "heading_error": [],
+        "no_contact_count": [],
+        "no_contact_recovery_active": [],
         "step_reward": [],
+        "reward_terms": [],
         "done": [],
+        "termination_reason": [],
     }
 
 
@@ -531,6 +602,14 @@ def _append_arm_diagnostic(
         torch.cos(command.locomotion_cmd_heading[0] - diagnostic["pelvis_yaw"][-1]),
     )
     diagnostic["heading_error"].append(float(heading_error.item()))
+    no_contact_count = getattr(base_env, "_dribbling_no_contact_count", None)
+    diagnostic["no_contact_count"].append(
+        np.nan if no_contact_count is None else float(no_contact_count[0].item())
+    )
+    no_contact_recovery = getattr(base_env, "_dribbling_no_contact_recovery_active", None)
+    diagnostic["no_contact_recovery_active"].append(
+        False if no_contact_recovery is None else bool(no_contact_recovery[0].item())
+    )
     # Filled with the reward returned by the immediately following env.step().
     diagnostic["step_reward"].append(np.nan)
     return True
@@ -541,12 +620,20 @@ def _save_arm_diagnostic(diagnostic: dict) -> None:
     if not diagnostic["step"]:
         print("[WARN] Arm diagnostic requested but no samples were recorded.")
         return
+    metadata_keys = {
+        "path", "stride", "joint_ids", "joint_names", "reward_term_names",
+        "constraint_group", "constraint_margin", "constraint_joint_names",
+    }
     arrays = {
         key: np.asarray(value)
         for key, value in diagnostic.items()
-        if key not in {"path", "stride", "joint_ids", "joint_names"}
+        if key not in metadata_keys
     }
     arrays["joint_names"] = diagnostic["joint_names"]
+    arrays["reward_term_names"] = diagnostic["reward_term_names"]
+    arrays["constraint_group"] = np.asarray(diagnostic["constraint_group"])
+    arrays["constraint_margin"] = np.asarray(diagnostic["constraint_margin"])
+    arrays["constraint_joint_names"] = diagnostic["constraint_joint_names"]
     np.savez_compressed(diagnostic["path"], **arrays)
     contact_rate = float(np.mean(arrays["ball_contact"]))
     ball_distance = float(np.mean(arrays["ball_pelvis_xy_distance"]))
@@ -557,6 +644,9 @@ def _save_arm_diagnostic(diagnostic: dict) -> None:
     heading_error = float(np.mean(np.abs(arrays["heading_error"])))
     arm_error = float(np.mean(np.abs(arrays["actual_joint_pos"] - arrays["reference_joint_pos"])))
     terminations = int(np.sum(arrays["done"]))
+    term_reasons = arrays["termination_reason"][arrays["termination_reason"] != ""]
+    unique_reasons, reason_counts = np.unique(term_reasons, return_counts=True)
+    reason_summary = ", ".join(f"{name}={count}" for name, count in zip(unique_reasons, reason_counts)) or "none"
     print(f"[INFO] Arm diagnostic ({len(diagnostic['step'])} samples) → {diagnostic['path']}")
     print(
         "[INFO] Counterfactual metrics: "
@@ -564,7 +654,7 @@ def _save_arm_diagnostic(diagnostic: dict) -> None:
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
         f"pelvis_xy_speed={pelvis_speed:.3f} m/s  "
         f"foot_ref_err={foot_error:.3f} m  mean_abs_heading_err={heading_error:.3f} rad  "
-        f"upper_joint_err={arm_error:.3f} rad  terminations={terminations}"
+        f"upper_joint_err={arm_error:.3f} rad  terminations={terminations} ({reason_summary})"
     )
 
 
@@ -950,16 +1040,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     upper_body_constraint = None
     if args_cli.upper_body_reference_margin is not None:
         upper_body_constraint = _create_upper_body_reference_constraint(
-            env, args_cli.upper_body_reference_margin
+            env, args_cli.upper_body_reference_margin, args_cli.upper_body_constraint_group
         )
         print(
             "[INFO] Play-only upper-body reference constraint enabled: "
+            f"group={upper_body_constraint['group']}  "
             f"q_target ∈ q_ref ± {upper_body_constraint['margin']:.3f} rad"
         )
 
     arm_diagnostic = None
     if args_cli.arm_diagnostic:
-        arm_diagnostic = _create_arm_diagnostic(env, log_dir, args_cli.arm_diagnostic_stride)
+        arm_diagnostic = _create_arm_diagnostic(
+            env, log_dir, args_cli.arm_diagnostic_stride, upper_body_constraint
+        )
         print(f"[INFO] Arm diagnostic enabled (stride={arm_diagnostic['stride']}) → {arm_diagnostic['path']}")
 
     # export policy to onnx/jit
@@ -1049,6 +1142,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     global _LAST_TERM_REASON
     _LAST_TERM_REASON = "-"
     obs, _ = env.get_observations()
+    base_env = _resolve_base_env(env)
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
@@ -1068,6 +1162,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if recorded_arm_sample:
                 arm_diagnostic["step_reward"][-1] = float(reward[0].item())
                 arm_diagnostic["done"].append(bool(dones[0].item()))
+                arm_diagnostic["reward_terms"].append(_reward_term_values(base_env))
+                arm_diagnostic["termination_reason"].append(
+                    _active_failure_termination_reason(base_env) if bool(dones[0].item()) else ""
+                )
 
         if video_recorder is not None:
             overlay = _get_play_overlay(env)
