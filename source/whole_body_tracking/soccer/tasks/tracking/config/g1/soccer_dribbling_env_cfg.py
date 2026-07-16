@@ -654,6 +654,11 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     """Control: external speed/heading/duration — ref provides pose/gait/CG only, not root vel."""
     _apply_dribbling_locomotion_velocity_terms(cfg)
     cfg.commands.motion.locomotion_command_mode = "resampled"
+    # The control heading is also the intended facing direction (see
+    # ``dribbling_command_face_ball``).  Rotate the style pose into that frame
+    # so the upper-body mimic reward does not hold arms and wrists at world +X
+    # during an oblique turn.
+    cfg.commands.motion.mimic_align_locomotion_heading = True
     # A control episode owns the task clock.  Demo time is a looping style
     # phase and must not reset the robot, ball, or locomotion command.
     cfg.commands.motion.motion_clip_end_resample = False
@@ -718,6 +723,15 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         cfg.rewards.motion_body_lin_vel.weight = 0.0
     if hasattr(cfg.rewards, "motion_body_ang_vel"):
         cfg.rewards.motion_body_ang_vel.weight = 0.0
+
+    # The reference is a style phase, not a task tape.  Keep a gentle whole
+    # body posture prior, but soften it in control so a phase wrap and an
+    # actual turn cannot produce large wrist/arm corrections.  This does not
+    # touch the CG foot/contact rewards (which are independent of the arms).
+    if hasattr(cfg.rewards, "motion_body_pos"):
+        cfg.rewards.motion_body_pos.weight = 0.45
+    if hasattr(cfg.rewards, "motion_body_ori"):
+        cfg.rewards.motion_body_ori.weight = 0.35
 
     cfg.observations.policy.motion_locomotion_polar_cmd = ObsTerm(
         func=mdp.motion_locomotion_polar_command,

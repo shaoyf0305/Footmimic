@@ -766,6 +766,43 @@ class MotionCommand(CommandTerm):
             return self.locomotion_manual_ang_vel
         return self.reference_locomotion_ang_vel_w()
 
+    def _mimic_target_yaw_delta_quat(
+        self,
+        anchor_quat_w: torch.Tensor,
+        robot_anchor_quat_w: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map the style pose into the configured task or command-heading frame.
+
+        Control locomotion headings are world-frame directions.  Keeping the
+        reference upper body in fixed task ``+X`` while asking the pelvis to
+        face an oblique command makes the arms (especially the wrist-yaw links)
+        fight the turn.  Control opts into the command-heading frame; all
+        legacy tasks retain their existing target construction.
+        """
+        delta = mimic_anchor_yaw_delta_quat(
+            anchor_quat_w,
+            robot_anchor_quat_w,
+            align_task_frame=bool(getattr(self.cfg, "mimic_align_task_frame", False)),
+        )
+        if not bool(getattr(self.cfg, "mimic_align_locomotion_heading", False)):
+            return delta
+
+        heading = self.locomotion_cmd_heading
+        # ``anchor_quat_w`` is [env, body, quat] during target construction;
+        # make the per-env heading broadcast over its body dimension.
+        while heading.ndim < anchor_quat_w.ndim - 1:
+            heading = heading.unsqueeze(-1)
+        heading_quat = quat_from_euler_xyz(
+            torch.zeros_like(heading), torch.zeros_like(heading), heading
+        )
+        # IsaacLab's ``quat_mul`` requires identical shapes rather than
+        # relying on PyTorch broadcasting.  Repeat the per-env heading over
+        # the body dimension used by the mimic targets.
+        heading_quat = heading_quat.expand_as(delta)
+        # The task-frame delta strips demo yaw to +X.  Rotate that style pose
+        # from +X into the active external-command heading.
+        return quat_mul(heading_quat, delta)
+
     @property
     def robot_joint_pos(self) -> torch.Tensor:
         return self.robot.data.joint_pos
@@ -1320,10 +1357,9 @@ class MotionCommand(CommandTerm):
 
         delta_pos_w = robot_anchor_pos_w_repeat
         delta_pos_w[..., 2] = anchor_pos_w_repeat[..., 2]
-        delta_ori_w = mimic_anchor_yaw_delta_quat(
+        delta_ori_w = self._mimic_target_yaw_delta_quat(
             anchor_quat_w_repeat,
             robot_anchor_quat_w_repeat,
-            align_task_frame=bool(getattr(self.cfg, "mimic_align_task_frame", False)),
         )
 
         self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
@@ -1399,6 +1435,10 @@ class MotionCommandCfg(CommandTermCfg):
     body_names: list[str] = MISSING
     # Strip demo anchor yaw to task +X for all mimic targets (pos/ori/vel), not only pelvis.
     mimic_align_task_frame: bool = False
+    # Control-only opt-in: rotate task-frame style targets from +X into the
+    # active locomotion heading.  This avoids an upper-body pose reward that
+    # fights command-frame turning.  Old tasks retain task-frame +X targets.
+    mimic_align_locomotion_heading: bool = False
     # Legacy behavior resamples the full command and scene when a demo clip
     # ends.  Control disables this so the clip becomes a looping style phase.
     motion_clip_end_resample: bool = True
