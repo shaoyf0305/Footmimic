@@ -32,18 +32,33 @@ from .soccer_flat_env_cfg import (
 )
 
 
-# Control-only regularization.  The play ablation showed that wrists need a
-# strong reference prior, elbows a weaker one, and shoulders should remain
-# free for balance recovery during a turn.
-_CONTROL_WRIST_JOINT_NAMES = [
+# Control-only whole-upper-body regularization.  Each tolerance corresponds to
+# the joint name at the same index: shoulders retain the largest recovery range,
+# elbows are intermediate, and wrists stay closest to the style reference.
+_CONTROL_UPPER_BODY_JOINT_NAMES = [
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
     "left_wrist_roll_joint",
     "left_wrist_pitch_joint",
     "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
     "right_wrist_roll_joint",
     "right_wrist_pitch_joint",
     "right_wrist_yaw_joint",
 ]
-_CONTROL_ELBOW_JOINT_NAMES = ["left_elbow_joint", "right_elbow_joint"]
+_CONTROL_UPPER_BODY_POSITION_SCALES = [
+    0.80, 0.80, 0.80, 0.60, 0.40, 0.40, 0.40,
+    0.80, 0.80, 0.80, 0.60, 0.40, 0.40, 0.40,
+]
+_CONTROL_UPPER_BODY_RESIDUAL_RATE_SCALES = [
+    0.12, 0.12, 0.12, 0.08, 0.06, 0.06, 0.06,
+    0.12, 0.12, 0.12, 0.08, 0.06, 0.06, 0.06,
+]
 
 
 @configclass
@@ -747,48 +762,27 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     if hasattr(cfg.rewards, "motion_body_ori"):
         cfg.rewards.motion_body_ori.weight = 0.35
 
-    # Direct wrist/elbow reference terms replace the ineffective indirect
-    # correction from whole-body orientation mimic.  The wrist term is tighter;
-    # elbows retain more freedom because the play ablation showed they help
-    # compensate for turn dynamics.  Keep shoulders unconstrained here: a
-    # full-upper-body clamp caused repeated no-contact failures.
-    cfg.rewards.control_wrist_joint_ref = RewTerm(
-        func=mdp.motion_joint_position_error_exp,
-        weight=0.60,
+    # One budget covers all 14 upper-body joints.  This removes the escape
+    # route where a wrist constraint simply migrates into shoulder motion.  It
+    # remains a soft training cost: task rewards and terminations are unchanged.
+    cfg.rewards.control_upper_body_regularizer = RewTerm(
+        func=mdp.adaptive_upper_body_reference_cost,
+        weight=-1.0,
         params={
             "command_name": "motion",
-            "joint_names": _CONTROL_WRIST_JOINT_NAMES,
-            "std": 0.40,
-        },
-    )
-    cfg.rewards.control_elbow_joint_ref = RewTerm(
-        func=mdp.motion_joint_position_error_exp,
-        weight=0.20,
-        params={
-            "command_name": "motion",
-            "joint_names": _CONTROL_ELBOW_JOINT_NAMES,
-            "std": 0.55,
-        },
-    )
-    # Position tracking alone can still permit large, saturated PD targets.
-    # Penalize target/reference error softly and with a bounded logarithm so a
-    # resumed checkpoint receives a finite correction rather than a hard clamp.
-    cfg.rewards.control_wrist_target_ref = RewTerm(
-        func=mdp.motion_joint_target_reference_log_penalty,
-        weight=-0.08,
-        params={
-            "command_name": "motion",
-            "joint_names": _CONTROL_WRIST_JOINT_NAMES,
-            "target_std": 0.40,
-        },
-    )
-    cfg.rewards.control_elbow_target_ref = RewTerm(
-        func=mdp.motion_joint_target_reference_log_penalty,
-        weight=-0.02,
-        params={
-            "command_name": "motion",
-            "joint_names": _CONTROL_ELBOW_JOINT_NAMES,
-            "target_std": 0.55,
+            "joint_names": _CONTROL_UPPER_BODY_JOINT_NAMES,
+            "position_scales": _CONTROL_UPPER_BODY_POSITION_SCALES,
+            "target_scales": _CONTROL_UPPER_BODY_POSITION_SCALES,
+            "residual_rate_scales": _CONTROL_UPPER_BODY_RESIDUAL_RATE_SCALES,
+            "pose_weight": 1.0,
+            "target_weight": 0.25,
+            "rate_weight": 0.10,
+            "budget": 0.30,
+            "lambda_init": 0.05,
+            "lambda_min": 0.02,
+            "lambda_max": 0.40,
+            "lambda_lr": 2.0e-4,
+            "ema_alpha": 0.01,
         },
     )
 
