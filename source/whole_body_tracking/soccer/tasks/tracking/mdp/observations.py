@@ -14,6 +14,15 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
+def effective_joint_action(env: ManagerBasedEnv, action_name: str = "joint_pos") -> torch.Tensor:
+    """Return the normalized joint command that is actually sent by an action term."""
+    action_term = env.action_manager.get_term(action_name)
+    effective = getattr(action_term, "effective_raw_actions", None)
+    if effective is not None:
+        return effective
+    return action_term.raw_actions
+
+
 def robot_anchor_ori_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
     mat = matrix_from_quat(command.robot_anchor_quat_w)

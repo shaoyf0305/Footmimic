@@ -32,9 +32,7 @@ from .soccer_flat_env_cfg import (
 )
 
 
-# Control-only whole-upper-body regularization.  Each tolerance corresponds to
-# the joint name at the same index: shoulders retain the largest recovery range,
-# elbows are intermediate, and wrists stay closest to the style reference.
+# Control-only coordinated upper-body action subsystem.
 _CONTROL_UPPER_BODY_JOINT_NAMES = [
     "left_shoulder_pitch_joint",
     "left_shoulder_roll_joint",
@@ -50,14 +48,6 @@ _CONTROL_UPPER_BODY_JOINT_NAMES = [
     "right_wrist_roll_joint",
     "right_wrist_pitch_joint",
     "right_wrist_yaw_joint",
-]
-_CONTROL_UPPER_BODY_POSITION_SCALES = [
-    0.80, 0.80, 0.80, 0.60, 0.40, 0.40, 0.40,
-    0.80, 0.80, 0.80, 0.60, 0.40, 0.40, 0.40,
-]
-_CONTROL_UPPER_BODY_RESIDUAL_RATE_SCALES = [
-    0.12, 0.12, 0.12, 0.08, 0.06, 0.06, 0.06,
-    0.12, 0.12, 0.12, 0.08, 0.06, 0.06, 0.06,
 ]
 
 
@@ -762,29 +752,37 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     if hasattr(cfg.rewards, "motion_body_ori"):
         cfg.rewards.motion_body_ori.weight = 0.35
 
-    # One budget covers all 14 upper-body joints.  This removes the escape
-    # route where a wrist constraint simply migrates into shoulder motion.  It
-    # remains a soft training cost: task rewards and terminations are unchanged.
-    cfg.rewards.control_upper_body_regularizer = RewTerm(
-        func=mdp.adaptive_upper_body_reference_cost,
-        weight=-1.0,
-        params={
-            "command_name": "motion",
-            "joint_names": _CONTROL_UPPER_BODY_JOINT_NAMES,
-            "position_scales": _CONTROL_UPPER_BODY_POSITION_SCALES,
-            "target_scales": _CONTROL_UPPER_BODY_POSITION_SCALES,
-            "residual_rate_scales": _CONTROL_UPPER_BODY_RESIDUAL_RATE_SCALES,
-            "pose_weight": 1.0,
-            "target_weight": 0.25,
-            "rate_weight": 0.10,
-            "budget": 0.30,
-            "lambda_init": 0.05,
-            "lambda_min": 0.02,
-            "lambda_max": 0.40,
-            "lambda_lr": 2.0e-4,
-            "ema_alpha": 0.01,
-        },
+    # Preserve the 37-D policy interface for Stage-1 checkpoint loading, but
+    # interpret the 14 upper-body targets as one coordinated subsystem.  PCA is
+    # fitted from the complete configured motion bank, never the active frame;
+    # lower-body actions are copied through exactly as before.
+    old_action_cfg = cfg.actions.joint_pos
+    cfg.actions.joint_pos = mdp.UpperBodyManifoldJointPositionActionCfg(
+        asset_name=old_action_cfg.asset_name,
+        joint_names=old_action_cfg.joint_names,
+        use_default_offset=old_action_cfg.use_default_offset,
+        upper_body_joint_names=_CONTROL_UPPER_BODY_JOINT_NAMES,
+        command_name="motion",
+        manifold_rank=6,
+        latent_std_limit=3.0,
+        min_latent_limit=0.03,
+        orthogonal_residual_limit=0.10,
+        cutoff_frequency_hz=1.8,
     )
+    cfg.actions.joint_pos.scale = old_action_cfg.scale
+    cfg.actions.joint_pos.offset = old_action_cfg.offset
+    cfg.actions.joint_pos.preserve_order = getattr(old_action_cfg, "preserve_order", False)
+    if hasattr(old_action_cfg, "clip"):
+        cfg.actions.joint_pos.clip = old_action_cfg.clip
+
+    # Feed back the effective action after manifold projection.  Observation
+    # dimensions stay unchanged, so Stage-1 actor/critic weights remain loadable.
+    cfg.observations.policy.actions.func = mdp.effective_joint_action
+    cfg.observations.policy.actions.params = {"action_name": "joint_pos"}
+    cfg.observations.critic.actions.func = mdp.effective_joint_action
+    cfg.observations.critic.actions.params = {"action_name": "joint_pos"}
+    cfg.rewards.action_rate_l2.func = mdp.effective_action_rate_l2_clip
+    cfg.rewards.action_rate_l2.params = {"action_name": "joint_pos"}
 
     cfg.observations.policy.motion_locomotion_polar_cmd = ObsTerm(
         func=mdp.motion_locomotion_polar_command,

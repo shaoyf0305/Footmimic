@@ -29,185 +29,20 @@ def _get_body_indexes(command: MotionCommand, body_names: list[str] | None) -> l
     return [i for i, name in enumerate(command.cfg.body_names) if (body_names is None) or (name in body_names)]
 
 
-def _map_names_to_indices(source_names: list[str], target_names: list[str]) -> list[int]:
-    target_list = list(target_names)
-    name_to_index = {name: idx for idx, name in enumerate(target_list)}
-    indices: list[int] = []
-    # Iterate all source names to map.
-    for name in source_names:
-        # Prefer exact matching for deterministic mapping.
-        if name in name_to_index:
-            indices.append(name_to_index[name])
-            continue
-        # If exact matching fails, attempt unique suffix matching.
-        suffix_matches = [idx for idx, candidate in enumerate(target_list) if candidate.endswith(name)]
-        # Accept only unique suffix matches to avoid ambiguity.
-        if len(suffix_matches) == 1:
-            indices.append(suffix_matches[0])
-    return indices
-
-
 def action_rate_l2_clip(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Penalize the rate of change of the actions using L2 squared kernel."""
     reward = torch.sum(torch.square(env.action_manager.action - env.action_manager.prev_action), dim=1)
     return reward.clamp(max=100.0)
 
 
-def _joint_position_action_targets(
-    env: ManagerBasedRLEnv,
-    command: MotionCommand,
-    joint_names: list[str],
-    action_term_name: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return position-action targets and motion-reference positions for selected joints.
-
-    ``JointPositionAction`` receives normalized policy actions but applies joint
-    targets after its internal scale/offset transform.  Rewarding the transformed
-    targets, rather than raw actions, keeps this term valid if action scaling is
-    changed later.
-    """
-    robot = command.robot
-    action_term = env.action_manager.get_term(action_term_name)
-    cache_name = "_motion_reference_target_joint_cache"
-    target_cache = getattr(action_term, cache_name, {})
-    cache_key = tuple(joint_names)
-    cached_indices = target_cache.get(cache_key)
-    if cached_indices is None:
-        robot_joint_ids, found_names = robot.find_joints(joint_names, preserve_order=True)
-        if len(robot_joint_ids) != len(joint_names):
-            raise ValueError(
-                f"Could not resolve all requested joints: expected {joint_names}, found {found_names}."
-            )
-        action_joint_ids = getattr(action_term, "_joint_ids", None)
-        if action_joint_ids is None:
-            action_joint_ids = getattr(action_term, "joint_ids", None)
-        if action_joint_ids is None:
-            raise RuntimeError(f"Action term '{action_term_name}' does not expose controlled joint ids.")
-        if isinstance(action_joint_ids, slice):
-            action_joint_ids = torch.arange(robot.num_joints, device=env.device)
-        action_joint_ids = torch.as_tensor(action_joint_ids, dtype=torch.long, device=env.device)
-        robot_to_action = {
-            int(robot_id): action_id for action_id, robot_id in enumerate(action_joint_ids.tolist())
-        }
-        try:
-            action_ids = torch.as_tensor(
-                [robot_to_action[int(robot_id)] for robot_id in robot_joint_ids],
-                dtype=torch.long,
-                device=env.device,
-            )
-        except KeyError as exc:
-            raise RuntimeError(
-                f"Action term '{action_term_name}' does not control robot joint id {exc.args[0]}."
-            ) from exc
-        cached_indices = (
-            torch.as_tensor(robot_joint_ids, dtype=torch.long, device=env.device),
-            action_ids,
-        )
-        target_cache[cache_key] = cached_indices
-        setattr(action_term, cache_name, target_cache)
-    robot_joint_ids, action_ids = cached_indices
-
-    raw_actions = getattr(action_term, "raw_actions", None)
-    if raw_actions is None:
-        raw_actions = getattr(action_term, "_raw_actions", None)
-    scale = getattr(action_term, "_scale", None)
-    offset = getattr(action_term, "_offset", None)
-    if raw_actions is None or scale is None or offset is None:
-        raise RuntimeError(f"Action term '{action_term_name}' does not expose raw actions, scale, and offset.")
-
-    targets = raw_actions[:, action_ids] * scale[:, action_ids] + offset[:, action_ids]
-    reference = command.joint_pos[:, robot_joint_ids]
-    return targets, reference
-
-
-def _normalized_huber_cost(error: torch.Tensor, scales: list[float]) -> torch.Tensor:
-    """Return a per-environment Huber cost after per-joint normalization."""
-    scale = torch.as_tensor(scales, dtype=error.dtype, device=error.device)
-    if scale.ndim != 1 or scale.numel() != error.shape[1] or torch.any(scale <= 0.0):
-        raise ValueError("scales must contain one positive tolerance for each selected joint.")
-    normalized = torch.abs(error / scale)
-    return torch.mean(torch.where(normalized <= 1.0, 0.5 * normalized.square(), normalized - 0.5), dim=1)
-
-
-def adaptive_upper_body_reference_cost(
-    env: ManagerBasedRLEnv,
-    command_name: str,
-    joint_names: list[str],
-    position_scales: list[float],
-    target_scales: list[float],
-    residual_rate_scales: list[float],
-    action_term_name: str = "joint_pos",
-    pose_weight: float = 1.0,
-    target_weight: float = 0.25,
-    rate_weight: float = 0.10,
-    budget: float = 0.30,
-    lambda_init: float = 0.05,
-    lambda_min: float = 0.02,
-    lambda_max: float = 0.40,
-    lambda_lr: float = 2.0e-4,
-    ema_alpha: float = 0.01,
+def effective_action_rate_l2_clip(
+    env: ManagerBasedRLEnv, action_name: str = "joint_pos"
 ) -> torch.Tensor:
-    """Adaptive whole-upper-body reference cost for the control task.
-
-    The cost covers all shoulder, elbow, and wrist joints together, using wider
-    tolerances for shoulder recovery and tighter tolerances for wrists.  It
-    penalizes actual pose error, saturated position targets, and changes in the
-    target residual relative to the motion reference.  A batch-level dual
-    coefficient is updated from the cost EMA, so the style prior tightens only
-    when the policy persistently exceeds its overall upper-body budget.
-    """
-    if min(pose_weight, target_weight, rate_weight, budget, lambda_min, lambda_lr, ema_alpha) < 0.0:
-        raise ValueError("adaptive upper-body cost weights and rates must be non-negative.")
-    if not 0.0 < lambda_init <= lambda_max or lambda_min > lambda_max:
-        raise ValueError("lambda bounds must satisfy 0 < lambda_min <= lambda_init <= lambda_max.")
-    if not joint_names:
-        raise ValueError("joint_names must not be empty.")
-
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    targets, reference = _joint_position_action_targets(env, command, joint_names, action_term_name)
-    action_term = env.action_manager.get_term(action_term_name)
-    target_cache = getattr(action_term, "_motion_reference_target_joint_cache")
-    robot_joint_ids, _ = target_cache[tuple(joint_names)]
-    actual = command.robot.data.joint_pos[:, robot_joint_ids]
-
-    pose_cost = _normalized_huber_cost(actual - reference, position_scales)
-    target_residual = targets - reference
-    target_cost = _normalized_huber_cost(target_residual, target_scales)
-
-    state_name = "_adaptive_upper_body_reference_state"
-    state = getattr(env, state_name, None)
-    if state is None or state["prev_residual"].shape != target_residual.shape:
-        state = {
-            "ema_cost": torch.full((), budget, dtype=targets.dtype, device=env.device),
-            "lambda": torch.full((), lambda_init, dtype=targets.dtype, device=env.device),
-            "prev_residual": target_residual.detach().clone(),
-        }
-        rate_cost = torch.zeros_like(pose_cost)
-    else:
-        residual_delta = target_residual - state["prev_residual"]
-        rate_cost = _normalized_huber_cost(residual_delta, residual_rate_scales)
-        # Do not charge the discontinuity caused by a freshly reset episode.
-        episode_steps = getattr(env, "episode_length_buf", None)
-        if episode_steps is not None:
-            rate_cost = torch.where(episode_steps <= 1, torch.zeros_like(rate_cost), rate_cost)
-        state["prev_residual"] = target_residual.detach().clone()
-
-    total_cost = pose_weight * pose_cost + target_weight * target_cost + rate_weight * rate_cost
-    mean_cost = total_cost.detach().mean()
-    state["ema_cost"] = (1.0 - ema_alpha) * state["ema_cost"] + ema_alpha * mean_cost
-    state["lambda"] = torch.clamp(
-        state["lambda"] + lambda_lr * (state["ema_cost"] - budget),
-        min=lambda_min,
-        max=lambda_max,
-    )
-    setattr(env, state_name, state)
-    # Expose components for play diagnostics and training HUDs.
-    env._upper_body_regularizer_lambda = state["lambda"].detach()
-    env._upper_body_regularizer_cost = total_cost.detach()
-    env._upper_body_regularizer_pose_cost = pose_cost.detach()
-    env._upper_body_regularizer_target_cost = target_cost.detach()
-    env._upper_body_regularizer_rate_cost = rate_cost.detach()
-    return state["lambda"] * total_cost
+    """Penalize changes in the normalized command that the action term actually executes."""
+    action_term = env.action_manager.get_term(action_name)
+    current = getattr(action_term, "effective_raw_actions", action_term.raw_actions)
+    previous = getattr(action_term, "prev_effective_raw_actions", env.action_manager.prev_action)
+    return torch.sum(torch.square(current - previous), dim=1).clamp(max=100.0)
 
 
 def forward_velocity_reward(

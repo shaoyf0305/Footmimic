@@ -397,17 +397,6 @@ def _reward_term_values(base_env, env_idx: int = 0) -> np.ndarray:
     return values[env_idx].detach().cpu().numpy().copy()
 
 
-def _diagnostic_env_scalar(base_env, name: str, env_idx: int = 0) -> float:
-    """Read a scalar or per-environment tensor published by an MDP term."""
-    value = getattr(base_env, name, None)
-    if value is None:
-        return np.nan
-    if isinstance(value, torch.Tensor):
-        value = value if value.ndim == 0 else value[env_idx]
-        return float(value.item())
-    return float(value)
-
-
 def _resolve_base_env(env):
     """Unwrap gym / RSL-RL wrappers to the underlying Isaac Lab env."""
     base = env
@@ -546,11 +535,11 @@ def _create_arm_diagnostic(env, log_dir: str, stride: int, constraint: dict | No
         "heading_error": [],
         "no_contact_count": [],
         "no_contact_recovery_active": [],
-        "upper_body_regularizer_lambda": [],
-        "upper_body_regularizer_cost": [],
-        "upper_body_regularizer_pose_cost": [],
-        "upper_body_regularizer_target_cost": [],
-        "upper_body_regularizer_rate_cost": [],
+        "manifold_raw_upper_target": [],
+        "manifold_projected_upper_target": [],
+        "manifold_latent": [],
+        "manifold_projection_error": [],
+        "manifold_latent_clip_fraction": [],
         "step_reward": [],
         "reward_terms": [],
         "done": [],
@@ -626,24 +615,36 @@ def _append_arm_diagnostic(
     diagnostic["no_contact_recovery_active"].append(
         False if no_contact_recovery is None else bool(no_contact_recovery[0].item())
     )
-    diagnostic["upper_body_regularizer_lambda"].append(
-        _diagnostic_env_scalar(base_env, "_upper_body_regularizer_lambda")
-    )
-    diagnostic["upper_body_regularizer_cost"].append(
-        _diagnostic_env_scalar(base_env, "_upper_body_regularizer_cost")
-    )
-    diagnostic["upper_body_regularizer_pose_cost"].append(
-        _diagnostic_env_scalar(base_env, "_upper_body_regularizer_pose_cost")
-    )
-    diagnostic["upper_body_regularizer_target_cost"].append(
-        _diagnostic_env_scalar(base_env, "_upper_body_regularizer_target_cost")
-    )
-    diagnostic["upper_body_regularizer_rate_cost"].append(
-        _diagnostic_env_scalar(base_env, "_upper_body_regularizer_rate_cost")
-    )
     # Filled with the reward returned by the immediately following env.step().
     diagnostic["step_reward"].append(np.nan)
     return True
+
+
+def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
+    """Record the action term's post-step projection for the sample just opened."""
+    base_env = _resolve_base_env(env)
+    action_term = base_env.action_manager.get_term("joint_pos")
+
+    def _env0(name: str, fallback_shape: tuple[int, ...]) -> np.ndarray:
+        value = getattr(action_term, name, None)
+        if not isinstance(value, torch.Tensor):
+            return np.full(fallback_shape, np.nan, dtype=np.float32)
+        return value[0].detach().cpu().numpy().copy()
+
+    upper_dim = len(_ARM_DIAGNOSTIC_JOINT_NAMES)
+    diagnostic["manifold_raw_upper_target"].append(
+        _env0("manifold_raw_upper_target", (upper_dim,))
+    )
+    diagnostic["manifold_projected_upper_target"].append(
+        _env0("manifold_projected_upper_target", (upper_dim,))
+    )
+    diagnostic["manifold_latent"].append(_env0("manifold_latent", (0,)))
+    diagnostic["manifold_projection_error"].append(
+        float(_env0("manifold_projection_error", ()).item())
+    )
+    diagnostic["manifold_latent_clip_fraction"].append(
+        float(_env0("manifold_latent_clip_fraction", ()).item())
+    )
 
 
 def _save_arm_diagnostic(diagnostic: dict) -> None:
@@ -675,8 +676,14 @@ def _save_arm_diagnostic(diagnostic: dict) -> None:
     heading_error = float(np.mean(np.abs(arrays["heading_error"])))
     arm_error = float(np.mean(np.abs(arrays["actual_joint_pos"] - arrays["reference_joint_pos"])))
     terminations = int(np.sum(arrays["done"]))
-    upper_cost = float(np.nanmean(arrays["upper_body_regularizer_cost"]))
-    upper_lambda = float(np.nanmean(arrays["upper_body_regularizer_lambda"]))
+    finite_projection = arrays["manifold_projection_error"][
+        np.isfinite(arrays["manifold_projection_error"])
+    ]
+    finite_clip = arrays["manifold_latent_clip_fraction"][
+        np.isfinite(arrays["manifold_latent_clip_fraction"])
+    ]
+    projection_error = float(np.mean(finite_projection)) if finite_projection.size else np.nan
+    latent_clip = float(np.mean(finite_clip)) if finite_clip.size else np.nan
     term_reasons = arrays["termination_reason"][arrays["termination_reason"] != ""]
     unique_reasons, reason_counts = np.unique(term_reasons, return_counts=True)
     reason_summary = ", ".join(f"{name}={count}" for name, count in zip(unique_reasons, reason_counts)) or "none"
@@ -687,8 +694,8 @@ def _save_arm_diagnostic(diagnostic: dict) -> None:
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
         f"pelvis_xy_speed={pelvis_speed:.3f} m/s  "
         f"foot_ref_err={foot_error:.3f} m  mean_abs_heading_err={heading_error:.3f} rad  "
-        f"upper_joint_err={arm_error:.3f} rad  upper_cost={upper_cost:.3f}  "
-        f"upper_lambda={upper_lambda:.3f}  terminations={terminations} ({reason_summary})"
+        f"upper_joint_err={arm_error:.3f} rad  manifold_projection={projection_error:.3f} rad  "
+        f"latent_clip={latent_clip:.3f}  terminations={terminations} ({reason_summary})"
     )
 
 
@@ -1194,6 +1201,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # env stepping
             obs, reward, dones, _ = env.step(actions)
             if recorded_arm_sample:
+                _append_upper_body_manifold_diagnostic(arm_diagnostic, env)
                 arm_diagnostic["step_reward"][-1] = float(reward[0].item())
                 arm_diagnostic["done"].append(bool(dones[0].item()))
                 arm_diagnostic["reward_terms"].append(_reward_term_values(base_env))
