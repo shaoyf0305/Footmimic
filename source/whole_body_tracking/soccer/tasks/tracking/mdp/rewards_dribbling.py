@@ -933,6 +933,63 @@ def dribbling_undesired_contact_penalty(
 # ---------------------------------------------------------------------------
 
 
+def dribbling_support_ankle_roll_tracking_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    std: float = 0.24,
+    deadzone: float = 0.10,
+    error_cap: float = 0.35,
+    left_ankle_roll_joint: str = "left_ankle_roll_joint",
+    right_ankle_roll_joint: str = "right_ankle_roll_joint",
+) -> torch.Tensor:
+    """Lightly keep the non-touching ankle roll near its style reference.
+
+    On a labeled right-foot touch, only the left (support) ankle is scored;
+    left-foot touches mirror the selection.  The touching ankle remains fully
+    free.  A deadzone permits normal balance corrections, while the capped
+    error keeps this cosmetic support-foot term from competing with ball
+    control when a recovery needs a larger deviation.
+    """
+    if std <= 0.0 or deadzone < 0.0 or error_cap <= 0.0:
+        raise ValueError("std and error_cap must be positive; deadzone must be non-negative.")
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    labeled = getattr(command, "motion_has_dribble_cg_label", None)
+    if not isinstance(labeled, torch.Tensor) or not torch.any(labeled):
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    ref_contact = command.dribble_cg_contact_ref
+    ref_touch_foot = command.dribble_cg_foot_ref
+    active = labeled & ref_contact & (ref_touch_foot >= 0)
+    if not torch.any(active):
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+
+    robot = env.scene[command.cfg.asset_name]
+    joint_cache_name = "_dribbling_support_ankle_roll_joint_ids"
+    joint_ids = getattr(command, joint_cache_name, None)
+    if joint_ids is None:
+        ids, found_names = robot.find_joints(
+            [left_ankle_roll_joint, right_ankle_roll_joint], preserve_order=True
+        )
+        if len(ids) != 2:
+            raise ValueError(
+                "Could not resolve support ankle roll joints: "
+                f"expected {[left_ankle_roll_joint, right_ankle_roll_joint]}, found {found_names}."
+            )
+        joint_ids = torch.as_tensor(ids, device=env.device, dtype=torch.long)
+        setattr(command, joint_cache_name, joint_ids)
+
+    # Ref foot id is 0=left / 1=right, so support is the opposite joint.
+    support_joint_ids = torch.where(ref_touch_foot == 1, joint_ids[0], joint_ids[1])
+    batch_ids = torch.arange(env.num_envs, device=env.device)
+    actual = robot.data.joint_pos[batch_ids, support_joint_ids]
+    reference = command.joint_pos[batch_ids, support_joint_ids]
+    excess = torch.clamp(torch.abs(actual - reference) - deadzone, min=0.0)
+    bounded_excess = torch.clamp(excess, max=error_cap)
+    reward = torch.exp(-torch.square(bounded_excess) / (std**2))
+    return reward * active.to(reward.dtype)
+
+
 def dribbling_cg_demo_ball_tracking_exp(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",

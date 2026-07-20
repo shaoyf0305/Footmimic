@@ -725,6 +725,20 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     if hasattr(cfg.rewards, "dribbling_cg_foot_consistency"):
         cfg.rewards.dribbling_cg_foot_consistency.weight = 0.5
 
+    # During a labeled touch, retain only the opposite (support) ankle's roll
+    # style.  The touching ankle remains unrestricted, so this small cosmetic
+    # correction cannot trade away reachability or ball-control recovery.
+    cfg.rewards.dribbling_support_ankle_roll = RewTerm(
+        func=mdp.dribbling_support_ankle_roll_tracking_exp,
+        weight=0.25,
+        params={
+            "command_name": "motion",
+            "std": 0.24,
+            "deadzone": 0.10,
+            "error_cap": 0.35,
+        },
+    )
+
     # Keep the no-contact termination, but give an actual command-change
     # recovery attempt a bounded extra window.  The counter only slows while
     # the ball is recoverable and the pelvis is closing distance.
@@ -768,6 +782,10 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         min_latent_limit=0.03,
         orthogonal_residual_limit=0.10,
         cutoff_frequency_hz=1.8,
+        # Keep the control policy inside the current style pose's local arm
+        # envelope.  This is control-only: the base config defaults to None.
+        # It prevents saturated PCA latents from locking an arm in a raised pose.
+        reference_target_margin=0.25,
     )
     cfg.actions.joint_pos.scale = old_action_cfg.scale
     cfg.actions.joint_pos.offset = old_action_cfg.offset
@@ -783,6 +801,15 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     cfg.observations.critic.actions.params = {"action_name": "joint_pos"}
     cfg.rewards.action_rate_l2.func = mdp.effective_action_rate_l2_clip
     cfg.rewards.action_rate_l2.params = {"action_name": "joint_pos"}
+    # The effective-action rate term cannot see a policy that keeps emitting
+    # huge targets after the action layer has clamped them.  Penalize that
+    # pre-constraint overflow directly so fine-tuning learns to operate inside
+    # the verified q_ref +/- 0.25 rad envelope.
+    cfg.rewards.upper_body_reference_overflow = RewTerm(
+        func=mdp.upper_body_reference_overflow_penalty,
+        weight=-0.05,
+        params={"action_name": "joint_pos"},
+    )
 
     cfg.observations.policy.motion_locomotion_polar_cmd = ObsTerm(
         func=mdp.motion_locomotion_polar_command,

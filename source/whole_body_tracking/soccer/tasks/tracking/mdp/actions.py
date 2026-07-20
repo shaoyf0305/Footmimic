@@ -35,6 +35,8 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             raise ValueError("latent limits must be non-negative and latent_std_limit must be positive.")
         if cfg.orthogonal_residual_limit < 0.0 or cfg.cutoff_frequency_hz <= 0.0:
             raise ValueError("orthogonal_residual_limit must be non-negative and cutoff_frequency_hz positive.")
+        if cfg.reference_target_margin is not None and cfg.reference_target_margin <= 0.0:
+            raise ValueError("reference_target_margin must be positive when enabled.")
         super().__init__(cfg, env)
         self._manifold_env = env
 
@@ -74,10 +76,17 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
 
         # Public diagnostic tensors.  They are populated by process_actions().
         self.manifold_raw_upper_target = torch.zeros_like(self._filtered_upper_target)
+        self.manifold_reference_upper_target = torch.zeros_like(self._filtered_upper_target)
+        self.manifold_constrained_upper_target = torch.zeros_like(self._filtered_upper_target)
         self.manifold_projected_upper_target = torch.zeros_like(self._filtered_upper_target)
         self.manifold_latent = torch.zeros_like(self._filtered_latent)
         self.manifold_projection_error = torch.zeros(self.num_envs, device=self.device)
+        self.manifold_projection_error_after_reference_constraint = torch.zeros(
+            self.num_envs, device=self.device
+        )
         self.manifold_latent_clip_fraction = torch.zeros(self.num_envs, device=self.device)
+        self.manifold_reference_overflow = torch.zeros_like(self._filtered_upper_target)
+        self.manifold_reference_clamp_fraction = torch.zeros(self.num_envs, device=self.device)
         self.effective_raw_actions = torch.zeros_like(self.raw_actions)
         self.prev_effective_raw_actions = torch.zeros_like(self.raw_actions)
 
@@ -159,7 +168,32 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
 
         action_ids = self._upper_action_ids
         raw_target = self.processed_actions[:, action_ids].clone()
-        centered = raw_target - self._manifold_mean
+
+        # Control can use the current style pose as a bounded safety envelope.
+        # This is deliberately applied before PCA: a target far outside the
+        # motion bank otherwise saturates every latent dimension and collapses
+        # the arm into one static pose.  The default remains disabled so the
+        # regular tracking and non-control environments retain their original
+        # action semantics.
+        reference_margin = self.cfg.reference_target_margin
+        if reference_margin is None:
+            reference_target = torch.zeros_like(raw_target)
+            constrained_target = raw_target
+            reference_overflow = torch.zeros_like(raw_target)
+        else:
+            command = self._manifold_env.command_manager.get_term(self.cfg.command_name)
+            reference_target = command.joint_pos[:, self._upper_robot_ids]
+            reference_overflow = torch.clamp(
+                torch.abs(raw_target - reference_target) - reference_margin,
+                min=0.0,
+            )
+            constrained_target = torch.clamp(
+                raw_target,
+                min=reference_target - reference_margin,
+                max=reference_target + reference_margin,
+            )
+
+        centered = constrained_target - self._manifold_mean
         raw_latent = centered @ self._manifold_basis
         bounded_latent = torch.clamp(
             raw_latent,
@@ -210,11 +244,18 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         ) / safe_upper_scale
 
         self.manifold_raw_upper_target[:] = raw_target
+        self.manifold_reference_upper_target[:] = reference_target
+        self.manifold_constrained_upper_target[:] = constrained_target
         self.manifold_projected_upper_target[:] = filtered_target
         self.manifold_latent[:] = filtered_latent
         self.manifold_projection_error[:] = torch.mean(torch.abs(filtered_target - raw_target), dim=1)
+        self.manifold_projection_error_after_reference_constraint[:] = torch.mean(
+            torch.abs(filtered_target - constrained_target), dim=1
+        )
         clipped = torch.abs(raw_latent) > self._manifold_latent_limit
         self.manifold_latent_clip_fraction[:] = clipped.float().mean(dim=1)
+        self.manifold_reference_overflow[:] = reference_overflow
+        self.manifold_reference_clamp_fraction[:] = (reference_overflow > 0.0).float().mean(dim=1)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         super().reset(env_ids)
@@ -237,3 +278,4 @@ class UpperBodyManifoldJointPositionActionCfg(JointPositionActionCfg):
     min_latent_limit: float = 0.03
     orthogonal_residual_limit: float = 0.10
     cutoff_frequency_hz: float = 1.8
+    reference_target_margin: float | None = None

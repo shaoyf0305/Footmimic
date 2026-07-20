@@ -45,6 +45,28 @@ def effective_action_rate_l2_clip(
     return torch.sum(torch.square(current - previous), dim=1).clamp(max=100.0)
 
 
+def upper_body_reference_overflow_penalty(
+    env: ManagerBasedRLEnv,
+    action_name: str = "joint_pos",
+) -> torch.Tensor:
+    """Penalize upper-body targets that exceed a reference-action safety envelope.
+
+    The manifold action term exposes the overflow *before* it clamps a target
+    to ``q_ref +/- margin``.  Penalizing that signal prevents a policy from
+    hiding permanently in the downstream PCA saturation region.  The smooth
+    L1-like form stays well scaled when fine-tuning a checkpoint that already
+    emits very large upper-body targets.
+    """
+    action_term = env.action_manager.get_term(action_name)
+    overflow = getattr(action_term, "manifold_reference_overflow", None)
+    margin = getattr(getattr(action_term, "cfg", None), "reference_target_margin", None)
+    if not isinstance(overflow, torch.Tensor) or margin is None:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    normalized_overflow = overflow / max(float(margin), 1.0e-6)
+    return torch.mean(torch.sqrt(1.0 + torch.square(normalized_overflow)) - 1.0, dim=1)
+
+
 def forward_velocity_reward(
     env: ManagerBasedRLEnv,
     target_speed: float = 0.8,

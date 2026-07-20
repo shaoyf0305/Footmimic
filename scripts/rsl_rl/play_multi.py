@@ -536,10 +536,15 @@ def _create_arm_diagnostic(env, log_dir: str, stride: int, constraint: dict | No
         "no_contact_count": [],
         "no_contact_recovery_active": [],
         "manifold_raw_upper_target": [],
+        "manifold_reference_upper_target": [],
+        "manifold_constrained_upper_target": [],
         "manifold_projected_upper_target": [],
         "manifold_latent": [],
         "manifold_projection_error": [],
+        "manifold_projection_error_after_reference_constraint": [],
         "manifold_latent_clip_fraction": [],
+        "manifold_reference_overflow": [],
+        "manifold_reference_clamp_fraction": [],
         "step_reward": [],
         "reward_terms": [],
         "done": [],
@@ -635,6 +640,12 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
     diagnostic["manifold_raw_upper_target"].append(
         _env0("manifold_raw_upper_target", (upper_dim,))
     )
+    diagnostic["manifold_reference_upper_target"].append(
+        _env0("manifold_reference_upper_target", (upper_dim,))
+    )
+    diagnostic["manifold_constrained_upper_target"].append(
+        _env0("manifold_constrained_upper_target", (upper_dim,))
+    )
     diagnostic["manifold_projected_upper_target"].append(
         _env0("manifold_projected_upper_target", (upper_dim,))
     )
@@ -642,8 +653,17 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
     diagnostic["manifold_projection_error"].append(
         float(_env0("manifold_projection_error", ()).item())
     )
+    diagnostic["manifold_projection_error_after_reference_constraint"].append(
+        float(_env0("manifold_projection_error_after_reference_constraint", ()).item())
+    )
     diagnostic["manifold_latent_clip_fraction"].append(
         float(_env0("manifold_latent_clip_fraction", ()).item())
+    )
+    diagnostic["manifold_reference_overflow"].append(
+        _env0("manifold_reference_overflow", (upper_dim,))
+    )
+    diagnostic["manifold_reference_clamp_fraction"].append(
+        float(_env0("manifold_reference_clamp_fraction", ()).item())
     )
 
 
