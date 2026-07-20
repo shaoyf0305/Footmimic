@@ -64,6 +64,54 @@ Phase D acceptance: speed test shows pelvis speed follow stop and go. Heading te
 
 ## Play diagnostics
 
+### Manual control-regression cases
+
+Run these after training with `--video --dual_view --arm_diagnostic`.  They are
+manual cases, deliberately not an automated script: simulator versions and
+available hardware vary between environments.  Use the control task and append
+the shown command arguments to the normal `play_multi.py` invocation.
+
+**A. Steady maximum speed**
+
+```
+--locomotion_cmd_speed 2.0
+--locomotion_cmd_heading 0.0
+--locomotion_cmd_duration 20.0
+--locomotion_cmd_hold_last
+```
+
+Check that `Robot actual` settles close to the effective `Loco cmd`, does not
+remain above it, retains the ball, and does not terminate.
+
+**B. Speed up and brake**
+
+```
+--locomotion_cmd_speed 0.8 2.0 1.2
+--locomotion_cmd_heading 0.0 0.0 0.0
+--locomotion_cmd_duration 5.0 8.0 7.0
+--locomotion_cmd_hold_last
+```
+
+Check acceleration, braking, and re-settling separately.  In particular, a
+2.0 m/s target must not leave a persistent overspeed after the 1.2 m/s segment.
+
+**C. High-speed smooth turns**
+
+```
+--locomotion_cmd_speed 1.8 1.8 1.8
+--locomotion_cmd_heading 0.0 0.50 -0.50
+--locomotion_cmd_duration 5.0 5.0 5.0
+--locomotion_cmd_hold_last
+```
+
+During each transition, `Requested endpoint` should lead the effective `Loco
+cmd`; the latter must rotate continuously and reduce speed before recovering.
+Check heading error, ball distance/contact, falls, and recovery to 1.8 m/s
+after each turn.
+
+For all cases, retain the `.npz` arm diagnostic and compare upper-joint error,
+reference-clamp fraction, and termination reason against the prior checkpoint.
+
 Speed channel:
 locomotion_cmd_speed 0.0 0.55 0.0
 locomotion_cmd_heading 0.0 0.0 0.0

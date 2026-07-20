@@ -531,6 +531,8 @@ def _create_arm_diagnostic(env, log_dir: str, stride: int, constraint: dict | No
         "ball_xy_speed": [],
         "ball_command_forward_speed": [],
         "pelvis_xy_speed": [],
+        "command_target_speed": [],
+        "command_target_heading": [],
         "foot_reference_position_error": [],
         "heading_error": [],
         "no_contact_count": [],
@@ -576,6 +578,10 @@ def _append_arm_diagnostic(
     diagnostic["style_phase"].append(int(command.style_phase_steps[0].item()))
     diagnostic["segment_idx"].append(int(command._locomotion_segment_idx[0].item()))
     diagnostic["command_heading"].append(float(command.locomotion_cmd_heading[0].item()))
+    target_speed = getattr(command, "locomotion_cmd_target_speed", command.locomotion_cmd_speed)
+    target_heading = getattr(command, "locomotion_cmd_target_heading", command.locomotion_cmd_heading)
+    diagnostic["command_target_speed"].append(float(target_speed[0].item()))
+    diagnostic["command_target_heading"].append(float(target_heading[0].item()))
 
     pelvis_id = robot.body_names.index("pelvis")
     pelvis_quat = robot.data.body_quat_w[0, pelvis_id]
@@ -909,6 +915,20 @@ def _get_play_overlay(env) -> str:
                 f"{track_str}"
                 f"{hold_str}"
             )
+            # Control smooths a requested endpoint into the effective command
+            # above.  Show both during a turn so speed reduction is observable.
+            target_speed_buf = getattr(cmd, "locomotion_cmd_target_speed", None)
+            target_heading_buf = getattr(cmd, "locomotion_cmd_target_heading", None)
+            if target_speed_buf is not None and target_heading_buf is not None:
+                target_spd = float(target_speed_buf[i].item())
+                target_hdg = float(target_heading_buf[i].item())
+                heading_gap = float(np.arctan2(np.sin(target_hdg - cmd_hdg), np.cos(target_hdg - cmd_hdg)))
+                if abs(target_spd - cmd_spd) > 0.01 or abs(heading_gap) > 0.01:
+                    lines.append(
+                        f"Requested endpoint :"
+                        f"  {target_spd:4.2f} m/s"
+                        f"  {_deg(target_hdg):+4.0f}deg {_arrow(target_hdg):<2s}"
+                    )
 
             # actual robot velocity vs command
             actual_hdg = float(np.arctan2(pelvis_vel[1], pelvis_vel[0]))

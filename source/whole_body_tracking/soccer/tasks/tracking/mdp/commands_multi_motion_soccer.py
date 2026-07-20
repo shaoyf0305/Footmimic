@@ -434,6 +434,12 @@ class MotionCommand(CommandTerm):
         self._locomotion_cmd_hold_steps_remaining = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.locomotion_cmd_speed = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.locomotion_cmd_heading = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        # These are requested endpoints.  The public command above remains the
+        # effective command seen by the policy and reward after smoothing.
+        self.locomotion_cmd_target_speed = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.locomotion_cmd_target_heading = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.locomotion_cmd_target_wz = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._locomotion_cmd_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._locomotion_segment_plans: list[list[tuple[float, float, float, float]]] = [[] for _ in range(self.num_envs)]
         self._locomotion_segment_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._locomotion_segment_hold_last = True
@@ -537,7 +543,30 @@ class MotionCommand(CommandTerm):
         heading: torch.Tensor,
         wz: torch.Tensor,
     ) -> None:
-        """Write speed/heading (task +X heading rad) into manual vel buffers."""
+        """Set a requested polar command, smoothing later changes when configured."""
+        self.locomotion_cmd_target_speed[env_ids] = speed
+        self.locomotion_cmd_target_heading[env_ids] = heading
+        self.locomotion_cmd_target_wz[env_ids] = wz
+        self._locomotion_cmd_steps_since_change[env_ids] = 0
+
+        # A reset must begin from a concrete command; only subsequent changes
+        # are filtered.  Legacy tasks retain the original immediate behavior.
+        smoothing_enabled = bool(getattr(self.cfg, "locomotion_cmd_smoothing_enabled", False))
+        immediate = ~self._locomotion_cmd_initialized[env_ids]
+        if not smoothing_enabled:
+            immediate = torch.ones_like(immediate)
+        if torch.any(immediate):
+            ids = env_ids[immediate]
+            self._write_effective_polar_locomotion(ids, speed[immediate], heading[immediate], wz[immediate])
+
+    def _write_effective_polar_locomotion(
+        self,
+        env_ids: torch.Tensor,
+        speed: torch.Tensor,
+        heading: torch.Tensor,
+        wz: torch.Tensor,
+    ) -> None:
+        """Write the effective speed/heading into the velocity-command buffers."""
         vx = speed * torch.cos(heading)
         vy = speed * torch.sin(heading)
         self.locomotion_manual_lin_vel[env_ids, 0] = vx
@@ -548,7 +577,49 @@ class MotionCommand(CommandTerm):
         self.locomotion_manual_ang_vel[env_ids, 2] = wz
         self.locomotion_cmd_speed[env_ids] = speed
         self.locomotion_cmd_heading[env_ids] = heading
-        self._locomotion_cmd_steps_since_change[env_ids] = 0
+        self._locomotion_cmd_initialized[env_ids] = True
+
+    def _update_smoothed_locomotion_commands(self) -> None:
+        """Advance requested endpoints with bounded heading and speed rates."""
+        if not bool(getattr(self.cfg, "locomotion_cmd_smoothing_enabled", False)):
+            return
+        if self._locomotion_command_mode not in {"resampled", "manual"}:
+            return
+
+        ids = self._locomotion_cmd_initialized.nonzero(as_tuple=False).flatten()
+        if ids.numel() == 0:
+            return
+
+        dt = self._env_step_dt_s()
+        heading_error = torch.atan2(
+            torch.sin(self.locomotion_cmd_target_heading[ids] - self.locomotion_cmd_heading[ids]),
+            torch.cos(self.locomotion_cmd_target_heading[ids] - self.locomotion_cmd_heading[ids]),
+        )
+        heading_rate = max(float(getattr(self.cfg, "locomotion_cmd_heading_rate_limit", 0.0)), 0.0)
+        if heading_rate > 0.0:
+            heading_step = torch.clamp(heading_error, min=-heading_rate * dt, max=heading_rate * dt)
+        else:
+            heading_step = heading_error
+        heading = self.locomotion_cmd_heading[ids] + heading_step
+
+        # Turning lowers the speed endpoint while the direction is changing;
+        # the slew limit then applies a physically continuous brake/recovery.
+        slow_angle = max(float(getattr(self.cfg, "locomotion_cmd_turn_slowdown_angle", 0.0)), 1.0e-6)
+        min_speed_scale = min(max(float(getattr(self.cfg, "locomotion_cmd_turn_min_speed_scale", 1.0)), 0.0), 1.0)
+        turn_fraction = torch.clamp(torch.abs(heading_error) / slow_angle, max=1.0)
+        desired_speed = self.locomotion_cmd_target_speed[ids] * (
+            1.0 - (1.0 - min_speed_scale) * turn_fraction
+        )
+        speed_delta = desired_speed - self.locomotion_cmd_speed[ids]
+        accel_limit = max(float(getattr(self.cfg, "locomotion_cmd_accel_limit", 0.0)), 0.0)
+        decel_limit = max(float(getattr(self.cfg, "locomotion_cmd_decel_limit", accel_limit)), 0.0)
+        if accel_limit > 0.0 or decel_limit > 0.0:
+            max_up = accel_limit * dt if accel_limit > 0.0 else float("inf")
+            max_down = decel_limit * dt if decel_limit > 0.0 else float("inf")
+            speed_delta = torch.clamp(speed_delta, min=-max_down, max=max_up)
+        speed = torch.clamp(self.locomotion_cmd_speed[ids] + speed_delta, min=0.0)
+
+        self._write_effective_polar_locomotion(ids, speed, heading, self.locomotion_cmd_target_wz[ids])
 
     def _sample_locomotion_commands(self, env_ids: torch.Tensor | Sequence[int]) -> None:
         """Sample speed + heading (+ optional wz) and a random hold duration per env."""
@@ -566,7 +637,22 @@ class MotionCommand(CommandTerm):
 
         n = env_ids.numel()
         speed = sample_uniform(speed_range[0], speed_range[1], (n,), device=self.device)
-        heading = sample_uniform(heading_range[0], heading_range[1], (n,), device=self.device)
+        heading_delta_range = getattr(self.cfg, "locomotion_cmd_heading_delta_range", None)
+        initialized = self._locomotion_cmd_initialized[env_ids]
+        if heading_delta_range is not None and torch.any(initialized):
+            # The first command of an episode remains uniformly distributed.
+            # Thereafter sample a bounded delta, explicitly training turning
+            # transitions rather than only unrelated heading snapshots.
+            heading = sample_uniform(heading_range[0], heading_range[1], (n,), device=self.device)
+            delta = sample_uniform(heading_delta_range[0], heading_delta_range[1], (n,), device=self.device)
+            transitioned_heading = torch.clamp(
+                self.locomotion_cmd_heading[env_ids] + delta,
+                min=heading_range[0],
+                max=heading_range[1],
+            )
+            heading = torch.where(initialized, transitioned_heading, heading)
+        else:
+            heading = sample_uniform(heading_range[0], heading_range[1], (n,), device=self.device)
         wz = sample_uniform(wz_range[0], wz_range[1], (n,), device=self.device)
         duration_s = sample_uniform(duration_range[0], duration_range[1], (n,), device=self.device)
 
@@ -725,6 +811,9 @@ class MotionCommand(CommandTerm):
             xy = self.locomotion_manual_lin_vel[env_ids, :2]
             self.locomotion_cmd_speed[env_ids] = torch.norm(xy, dim=-1)
             self.locomotion_cmd_heading[env_ids] = torch.atan2(xy[:, 1], xy[:, 0])
+            self.locomotion_cmd_target_speed[env_ids] = self.locomotion_cmd_speed[env_ids]
+            self.locomotion_cmd_target_heading[env_ids] = self.locomotion_cmd_heading[env_ids]
+            self._locomotion_cmd_initialized[env_ids] = True
 
         if ang_vel is not None:
             if not isinstance(ang_vel, torch.Tensor):
@@ -1244,6 +1333,10 @@ class MotionCommand(CommandTerm):
         if env_ids.numel() == 0:
             return
 
+        # The next sampled command is an episode initial condition, not a
+        # transition from the previous terminated episode.
+        self._locomotion_cmd_initialized[env_ids] = False
+
         # In style-looping control this method is reached only for a real
         # episode reset, so restart the per-episode diagnostic counter.
         if not bool(getattr(self.cfg, "motion_clip_end_resample", True)):
@@ -1328,6 +1421,7 @@ class MotionCommand(CommandTerm):
     def _update_command(self):
         self.kick_contact_tracker.begin_step(self)
         self._update_locomotion_command_timers()
+        self._update_smoothed_locomotion_commands()
         self._steps_since_resample += 1
         # Advance the demo style phase.  Legacy tasks retain full clip-end
         # resampling; control opts into a style-only wrap so its task scene and
@@ -1455,6 +1549,15 @@ class MotionCommandCfg(CommandTermCfg):
     locomotion_cmd_heading_range: tuple[float, float] = (-0.75, 0.75)
     locomotion_cmd_duration_range: tuple[float, float] = (1.5, 3.0)
     locomotion_cmd_wz_range: tuple[float, float] = (0.0, 0.0)
+    # Optional control transition filter.  Keeping this disabled preserves
+    # legacy forward/follow tasks and their instantaneous command semantics.
+    locomotion_cmd_smoothing_enabled: bool = False
+    locomotion_cmd_heading_rate_limit: float = 0.0
+    locomotion_cmd_accel_limit: float = 0.0
+    locomotion_cmd_decel_limit: float = 0.0
+    locomotion_cmd_turn_slowdown_angle: float = 0.6
+    locomotion_cmd_turn_min_speed_scale: float = 1.0
+    locomotion_cmd_heading_delta_range: tuple[float, float] | None = None
     locomotion_cmd_lin_vel_range: dict[str, tuple[float, float]] = {
         "x": (0.25, 0.65),
         "y": (-0.25, 0.25),

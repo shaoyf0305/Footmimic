@@ -681,12 +681,29 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     # A control episode owns the task clock.  Demo time is a looping style
     # phase and must not reset the robot, ball, or locomotion command.
     cfg.commands.motion.motion_clip_end_resample = False
-    # 1.5 m/s is a normal control target, not an out-of-distribution play-only
-    # command.  Long holds force the policy to keep control across turns.
-    cfg.commands.motion.locomotion_cmd_speed_range = (0.40, 1.50)
+    # 2.0 m/s is a normal control target, not an out-of-distribution play-only
+    # command.  Sampling speed and heading transitions covers acceleration,
+    # braking, and turning rather than only steady straight runs.
+    cfg.commands.motion.locomotion_cmd_speed_range = (0.40, 2.00)
     cfg.commands.motion.locomotion_cmd_heading_range = (-0.75, 0.75)
     cfg.commands.motion.locomotion_cmd_duration_range = (3.0, 6.0)
     cfg.commands.motion.locomotion_cmd_wz_range = (0.0, 0.0)
+    cfg.commands.motion.locomotion_cmd_smoothing_enabled = True
+    cfg.commands.motion.locomotion_cmd_heading_rate_limit = 0.85
+    cfg.commands.motion.locomotion_cmd_accel_limit = 1.4
+    cfg.commands.motion.locomotion_cmd_decel_limit = 2.4
+    cfg.commands.motion.locomotion_cmd_turn_slowdown_angle = 0.55
+    cfg.commands.motion.locomotion_cmd_turn_min_speed_scale = 0.60
+    cfg.commands.motion.locomotion_cmd_heading_delta_range = (-0.70, 0.70)
+
+    # Follow keeps its demo-velocity tolerance.  Control instead needs a
+    # precise commanded-speed objective and an explicit reason not to overshoot.
+    cfg.rewards.motion_anchor_lin_vel.params["std"] = 0.35
+    cfg.rewards.motion_anchor_xy_speed_excess = RewTerm(
+        func=mdp.motion_anchor_xy_speed_excess_penalty,
+        weight=-4.0,
+        params={"command_name": "motion", "tolerance": 0.12, "scale": 0.25},
+    )
 
     # A turn or recovery necessarily departs from the instantaneous demo pose.
     # Keep these references as soft rewards, but never end a control episode

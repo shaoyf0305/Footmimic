@@ -244,6 +244,25 @@ def motion_anchor_lin_vel_tracking_exp(env: ManagerBasedRLEnv, command_name: str
     return torch.exp(-error / max(std, 1e-6) ** 2)
 
 
+def motion_anchor_xy_speed_excess_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    tolerance: float = 0.10,
+    scale: float = 0.25,
+) -> torch.Tensor:
+    """Penalize anchor XY speed above the active command plus a small tolerance.
+
+    The normal velocity-tracking reward is symmetric and intentionally smooth.
+    This one-sided term prevents other task rewards from making sustained
+    overspeed worthwhile, including high-speed sideways recoveries.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    desired_speed = torch.norm(_locomotion_lin_vel_command_w(command)[:, :2], dim=-1)
+    actual_speed = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
+    excess = torch.clamp(actual_speed - desired_speed - max(tolerance, 0.0), min=0.0)
+    return torch.square(excess / max(scale, 1.0e-6)).clamp(max=4.0)
+
+
 def motion_anchor_ang_vel_tracking_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:
     """Match active locomotion angular-velocity command (reference or manual)."""
     command: MotionCommand = env.command_manager.get_term(command_name)
