@@ -67,6 +67,124 @@ def upper_body_reference_overflow_penalty(
     return torch.mean(torch.sqrt(1.0 + torch.square(normalized_overflow)) - 1.0, dim=1)
 
 
+def trunk_pitch_reference_overflow_penalty(
+    env: ManagerBasedRLEnv,
+    action_name: str = "joint_pos",
+    lower_deviation: float = 0.45,
+    upper_deviation: float = 0.12,
+) -> torch.Tensor:
+    """Penalize pitch targets that exceed the smooth style-relative envelope."""
+    action_term = env.action_manager.get_term(action_name)
+    overflow = getattr(action_term, "trunk_pitch_reference_overflow", None)
+    if not isinstance(overflow, torch.Tensor):
+        return torch.zeros(env.num_envs, device=env.device)
+    scale = max(float(lower_deviation), float(upper_deviation), 1.0e-6)
+    normalized = overflow / scale
+    return torch.sqrt(1.0 + torch.square(normalized)) - 1.0
+
+
+def waist_pitch_reference_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    joint_name: str = "waist_pitch_joint",
+    std: float = 0.45,
+) -> torch.Tensor:
+    """Softly retain the reference's normal forward-lean waist-pitch pose."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    robot = command.robot
+    joint_ids, found_names = robot.find_joints([joint_name], preserve_order=True)
+    if len(joint_ids) != 1:
+        raise RuntimeError(f"Could not resolve waist pitch joint {joint_name!r}; found {found_names}.")
+    error = robot.data.joint_pos[:, joint_ids[0]] - command.joint_pos[:, joint_ids[0]]
+    return torch.exp(-torch.square(error) / max(float(std), 1.0e-6) ** 2)
+
+
+def _pitch_from_quat(quat: torch.Tensor) -> torch.Tensor:
+    """Return the intrinsic pitch component of scalar-first quaternions."""
+    sin_pitch = 2.0 * (quat[..., 0] * quat[..., 2] - quat[..., 3] * quat[..., 1])
+    return torch.asin(torch.clamp(sin_pitch, min=-1.0, max=1.0))
+
+
+def trunk_relative_pitch_reference_error_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    pelvis_body_name: str = "pelvis",
+    torso_body_name: str = "torso_link",
+    std: float = 0.35,
+) -> torch.Tensor:
+    """Softly track torso pitch relative to pelvis, retaining natural forward lean."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    robot = command.robot
+    pelvis_id = robot.body_names.index(pelvis_body_name)
+    torso_id = robot.body_names.index(torso_body_name)
+    reference_pelvis_id = command.cfg.body_names.index(pelvis_body_name)
+    reference_torso_id = command.cfg.body_names.index(torso_body_name)
+    actual_relative_quat = quat_mul(
+        quat_inv(robot.data.body_quat_w[:, pelvis_id]), robot.data.body_quat_w[:, torso_id]
+    )
+    reference_relative_quat = quat_mul(
+        quat_inv(command.body_quat_relative_w[:, reference_pelvis_id]),
+        command.body_quat_relative_w[:, reference_torso_id],
+    )
+    error = torch.atan2(
+        torch.sin(_pitch_from_quat(actual_relative_quat) - _pitch_from_quat(reference_relative_quat)),
+        torch.cos(_pitch_from_quat(actual_relative_quat) - _pitch_from_quat(reference_relative_quat)),
+    )
+    return torch.exp(-torch.square(error) / max(float(std), 1.0e-6) ** 2)
+
+
+def trunk_relative_pitch_rate_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    pelvis_body_name: str = "pelvis",
+    torso_body_name: str = "torso_link",
+) -> torch.Tensor:
+    """Penalize fore/aft torso oscillation relative to the pelvis frame."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    robot = command.robot
+    pelvis_id = robot.body_names.index(pelvis_body_name)
+    torso_id = robot.body_names.index(torso_body_name)
+    relative_ang_vel_w = (
+        robot.data.body_ang_vel_w[:, torso_id] - robot.data.body_ang_vel_w[:, pelvis_id]
+    )
+    relative_ang_vel_pelvis = quat_apply_inverse(
+        robot.data.body_quat_w[:, pelvis_id], relative_ang_vel_w
+    )
+    return torch.square(relative_ang_vel_pelvis[:, 1]).clamp(max=100.0)
+
+
+def trunk_pitch_effective_action_rate_l2(
+    env: ManagerBasedRLEnv,
+    action_name: str = "joint_pos",
+    joint_name: str = "waist_pitch_joint",
+) -> torch.Tensor:
+    """Penalize only the executed, filtered waist-pitch command rate."""
+    action_term = env.action_manager.get_term(action_name)
+    command: MotionCommand = env.command_manager.get_term("motion")
+    robot = command.robot
+    robot_joint_ids, found_names = robot.find_joints([joint_name], preserve_order=True)
+    if len(robot_joint_ids) != 1:
+        raise RuntimeError(f"Could not resolve waist pitch joint {joint_name!r}; found {found_names}.")
+    action_joint_ids = getattr(action_term, "_joint_ids", None)
+    if action_joint_ids is None:
+        action_joint_ids = getattr(action_term, "joint_ids", None)
+    if isinstance(action_joint_ids, slice):
+        action_id = int(robot_joint_ids[0])
+    elif action_joint_ids is not None:
+        if isinstance(action_joint_ids, torch.Tensor):
+            action_joint_ids = action_joint_ids.detach().cpu().tolist()
+        robot_to_action = {int(robot_id): i for i, robot_id in enumerate(action_joint_ids)}
+        try:
+            action_id = robot_to_action[int(robot_joint_ids[0])]
+        except KeyError as exc:
+            raise RuntimeError(f"joint_pos action does not control waist pitch joint id {exc.args[0]}.") from exc
+    else:
+        raise RuntimeError("joint_pos action term does not expose controlled joint ids.")
+    current = getattr(action_term, "effective_raw_actions", action_term.raw_actions)
+    previous = getattr(action_term, "prev_effective_raw_actions", env.action_manager.prev_action)
+    return torch.square(current[:, action_id] - previous[:, action_id]).clamp(max=100.0)
+
+
 def forward_velocity_reward(
     env: ManagerBasedRLEnv,
     target_speed: float = 0.8,

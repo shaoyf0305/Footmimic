@@ -696,6 +696,23 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     cfg.commands.motion.locomotion_cmd_turn_min_speed_scale = 0.60
     cfg.commands.motion.locomotion_cmd_heading_delta_range = (-0.70, 0.70)
 
+    # The playback A/B showed that waist roll is limited by PD tracking rather
+    # than effort saturation.  Give it the same 2x stiffness / sqrt(2)x damping
+    # pair in training, while keeping pitch at its validated baseline gains.
+    # Splitting the original two-joint actuator also makes this control-only;
+    # forward/follow environments retain the robot's default actuator layout.
+    control_actuators = dict(cfg.scene.robot.actuators)
+    waist_actuator = control_actuators.pop("waist")
+    control_actuators["waist_roll_control"] = waist_actuator.replace(
+        joint_names_expr=["waist_roll_joint"],
+        stiffness=2.0 * waist_actuator.stiffness,
+        damping=(2.0**0.5) * waist_actuator.damping,
+    )
+    control_actuators["waist_pitch_control"] = waist_actuator.replace(
+        joint_names_expr=["waist_pitch_joint"],
+    )
+    cfg.scene.robot.actuators = control_actuators
+
     # Follow keeps its demo-velocity tolerance.  Control instead needs a
     # precise commanded-speed objective and an explicit reason not to overshoot.
     cfg.rewards.motion_anchor_lin_vel.params["std"] = 0.35
@@ -803,6 +820,14 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         # envelope.  This is control-only: the base config defaults to None.
         # It prevents saturated PCA latents from locking an arm in a raised pose.
         reference_target_margin=0.25,
+        # Preserve the reference clip's normal forward lean, but smoothly
+        # compress and filter the policy's waist-pitch deviation from it.  The
+        # asymmetric envelope leaves room to lean farther forward for a touch,
+        # while strongly rejecting the recurrent backward target seen in 3.9.
+        trunk_pitch_joint_name="waist_pitch_joint",
+        trunk_pitch_lower_deviation=0.45,
+        trunk_pitch_upper_deviation=0.12,
+        trunk_pitch_cutoff_frequency_hz=1.8,
     )
     cfg.actions.joint_pos.scale = old_action_cfg.scale
     cfg.actions.joint_pos.offset = old_action_cfg.offset
@@ -825,6 +850,38 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     cfg.rewards.upper_body_reference_overflow = RewTerm(
         func=mdp.upper_body_reference_overflow_penalty,
         weight=-0.05,
+        params={"action_name": "joint_pos"},
+    )
+    # Keep a reference-relative forward lean without forcing the torso upright.
+    # These terms target the mechanism identified in the 3.9 diagnostic:
+    # recurrent waist-pitch target excursions and torso-vs-pelvis pitch rate.
+    cfg.rewards.trunk_pitch_reference_overflow = RewTerm(
+        func=mdp.trunk_pitch_reference_overflow_penalty,
+        weight=-0.10,
+        params={
+            "action_name": "joint_pos",
+            "lower_deviation": 0.45,
+            "upper_deviation": 0.12,
+        },
+    )
+    cfg.rewards.waist_pitch_reference = RewTerm(
+        func=mdp.waist_pitch_reference_error_exp,
+        weight=0.60,
+        params={"command_name": "motion", "std": 0.45},
+    )
+    cfg.rewards.trunk_relative_pitch_reference = RewTerm(
+        func=mdp.trunk_relative_pitch_reference_error_exp,
+        weight=0.45,
+        params={"command_name": "motion", "std": 0.35},
+    )
+    cfg.rewards.trunk_relative_pitch_rate = RewTerm(
+        func=mdp.trunk_relative_pitch_rate_l2,
+        weight=-0.08,
+        params={"command_name": "motion"},
+    )
+    cfg.rewards.trunk_pitch_effective_action_rate = RewTerm(
+        func=mdp.trunk_pitch_effective_action_rate_l2,
+        weight=-0.12,
         params={"action_name": "joint_pos"},
     )
 

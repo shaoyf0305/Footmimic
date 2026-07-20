@@ -37,6 +37,11 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             raise ValueError("orthogonal_residual_limit must be non-negative and cutoff_frequency_hz positive.")
         if cfg.reference_target_margin is not None and cfg.reference_target_margin <= 0.0:
             raise ValueError("reference_target_margin must be positive when enabled.")
+        if cfg.trunk_pitch_joint_name is not None:
+            if cfg.trunk_pitch_cutoff_frequency_hz <= 0.0:
+                raise ValueError("trunk_pitch_cutoff_frequency_hz must be positive when enabled.")
+            if cfg.trunk_pitch_lower_deviation <= 0.0 or cfg.trunk_pitch_upper_deviation <= 0.0:
+                raise ValueError("trunk pitch reference deviations must be positive when enabled.")
         super().__init__(cfg, env)
         self._manifold_env = env
 
@@ -68,11 +73,34 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self._manifold_basis: torch.Tensor | None = None
         self._manifold_latent_limit: torch.Tensor | None = None
 
+        self._trunk_pitch_robot_id: int | None = None
+        self._trunk_pitch_action_id: int | None = None
+        if cfg.trunk_pitch_joint_name is not None:
+            trunk_ids, trunk_names = self._asset.find_joints(
+                [cfg.trunk_pitch_joint_name], preserve_order=True
+            )
+            if len(trunk_ids) != 1:
+                raise ValueError(
+                    f"Could not resolve trunk pitch joint {cfg.trunk_pitch_joint_name!r}; found {trunk_names}."
+                )
+            try:
+                trunk_action_id = robot_to_action[int(trunk_ids[0])]
+            except KeyError as exc:
+                raise ValueError(
+                    f"The joint-position action does not control trunk pitch joint id {exc.args[0]}."
+                ) from exc
+            self._trunk_pitch_robot_id = int(trunk_ids[0])
+            self._trunk_pitch_action_id = trunk_action_id
+
         upper_dim = len(upper_action_ids)
         rank = min(int(cfg.manifold_rank), upper_dim)
         self._filtered_latent = torch.zeros(self.num_envs, rank, device=self.device)
         self._filtered_upper_target = torch.zeros(self.num_envs, upper_dim, device=self.device)
         self._filter_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._filtered_trunk_pitch_target = torch.zeros(self.num_envs, device=self.device)
+        self._trunk_pitch_filter_initialized = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
 
         # Public diagnostic tensors.  They are populated by process_actions().
         self.manifold_raw_upper_target = torch.zeros_like(self._filtered_upper_target)
@@ -87,6 +115,11 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.manifold_latent_clip_fraction = torch.zeros(self.num_envs, device=self.device)
         self.manifold_reference_overflow = torch.zeros_like(self._filtered_upper_target)
         self.manifold_reference_clamp_fraction = torch.zeros(self.num_envs, device=self.device)
+        self.trunk_pitch_raw_target = torch.full((self.num_envs,), torch.nan, device=self.device)
+        self.trunk_pitch_reference_target = torch.full((self.num_envs,), torch.nan, device=self.device)
+        self.trunk_pitch_soft_target = torch.full((self.num_envs,), torch.nan, device=self.device)
+        self.trunk_pitch_filtered_target = torch.full((self.num_envs,), torch.nan, device=self.device)
+        self.trunk_pitch_reference_overflow = torch.zeros(self.num_envs, device=self.device)
         self.effective_raw_actions = torch.zeros_like(self.raw_actions)
         self.prev_effective_raw_actions = torch.zeros_like(self.raw_actions)
 
@@ -229,6 +262,45 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self._filter_initialized[:] = True
         self._processed_actions[:, action_ids] = filtered_target
 
+        if self._trunk_pitch_robot_id is not None and self._trunk_pitch_action_id is not None:
+            trunk_action_id = self._trunk_pitch_action_id
+            trunk_robot_id = self._trunk_pitch_robot_id
+            trunk_raw_target = self.processed_actions[:, trunk_action_id].clone()
+            command = self._manifold_env.command_manager.get_term(self.cfg.command_name)
+            trunk_reference_target = command.joint_pos[:, trunk_robot_id]
+            trunk_deviation = trunk_raw_target - trunk_reference_target
+            lower_deviation = float(self.cfg.trunk_pitch_lower_deviation)
+            upper_deviation = float(self.cfg.trunk_pitch_upper_deviation)
+            trunk_soft_target = trunk_reference_target + torch.where(
+                trunk_deviation < 0.0,
+                lower_deviation * torch.tanh(trunk_deviation / lower_deviation),
+                upper_deviation * torch.tanh(trunk_deviation / upper_deviation),
+            )
+            trunk_alpha = 1.0 - math.exp(
+                -2.0 * math.pi * float(self.cfg.trunk_pitch_cutoff_frequency_hz) * step_dt
+            )
+            trunk_alpha = min(max(trunk_alpha, 0.0), 1.0)
+            previous_trunk_target = torch.where(
+                self._trunk_pitch_filter_initialized,
+                self._filtered_trunk_pitch_target,
+                self._asset.data.joint_pos[:, trunk_robot_id],
+            )
+            filtered_trunk_target = previous_trunk_target + trunk_alpha * (
+                trunk_soft_target - previous_trunk_target
+            )
+            self._filtered_trunk_pitch_target[:] = filtered_trunk_target
+            self._trunk_pitch_filter_initialized[:] = True
+            self._processed_actions[:, trunk_action_id] = filtered_trunk_target
+            self.trunk_pitch_raw_target[:] = trunk_raw_target
+            self.trunk_pitch_reference_target[:] = trunk_reference_target
+            self.trunk_pitch_soft_target[:] = trunk_soft_target
+            self.trunk_pitch_filtered_target[:] = filtered_trunk_target
+            self.trunk_pitch_reference_overflow[:] = torch.where(
+                trunk_deviation < 0.0,
+                torch.clamp(-trunk_deviation - lower_deviation, min=0.0),
+                torch.clamp(trunk_deviation - upper_deviation, min=0.0),
+            )
+
         scale = self._scale_tensor()
         offset = self._offset_tensor()
         upper_scale = scale[:, action_ids]
@@ -242,6 +314,17 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.effective_raw_actions[:, action_ids] = (
             filtered_target - offset[:, action_ids]
         ) / safe_upper_scale
+        if self._trunk_pitch_action_id is not None:
+            trunk_action_id = self._trunk_pitch_action_id
+            trunk_scale = scale[:, trunk_action_id]
+            safe_trunk_scale = torch.where(
+                torch.abs(trunk_scale) < 1.0e-8,
+                torch.ones_like(trunk_scale),
+                trunk_scale,
+            )
+            self.effective_raw_actions[:, trunk_action_id] = (
+                self._processed_actions[:, trunk_action_id] - offset[:, trunk_action_id]
+            ) / safe_trunk_scale
 
         self.manifold_raw_upper_target[:] = raw_target
         self.manifold_reference_upper_target[:] = reference_target
@@ -262,6 +345,13 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self._filtered_latent[env_ids] = 0.0
         self._filtered_upper_target[env_ids] = 0.0
         self._filter_initialized[env_ids] = False
+        self._filtered_trunk_pitch_target[env_ids] = 0.0
+        self._trunk_pitch_filter_initialized[env_ids] = False
+        self.trunk_pitch_raw_target[env_ids] = torch.nan
+        self.trunk_pitch_reference_target[env_ids] = torch.nan
+        self.trunk_pitch_soft_target[env_ids] = torch.nan
+        self.trunk_pitch_filtered_target[env_ids] = torch.nan
+        self.trunk_pitch_reference_overflow[env_ids] = 0.0
         self.effective_raw_actions[env_ids] = 0.0
         self.prev_effective_raw_actions[env_ids] = 0.0
 
@@ -279,3 +369,9 @@ class UpperBodyManifoldJointPositionActionCfg(JointPositionActionCfg):
     orthogonal_residual_limit: float = 0.10
     cutoff_frequency_hz: float = 1.8
     reference_target_margin: float | None = None
+    # Control-only pitch stabilizer.  It smooths the policy's deviation around
+    # the motion's normal forward-lean pose; it is not a hard pose lock.
+    trunk_pitch_joint_name: str | None = None
+    trunk_pitch_lower_deviation: float = 0.45
+    trunk_pitch_upper_deviation: float = 0.12
+    trunk_pitch_cutoff_frequency_hz: float = 1.8

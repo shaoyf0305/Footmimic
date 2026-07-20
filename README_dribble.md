@@ -66,7 +66,7 @@ Phase D acceptance: speed test shows pelvis speed follow stop and go. Heading te
 
 ### Manual control-regression cases
 
-Run these after training with `--video --dual_view --arm_diagnostic`.  They are
+Run these after training with `--video --dual_view --diagnostic`.  They are
 manual cases, deliberately not an automated script: simulator versions and
 available hardware vary between environments.  Use the control task and append
 the shown command arguments to the normal `play_multi.py` invocation.
@@ -109,8 +109,62 @@ cmd`; the latter must rotate continuously and reduce speed before recovering.
 Check heading error, ball distance/contact, falls, and recovery to 1.8 m/s
 after each turn.
 
-For all cases, retain the `.npz` arm diagnostic and compare upper-joint error,
-reference-clamp fraction, and termination reason against the prior checkpoint.
+For all cases, retain the `.npz` upper-body diagnostic and compare upper-joint error,
+reference-clamp fraction, and termination reason against the prior checkpoint. The
+`--diagnostic` records the three waist joints plus pelvis
+and torso roll/pitch/yaw and angular velocity. For the waist-sway investigation,
+compare `waist_joint_err`, `waist_action_step`, `torso_rel_tilt`,
+`torso_rel_tilt_err`, and `torso_rel_ang_vel` in the playback summary. The archive retains the old arm arrays
+and adds `trunk_*` arrays, so existing arm-analysis scripts remain valid.
+
+The trunk trace is deliberately end-to-end: `trunk_policy_action` is the raw
+policy output, `trunk_applied_action` is the replay-adjusted action,
+`trunk_processed_joint_target` is the physical position target after the action
+layer, and `trunk_post_step_target_error` is the resulting tracking error.
+`trunk_computed_torque`, `trunk_applied_torque`, `trunk_effort_utilization`,
+`trunk_effort_saturated`, and the actual/target joint-limit margins distinguish
+actuator saturation from a bad target or a reference-bound error.
+
+### Waist reference-bound counterfactual
+
+For the v3.9 waist-sway check, run the same playback twice: once with only
+`--diagnostic`, then once with the following extra option:
+
+```
+--waist_reference_margin 0.20
+```
+
+This is playback-only: it clamps waist yaw/roll/pitch targets to `q_ref ± 0.20`
+radians after policy inference. It does not modify the checkpoint, rewards, or
+training MDP. Compare ball distance/contact, heading error, `waist_joint_err`,
+and `torso_rel_tilt_err`; a better result should reduce the latter two without
+materially worsening the first two.
+
+### Waist-roll PD counterfactual
+
+The current diagnostic shows that waist roll misses its final target without
+reaching the 50 Nm effort limit. Test its PD authority independently of the
+reference-bound experiment:
+
+```
+--diagnostic --waist_roll_stiffness_scale 2.0
+```
+
+This splits the playback waist actuator into roll and pitch, doubles only roll
+stiffness, and scales only roll damping by `sqrt(2)`. Do not combine this first
+A/B test with `--waist_reference_margin`; compare it against the same command
+with only `--diagnostic`.
+
+The same roll PD setting is now built into the control training environment.
+For the control task, do not also pass `--waist_roll_stiffness_scale`: playback
+reports the built-in `x2.0` scale automatically.  The control action layer also
+keeps the reference clip's natural forward lean, while applying an asymmetric,
+smooth waist-pitch deviation envelope (`-0.45` / `+0.12` rad) and a 1.8 Hz
+low-pass filter.  It is intentionally not a hard upright or `q_ref +/- 0.2`
+lock.  A control diagnostic now includes `trunk_pitch_raw_target`,
+`trunk_pitch_soft_target`, `trunk_pitch_filtered_target`, and
+`trunk_pitch_reference_overflow`; check that the filtered target no longer
+tracks large recurrent fore/aft target jumps.
 
 Speed channel:
 locomotion_cmd_speed 0.0 0.55 0.0

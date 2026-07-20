@@ -127,16 +127,19 @@ parser.add_argument(
     help="Keep the final multi-segment polar command active instead of looping.",
 )
 parser.add_argument(
-    "--arm_diagnostic",
+    "--diagnostic",
     action="store_true",
     default=False,
-    help="Save reference/actual arm joints, policy actions, phase, and command values to a .npz file.",
+    help=(
+        "Save arm and waist reference/actual joints, policy actions, pelvis/torso motion, phase, "
+        "and command values to a .npz file."
+    ),
 )
 parser.add_argument(
-    "--arm_diagnostic_stride",
+    "--diagnostic_stride",
     type=int,
     default=1,
-    help="Record every N simulator steps with --arm_diagnostic (default: 1).",
+    help="Record every N simulator steps with --diagnostic (default: 1).",
 )
 parser.add_argument(
     "--upper_body_reference_margin",
@@ -155,6 +158,24 @@ parser.add_argument(
     help=(
         "Joints affected by --upper_body_reference_margin: wrists; wrists_elbows; or all "
         "shoulders, elbows, and wrists (default)."
+    ),
+)
+parser.add_argument(
+    "--waist_reference_margin",
+    type=float,
+    default=None,
+    help=(
+        "Play-only counterfactual: limit waist yaw/roll/pitch position targets to this many radians "
+        "from the current reference. Omit to use the checkpoint waist actions unchanged."
+    ),
+)
+parser.add_argument(
+    "--waist_roll_stiffness_scale",
+    type=float,
+    default=None,
+    help=(
+        "Play-only counterfactual: multiply waist-roll PD stiffness by this positive factor and "
+        "its damping by sqrt(factor). The waist-pitch actuator remains unchanged."
     ),
 )
 
@@ -327,6 +348,20 @@ _ARM_DIAGNOSTIC_JOINT_NAMES = [
     "right_wrist_yaw_joint",
 ]
 
+# The diagnostic archive keeps arm and trunk arrays separate so analysis scripts
+# can distinguish their control paths without relying on array slices.
+_TRUNK_DIAGNOSTIC_JOINT_NAMES = [
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+]
+_WAIST_REFERENCE_CONSTRAINT_GROUP = "waist"
+_TRUNK_DIAGNOSTIC_BODY_NAMES = ["pelvis", "torso_link"]
+# These match the G1 actuator ``effort_limit_sim`` values in ``soccer/robots/g1.py``.
+# They make saturation visible in an offline diagnostic without depending on a
+# simulator-internal actuator API.
+_TRUNK_EFFORT_LIMITS = [88.0, 50.0, 50.0]
+
 _UPPER_BODY_CONSTRAINT_JOINT_GROUPS = {
     "wrists": [
         "left_wrist_roll_joint",
@@ -420,25 +455,40 @@ def _get_joint_position_action_term(base_env):
     return action_term, torch.as_tensor(action_joint_ids, dtype=torch.long, device=base_env.device)
 
 
-def _create_upper_body_reference_constraint(env, margin: float, group: str) -> dict:
-    """Prepare a play-only joint-target clamp around the current arm reference."""
+def _action_ids_for_robot_joint_ids(action_joint_ids: torch.Tensor, robot_joint_ids) -> list[int]:
+    """Map robot joint ids to their positions in the policy action vector."""
+    robot_to_action = {int(robot_id): action_id for action_id, robot_id in enumerate(action_joint_ids.tolist())}
+    try:
+        return [robot_to_action[int(robot_id)] for robot_id in robot_joint_ids]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"joint_pos action does not control robot joint id {exc.args[0]}."
+        ) from exc
+
+
+def _world_quat_to_rpy(quat: torch.Tensor) -> torch.Tensor:
+    """Convert Isaac Lab scalar-first quaternions to roll/pitch/yaw in radians."""
+    w, x, y, z = quat.unbind(dim=-1)
+    roll = torch.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x.square() + y.square()))
+    pitch = torch.asin(torch.clamp(2.0 * (w * y - z * x), min=-1.0, max=1.0))
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
+    return torch.stack((roll, pitch, yaw), dim=-1)
+
+
+def _create_joint_reference_constraint(env, margin: float, group: str, joint_names: list[str]) -> dict:
+    """Prepare a play-only joint-target clamp around the current reference."""
     if margin < 0.0:
-        raise ValueError("--upper_body_reference_margin must be non-negative.")
+        raise ValueError(f"{group} reference margin must be non-negative.")
 
     base_env = _resolve_base_env(env)
     command = base_env.command_manager.get_term("motion")
     robot = base_env.scene[command.cfg.asset_name]
     action_term, action_joint_ids = _get_joint_position_action_term(base_env)
-    joint_names = _UPPER_BODY_CONSTRAINT_JOINT_GROUPS[group]
     robot_joint_ids, found_names = robot.find_joints(joint_names, preserve_order=True)
     if len(robot_joint_ids) != len(joint_names):
         raise RuntimeError(f"Could not resolve all {group} constraint joints; found {found_names}.")
 
-    robot_to_action = {int(robot_id): action_id for action_id, robot_id in enumerate(action_joint_ids.tolist())}
-    try:
-        action_ids = [robot_to_action[int(robot_id)] for robot_id in robot_joint_ids]
-    except KeyError as exc:
-        raise RuntimeError(f"joint_pos action does not control upper-body robot joint id {exc.args[0]}.") from exc
+    action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, robot_joint_ids)
 
     scale = getattr(action_term, "_scale", None)
     offset = getattr(action_term, "_offset", None)
@@ -456,7 +506,21 @@ def _create_upper_body_reference_constraint(env, margin: float, group: str) -> d
     }
 
 
-def _constrain_upper_body_actions(env, actions: torch.Tensor, constraint: dict) -> torch.Tensor:
+def _create_upper_body_reference_constraint(env, margin: float, group: str) -> dict:
+    """Prepare a play-only shoulder/elbow/wrist target clamp."""
+    return _create_joint_reference_constraint(
+        env, margin, group, _UPPER_BODY_CONSTRAINT_JOINT_GROUPS[group]
+    )
+
+
+def _create_waist_reference_constraint(env, margin: float) -> dict:
+    """Prepare a play-only waist yaw/roll/pitch target clamp."""
+    return _create_joint_reference_constraint(
+        env, margin, _WAIST_REFERENCE_CONSTRAINT_GROUP, _TRUNK_DIAGNOSTIC_JOINT_NAMES
+    )
+
+
+def _constrain_reference_actions(env, actions: torch.Tensor, constraint: dict) -> torch.Tensor:
     """Keep each commanded upper-body target within ``q_ref ± margin``.
 
     This is a counterfactual evaluation intervention only: it alters actions
@@ -469,7 +533,7 @@ def _constrain_upper_body_actions(env, actions: torch.Tensor, constraint: dict) 
     scale = constraint["scale"][:, action_ids]
     offset = constraint["offset"][:, action_ids]
     if torch.any(torch.abs(scale) < 1.0e-8):
-        raise RuntimeError("Cannot constrain upper-body actions with a zero action scale.")
+        raise RuntimeError(f"Cannot constrain {constraint['group']} actions with a zero action scale.")
 
     target = actions[:, action_ids] * scale + offset
     reference = command.joint_pos[:, robot_joint_ids]
@@ -483,10 +547,67 @@ def _constrain_upper_body_actions(env, actions: torch.Tensor, constraint: dict) 
     return constrained_actions
 
 
-def _create_arm_diagnostic(env, log_dir: str, stride: int, constraint: dict | None = None) -> dict:
-    """Prepare a compact, per-step arm-control trace for one playback env."""
+def _single_joint_actuator_parameter(value, joint_name: str, scale: float):
+    """Return a one-joint actuator parameter, preserving scalar config values."""
+    if not isinstance(value, dict):
+        return float(value) * scale
+    if joint_name in value:
+        return {joint_name: float(value[joint_name]) * scale}
+    if len(value) == 1:
+        return {joint_name: float(next(iter(value.values()))) * scale}
+    raise ValueError(f"Cannot select {joint_name} from multi-joint actuator parameter {value}.")
+
+
+def _apply_play_waist_roll_stiffness_scale(env_cfg, scale: float | None) -> float:
+    """Split the waist actuator and strengthen only waist roll for one playback."""
+    if scale is not None and scale <= 0.0:
+        raise ValueError("--waist_roll_stiffness_scale must be positive.")
+
+    actuators = dict(env_cfg.scene.robot.actuators)
+    waist_cfg = actuators.pop("waist", None)
+    if waist_cfg is None:
+        if "waist_roll_control" in actuators:
+            if scale is not None:
+                raise ValueError(
+                    "The control task already uses the training waist-roll PD scale (2.0); "
+                    "do not also pass --waist_roll_stiffness_scale."
+                )
+            print("[INFO] Control task uses the training waist-roll PD scale: stiffness x2.000, damping x1.414.")
+            return 2.0
+        raise RuntimeError("Play-only waist-roll override requires the robot 'waist' actuator config.")
+    if scale is None:
+        return 1.0
+
+    damping_scale = float(scale) ** 0.5
+    actuators["waist_roll_play"] = waist_cfg.replace(
+        joint_names_expr=["waist_roll_joint"],
+        stiffness=_single_joint_actuator_parameter(waist_cfg.stiffness, "waist_roll_joint", scale),
+        damping=_single_joint_actuator_parameter(waist_cfg.damping, "waist_roll_joint", damping_scale),
+    )
+    actuators["waist_pitch_play"] = waist_cfg.replace(
+        joint_names_expr=["waist_pitch_joint"],
+        stiffness=_single_joint_actuator_parameter(waist_cfg.stiffness, "waist_pitch_joint", 1.0),
+        damping=_single_joint_actuator_parameter(waist_cfg.damping, "waist_pitch_joint", 1.0),
+    )
+    env_cfg.scene.robot.actuators = actuators
+    print(
+        "[INFO] Play-only waist-roll PD override: "
+        f"stiffness x{scale:.3f}, damping x{damping_scale:.3f}; waist pitch unchanged."
+    )
+    return float(scale)
+
+
+def _create_diagnostic(
+    env,
+    log_dir: str,
+    stride: int,
+    constraints: list[dict] | None = None,
+    waist_roll_stiffness_scale: float = 1.0,
+) -> dict:
+    """Prepare a per-step arm, waist, and trunk-motion trace for one playback env."""
     if stride <= 0:
-        raise ValueError("--arm_diagnostic_stride must be positive.")
+        raise ValueError("--diagnostic_stride must be positive.")
+    constraints = [] if constraints is None else constraints
 
     base_env = _resolve_base_env(env)
     command = base_env.command_manager.get_term("motion")
@@ -494,26 +615,63 @@ def _create_arm_diagnostic(env, log_dir: str, stride: int, constraint: dict | No
     joint_ids, found_names = robot.find_joints(_ARM_DIAGNOSTIC_JOINT_NAMES, preserve_order=True)
     if len(joint_ids) != len(_ARM_DIAGNOSTIC_JOINT_NAMES):
         raise RuntimeError(
-            "Could not resolve all arm diagnostic joints. "
+            "Could not resolve all arm joints for the diagnostic. "
             f"Expected {_ARM_DIAGNOSTIC_JOINT_NAMES}, found {found_names}."
         )
+    trunk_joint_ids, trunk_found_names = robot.find_joints(
+        _TRUNK_DIAGNOSTIC_JOINT_NAMES, preserve_order=True
+    )
+    if len(trunk_joint_ids) != len(_TRUNK_DIAGNOSTIC_JOINT_NAMES):
+        raise RuntimeError(
+            "Could not resolve all waist diagnostic joints. "
+            f"Expected {_TRUNK_DIAGNOSTIC_JOINT_NAMES}, found {trunk_found_names}."
+        )
+    trunk_body_ids = [robot.body_names.index(name) for name in _TRUNK_DIAGNOSTIC_BODY_NAMES]
+    try:
+        trunk_reference_body_ids = [command.cfg.body_names.index(name) for name in _TRUNK_DIAGNOSTIC_BODY_NAMES]
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Motion command does not expose every trunk diagnostic body: {_TRUNK_DIAGNOSTIC_BODY_NAMES}."
+        ) from exc
+    _, action_joint_ids = _get_joint_position_action_term(base_env)
+    arm_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, joint_ids)
+    trunk_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, trunk_joint_ids)
 
     output_dir = os.path.join(log_dir, "diagnostics")
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(
-        output_dir, f"arm_diagnostic_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.npz"
+        output_dir, f"diagnostic_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.npz"
     )
     reward_manager = getattr(base_env, "reward_manager", None)
     reward_term_names = np.asarray(getattr(reward_manager, "_term_names", []))
+    constraint_groups = np.asarray([constraint["group"] for constraint in constraints])
+    constraint_margins = np.asarray([constraint["margin"] for constraint in constraints], dtype=np.float32)
+    constraint_joint_names = (
+        np.concatenate([constraint["joint_names"] for constraint in constraints])
+        if constraints else np.asarray([])
+    )
     return {
         "path": output_path,
         "stride": int(stride),
         "joint_ids": torch.as_tensor(joint_ids, dtype=torch.long, device=base_env.device),
         "joint_names": np.asarray(_ARM_DIAGNOSTIC_JOINT_NAMES),
+        "action_ids": torch.as_tensor(arm_action_ids, dtype=torch.long, device=base_env.device),
+        "trunk_joint_ids": torch.as_tensor(trunk_joint_ids, dtype=torch.long, device=base_env.device),
+        "trunk_joint_names": np.asarray(_TRUNK_DIAGNOSTIC_JOINT_NAMES),
+        "trunk_action_ids": torch.as_tensor(trunk_action_ids, dtype=torch.long, device=base_env.device),
+        "trunk_body_ids": torch.as_tensor(trunk_body_ids, dtype=torch.long, device=base_env.device),
+        "trunk_reference_body_ids": torch.as_tensor(
+            trunk_reference_body_ids, dtype=torch.long, device=base_env.device
+        ),
+        "trunk_body_names": np.asarray(_TRUNK_DIAGNOSTIC_BODY_NAMES),
         "reward_term_names": reward_term_names,
-        "constraint_group": "none" if constraint is None else constraint["group"],
-        "constraint_margin": np.nan if constraint is None else float(constraint["margin"]),
-        "constraint_joint_names": np.asarray([]) if constraint is None else constraint["joint_names"],
+        "constraint_group": "none" if not constraints else "+".join(constraint_groups.tolist()),
+        "constraint_margin": float(constraint_margins[0]) if len(constraints) == 1 else np.nan,
+        "constraint_joint_names": constraint_joint_names,
+        "constraint_groups": constraint_groups,
+        "constraint_margins": constraint_margins,
+        "waist_roll_stiffness_scale": float(waist_roll_stiffness_scale),
+        "waist_roll_damping_scale": float(waist_roll_stiffness_scale) ** 0.5,
         "step": [],
         "motion_idx": [],
         "style_phase": [],
@@ -526,6 +684,35 @@ def _create_arm_diagnostic(env, log_dir: str, stride: int, constraint: dict | No
         "actual_joint_vel": [],
         "policy_action": [],
         "applied_action": [],
+        "trunk_reference_joint_pos": [],
+        "trunk_reference_joint_vel": [],
+        "trunk_actual_joint_pos": [],
+        "trunk_actual_joint_vel": [],
+        "trunk_policy_action": [],
+        "trunk_applied_action": [],
+        "trunk_processed_joint_target": [],
+        "trunk_target_minus_reference": [],
+        "trunk_post_step_actual_joint_pos": [],
+        "trunk_post_step_target_error": [],
+        "trunk_soft_joint_pos_limits": [],
+        "trunk_actual_limit_margin": [],
+        "trunk_target_limit_margin": [],
+        "trunk_computed_torque": [],
+        "trunk_applied_torque": [],
+        "trunk_effort_limit": [],
+        "trunk_computed_effort_utilization": [],
+        "trunk_effort_utilization": [],
+        "trunk_effort_saturated": [],
+        "pelvis_rpy": [],
+        "torso_rpy": [],
+        "torso_minus_pelvis_rpy": [],
+        "reference_pelvis_rpy": [],
+        "reference_torso_rpy": [],
+        "reference_torso_minus_pelvis_rpy": [],
+        "torso_minus_pelvis_rpy_error": [],
+        "pelvis_ang_vel_w": [],
+        "torso_ang_vel_w": [],
+        "torso_minus_pelvis_ang_vel_w": [],
         "ball_pelvis_xy_distance": [],
         "ball_contact": [],
         "ball_xy_speed": [],
@@ -547,6 +734,11 @@ def _create_arm_diagnostic(env, log_dir: str, stride: int, constraint: dict | No
         "manifold_latent_clip_fraction": [],
         "manifold_reference_overflow": [],
         "manifold_reference_clamp_fraction": [],
+        "trunk_pitch_raw_target": [],
+        "trunk_pitch_reference_target": [],
+        "trunk_pitch_soft_target": [],
+        "trunk_pitch_filtered_target": [],
+        "trunk_pitch_reference_overflow": [],
         "step_reward": [],
         "reward_terms": [],
         "done": [],
@@ -554,7 +746,7 @@ def _create_arm_diagnostic(env, log_dir: str, stride: int, constraint: dict | No
     }
 
 
-def _append_arm_diagnostic(
+def _append_diagnostic(
     diagnostic: dict,
     env,
     policy_actions: torch.Tensor,
@@ -569,6 +761,11 @@ def _append_arm_diagnostic(
     command = base_env.command_manager.get_term("motion")
     robot = base_env.scene[command.cfg.asset_name]
     ids = diagnostic["joint_ids"]
+    action_ids = diagnostic["action_ids"]
+    trunk_ids = diagnostic["trunk_joint_ids"]
+    trunk_action_ids = diagnostic["trunk_action_ids"]
+    trunk_body_ids = diagnostic["trunk_body_ids"]
+    trunk_reference_body_ids = diagnostic["trunk_reference_body_ids"]
 
     def _cpu(value: torch.Tensor) -> np.ndarray:
         return value[0].detach().cpu().numpy().copy()
@@ -593,8 +790,45 @@ def _append_arm_diagnostic(
     diagnostic["reference_joint_vel"].append(_cpu(command.joint_vel[:, ids]))
     diagnostic["actual_joint_pos"].append(_cpu(robot.data.joint_pos[:, ids]))
     diagnostic["actual_joint_vel"].append(_cpu(robot.data.joint_vel[:, ids]))
-    diagnostic["policy_action"].append(_cpu(policy_actions[:, ids]))
-    diagnostic["applied_action"].append(_cpu(applied_actions[:, ids]))
+    diagnostic["policy_action"].append(_cpu(policy_actions[:, action_ids]))
+    diagnostic["applied_action"].append(_cpu(applied_actions[:, action_ids]))
+    diagnostic["trunk_reference_joint_pos"].append(_cpu(command.joint_pos[:, trunk_ids]))
+    diagnostic["trunk_reference_joint_vel"].append(_cpu(command.joint_vel[:, trunk_ids]))
+    diagnostic["trunk_actual_joint_pos"].append(_cpu(robot.data.joint_pos[:, trunk_ids]))
+    diagnostic["trunk_actual_joint_vel"].append(_cpu(robot.data.joint_vel[:, trunk_ids]))
+    diagnostic["trunk_policy_action"].append(_cpu(policy_actions[:, trunk_action_ids]))
+    diagnostic["trunk_applied_action"].append(_cpu(applied_actions[:, trunk_action_ids]))
+
+    trunk_quat = robot.data.body_quat_w[0, trunk_body_ids]
+    trunk_rpy = _world_quat_to_rpy(trunk_quat)
+    torso_minus_pelvis_rpy = torch.atan2(
+        torch.sin(trunk_rpy[1] - trunk_rpy[0]),
+        torch.cos(trunk_rpy[1] - trunk_rpy[0]),
+    )
+    reference_trunk_rpy = _world_quat_to_rpy(
+        command.body_quat_relative_w[0, trunk_reference_body_ids]
+    )
+    reference_torso_minus_pelvis_rpy = torch.atan2(
+        torch.sin(reference_trunk_rpy[1] - reference_trunk_rpy[0]),
+        torch.cos(reference_trunk_rpy[1] - reference_trunk_rpy[0]),
+    )
+    torso_minus_pelvis_rpy_error = torch.atan2(
+        torch.sin(torso_minus_pelvis_rpy - reference_torso_minus_pelvis_rpy),
+        torch.cos(torso_minus_pelvis_rpy - reference_torso_minus_pelvis_rpy),
+    )
+    trunk_ang_vel_w = robot.data.body_ang_vel_w[0, trunk_body_ids]
+    diagnostic["pelvis_rpy"].append(_cpu(trunk_rpy[None, 0]))
+    diagnostic["torso_rpy"].append(_cpu(trunk_rpy[None, 1]))
+    diagnostic["torso_minus_pelvis_rpy"].append(_cpu(torso_minus_pelvis_rpy[None]))
+    diagnostic["reference_pelvis_rpy"].append(_cpu(reference_trunk_rpy[None, 0]))
+    diagnostic["reference_torso_rpy"].append(_cpu(reference_trunk_rpy[None, 1]))
+    diagnostic["reference_torso_minus_pelvis_rpy"].append(
+        _cpu(reference_torso_minus_pelvis_rpy[None])
+    )
+    diagnostic["torso_minus_pelvis_rpy_error"].append(_cpu(torso_minus_pelvis_rpy_error[None]))
+    diagnostic["pelvis_ang_vel_w"].append(_cpu(trunk_ang_vel_w[None, 0]))
+    diagnostic["torso_ang_vel_w"].append(_cpu(trunk_ang_vel_w[None, 1]))
+    diagnostic["torso_minus_pelvis_ang_vel_w"].append(_cpu((trunk_ang_vel_w[1] - trunk_ang_vel_w[0])[None]))
     soccer_ball = base_env.scene["soccer_ball"]
     ball_delta_xy = soccer_ball.data.root_pos_w[0, :2] - robot.data.body_pos_w[0, pelvis_id, :2]
     diagnostic["ball_pelvis_xy_distance"].append(float(torch.norm(ball_delta_xy).item()))
@@ -632,7 +866,7 @@ def _append_arm_diagnostic(
 
 
 def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
-    """Record the action term's post-step projection for the sample just opened."""
+    """Record post-step arm projection and trunk target/actuator telemetry."""
     base_env = _resolve_base_env(env)
     action_term = base_env.action_manager.get_term("joint_pos")
 
@@ -671,16 +905,91 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
     diagnostic["manifold_reference_clamp_fraction"].append(
         float(_env0("manifold_reference_clamp_fraction", ()).item())
     )
+    diagnostic["trunk_pitch_raw_target"].append(
+        float(_env0("trunk_pitch_raw_target", ()).item())
+    )
+    diagnostic["trunk_pitch_reference_target"].append(
+        float(_env0("trunk_pitch_reference_target", ()).item())
+    )
+    diagnostic["trunk_pitch_soft_target"].append(
+        float(_env0("trunk_pitch_soft_target", ()).item())
+    )
+    diagnostic["trunk_pitch_filtered_target"].append(
+        float(_env0("trunk_pitch_filtered_target", ()).item())
+    )
+    diagnostic["trunk_pitch_reference_overflow"].append(
+        float(_env0("trunk_pitch_reference_overflow", ()).item())
+    )
+
+    command = base_env.command_manager.get_term("motion")
+    robot = base_env.scene[command.cfg.asset_name]
+    trunk_ids = diagnostic["trunk_joint_ids"]
+    trunk_action_ids = diagnostic["trunk_action_ids"]
+    processed_actions = getattr(action_term, "processed_actions", None)
+    if processed_actions is None:
+        processed_actions = getattr(action_term, "_processed_actions", None)
+
+    if isinstance(processed_actions, torch.Tensor):
+        trunk_target = processed_actions[0, trunk_action_ids]
+    else:
+        trunk_target = torch.full(
+            (len(_TRUNK_DIAGNOSTIC_JOINT_NAMES),),
+            float("nan"),
+            dtype=robot.data.joint_pos.dtype,
+            device=base_env.device,
+        )
+    trunk_post_step_pos = robot.data.joint_pos[0, trunk_ids]
+    trunk_reference = command.joint_pos[0, trunk_ids]
+    soft_limits = robot.data.soft_joint_pos_limits[0, trunk_ids]
+    trunk_actual_limit_margin = torch.minimum(
+        trunk_post_step_pos - soft_limits[:, 0], soft_limits[:, 1] - trunk_post_step_pos
+    )
+    trunk_target_limit_margin = torch.minimum(
+        trunk_target - soft_limits[:, 0], soft_limits[:, 1] - trunk_target
+    )
+    computed_torque = getattr(robot.data, "computed_torque", None)
+    if isinstance(computed_torque, torch.Tensor):
+        trunk_computed_torque = computed_torque[0, trunk_ids]
+    else:
+        trunk_computed_torque = torch.full_like(trunk_target, float("nan"))
+    applied_torque = getattr(robot.data, "applied_torque", None)
+    if isinstance(applied_torque, torch.Tensor):
+        trunk_applied_torque = applied_torque[0, trunk_ids]
+    else:
+        trunk_applied_torque = torch.full_like(trunk_target, float("nan"))
+    effort_limit = torch.as_tensor(_TRUNK_EFFORT_LIMITS, dtype=trunk_target.dtype, device=base_env.device)
+    computed_effort_utilization = torch.abs(trunk_computed_torque) / effort_limit
+    effort_utilization = torch.abs(trunk_applied_torque) / effort_limit
+
+    def _trunk_cpu(value: torch.Tensor) -> np.ndarray:
+        return value.detach().cpu().numpy().copy()
+
+    diagnostic["trunk_processed_joint_target"].append(_trunk_cpu(trunk_target))
+    diagnostic["trunk_target_minus_reference"].append(_trunk_cpu(trunk_target - trunk_reference))
+    diagnostic["trunk_post_step_actual_joint_pos"].append(_trunk_cpu(trunk_post_step_pos))
+    diagnostic["trunk_post_step_target_error"].append(_trunk_cpu(trunk_post_step_pos - trunk_target))
+    diagnostic["trunk_soft_joint_pos_limits"].append(_trunk_cpu(soft_limits))
+    diagnostic["trunk_actual_limit_margin"].append(_trunk_cpu(trunk_actual_limit_margin))
+    diagnostic["trunk_target_limit_margin"].append(_trunk_cpu(trunk_target_limit_margin))
+    diagnostic["trunk_computed_torque"].append(_trunk_cpu(trunk_computed_torque))
+    diagnostic["trunk_applied_torque"].append(_trunk_cpu(trunk_applied_torque))
+    diagnostic["trunk_effort_limit"].append(_trunk_cpu(effort_limit))
+    diagnostic["trunk_computed_effort_utilization"].append(_trunk_cpu(computed_effort_utilization))
+    diagnostic["trunk_effort_utilization"].append(_trunk_cpu(effort_utilization))
+    diagnostic["trunk_effort_saturated"].append(_trunk_cpu(effort_utilization >= 0.98))
 
 
-def _save_arm_diagnostic(diagnostic: dict) -> None:
+def _save_diagnostic(diagnostic: dict) -> None:
     """Persist the trace in a self-describing NumPy archive."""
     if not diagnostic["step"]:
-        print("[WARN] Arm diagnostic requested but no samples were recorded.")
+        print("[WARN] Diagnostic requested but no samples were recorded.")
         return
     metadata_keys = {
-        "path", "stride", "joint_ids", "joint_names", "reward_term_names",
-        "constraint_group", "constraint_margin", "constraint_joint_names",
+        "path", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names",
+        "trunk_joint_ids", "trunk_joint_names", "trunk_action_ids", "trunk_body_ids",
+        "trunk_reference_body_ids", "trunk_body_names",
+        "constraint_group", "constraint_margin", "constraint_joint_names", "constraint_groups",
+        "constraint_margins", "waist_roll_stiffness_scale", "waist_roll_damping_scale",
     }
     arrays = {
         key: np.asarray(value)
@@ -688,10 +997,16 @@ def _save_arm_diagnostic(diagnostic: dict) -> None:
         if key not in metadata_keys
     }
     arrays["joint_names"] = diagnostic["joint_names"]
+    arrays["trunk_joint_names"] = diagnostic["trunk_joint_names"]
+    arrays["trunk_body_names"] = diagnostic["trunk_body_names"]
     arrays["reward_term_names"] = diagnostic["reward_term_names"]
     arrays["constraint_group"] = np.asarray(diagnostic["constraint_group"])
     arrays["constraint_margin"] = np.asarray(diagnostic["constraint_margin"])
     arrays["constraint_joint_names"] = diagnostic["constraint_joint_names"]
+    arrays["constraint_groups"] = diagnostic["constraint_groups"]
+    arrays["constraint_margins"] = diagnostic["constraint_margins"]
+    arrays["waist_roll_stiffness_scale"] = np.asarray(diagnostic["waist_roll_stiffness_scale"])
+    arrays["waist_roll_damping_scale"] = np.asarray(diagnostic["waist_roll_damping_scale"])
     np.savez_compressed(diagnostic["path"], **arrays)
     contact_rate = float(np.mean(arrays["ball_contact"]))
     ball_distance = float(np.mean(arrays["ball_pelvis_xy_distance"]))
@@ -701,6 +1016,60 @@ def _save_arm_diagnostic(diagnostic: dict) -> None:
     foot_error = float(np.mean(arrays["foot_reference_position_error"]))
     heading_error = float(np.mean(np.abs(arrays["heading_error"])))
     arm_error = float(np.mean(np.abs(arrays["actual_joint_pos"] - arrays["reference_joint_pos"])))
+    trunk_error = float(
+        np.mean(np.abs(arrays["trunk_actual_joint_pos"] - arrays["trunk_reference_joint_pos"]))
+    )
+    trunk_action_delta = np.diff(arrays["trunk_applied_action"], axis=0)
+    trunk_action_step = (
+        float(np.mean(np.linalg.norm(trunk_action_delta, axis=1))) if trunk_action_delta.size else np.nan
+    )
+    torso_rel_tilt = float(
+        np.mean(np.linalg.norm(arrays["torso_minus_pelvis_rpy"][:, :2], axis=1))
+    )
+    torso_rel_tilt_error = float(
+        np.mean(np.linalg.norm(arrays["torso_minus_pelvis_rpy_error"][:, :2], axis=1))
+    )
+    torso_rel_ang_vel = float(
+        np.mean(np.linalg.norm(arrays["torso_minus_pelvis_ang_vel_w"], axis=1))
+    )
+    trunk_target_error = float(np.nanmean(np.abs(arrays["trunk_post_step_target_error"])))
+    trunk_target_reference_offset = float(np.nanmean(np.abs(arrays["trunk_target_minus_reference"])))
+    trunk_pitch_filter_values = np.abs(
+        arrays["trunk_pitch_filtered_target"] - arrays["trunk_pitch_raw_target"]
+    )
+    finite_trunk_pitch_filter_values = trunk_pitch_filter_values[
+        np.isfinite(trunk_pitch_filter_values)
+    ]
+    trunk_pitch_filter_delta = (
+        float(np.mean(finite_trunk_pitch_filter_values))
+        if finite_trunk_pitch_filter_values.size
+        else np.nan
+    )
+    finite_trunk_pitch_overflow = arrays["trunk_pitch_reference_overflow"][
+        np.isfinite(arrays["trunk_pitch_reference_overflow"])
+    ]
+    trunk_pitch_overflow = (
+        float(np.mean(finite_trunk_pitch_overflow)) if finite_trunk_pitch_overflow.size else np.nan
+    )
+    trunk_effort_utilization = arrays["trunk_effort_utilization"]
+    finite_effort_utilization = trunk_effort_utilization[np.isfinite(trunk_effort_utilization)]
+    effort_utilization_p95 = (
+        float(np.percentile(finite_effort_utilization, 95)) if finite_effort_utilization.size else np.nan
+    )
+    computed_effort_utilization = arrays["trunk_computed_effort_utilization"]
+    finite_computed_effort_utilization = computed_effort_utilization[
+        np.isfinite(computed_effort_utilization)
+    ]
+    computed_effort_utilization_p95 = (
+        float(np.percentile(finite_computed_effort_utilization, 95))
+        if finite_computed_effort_utilization.size else np.nan
+    )
+    effort_saturation_fraction = float(np.nanmean(arrays["trunk_effort_saturated"]))
+    trunk_limit_margin = arrays["trunk_actual_limit_margin"]
+    finite_limit_margin = trunk_limit_margin[np.isfinite(trunk_limit_margin)]
+    limit_margin_p05 = (
+        float(np.percentile(finite_limit_margin, 5)) if finite_limit_margin.size else np.nan
+    )
     terminations = int(np.sum(arrays["done"]))
     finite_projection = arrays["manifold_projection_error"][
         np.isfinite(arrays["manifold_projection_error"])
@@ -713,14 +1082,25 @@ def _save_arm_diagnostic(diagnostic: dict) -> None:
     term_reasons = arrays["termination_reason"][arrays["termination_reason"] != ""]
     unique_reasons, reason_counts = np.unique(term_reasons, return_counts=True)
     reason_summary = ", ".join(f"{name}={count}" for name, count in zip(unique_reasons, reason_counts)) or "none"
-    print(f"[INFO] Arm diagnostic ({len(diagnostic['step'])} samples) → {diagnostic['path']}")
+    print(f"[INFO] Diagnostic ({len(diagnostic['step'])} samples) → {diagnostic['path']}")
     print(
         "[INFO] Counterfactual metrics: "
         f"contact_rate={contact_rate:.3f}  ball_pelvis_xy={ball_distance:.3f} m  "
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
         f"pelvis_xy_speed={pelvis_speed:.3f} m/s  "
         f"foot_ref_err={foot_error:.3f} m  mean_abs_heading_err={heading_error:.3f} rad  "
-        f"upper_joint_err={arm_error:.3f} rad  manifold_projection={projection_error:.3f} rad  "
+        f"arm_joint_err={arm_error:.3f} rad  waist_joint_err={trunk_error:.3f} rad  "
+        f"waist_action_step={trunk_action_step:.3f}  torso_rel_tilt={torso_rel_tilt:.3f} rad  "
+        f"torso_rel_tilt_err={torso_rel_tilt_error:.3f} rad  "
+        f"torso_rel_ang_vel={torso_rel_ang_vel:.3f} rad/s  manifold_projection={projection_error:.3f} rad  "
+        f"waist_target_err={trunk_target_error:.3f} rad  "
+        f"waist_target_ref_offset={trunk_target_reference_offset:.3f} rad  "
+        f"waist_pitch_filter_delta={trunk_pitch_filter_delta:.3f} rad  "
+        f"waist_pitch_overflow={trunk_pitch_overflow:.3f} rad  "
+        f"waist_computed_effort_util_p95={computed_effort_utilization_p95:.3f}  "
+        f"waist_effort_util_p95={effort_utilization_p95:.3f}  "
+        f"waist_effort_sat={effort_saturation_fraction:.3f}  "
+        f"waist_limit_margin_p05={limit_margin_p05:.3f} rad  "
         f"latent_clip={latent_clip:.3f}  terminations={terminations} ({reason_summary})"
     )
 
@@ -1097,6 +1477,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     elif args_cli.record_all_motions and len(motion_files) > 1:
         print(f"[INFO] --record_all_motions: using explicit --video_length={play_steps}")
 
+    waist_roll_stiffness_scale = _apply_play_waist_roll_stiffness_scale(
+        env_cfg, args_cli.waist_roll_stiffness_scale
+    )
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
@@ -1118,23 +1502,37 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
-    upper_body_constraint = None
+    reference_constraints: list[dict] = []
     if args_cli.upper_body_reference_margin is not None:
         upper_body_constraint = _create_upper_body_reference_constraint(
             env, args_cli.upper_body_reference_margin, args_cli.upper_body_constraint_group
         )
+        reference_constraints.append(upper_body_constraint)
         print(
             "[INFO] Play-only upper-body reference constraint enabled: "
             f"group={upper_body_constraint['group']}  "
             f"q_target ∈ q_ref ± {upper_body_constraint['margin']:.3f} rad"
         )
 
-    arm_diagnostic = None
-    if args_cli.arm_diagnostic:
-        arm_diagnostic = _create_arm_diagnostic(
-            env, log_dir, args_cli.arm_diagnostic_stride, upper_body_constraint
+    if args_cli.waist_reference_margin is not None:
+        waist_constraint = _create_waist_reference_constraint(env, args_cli.waist_reference_margin)
+        reference_constraints.append(waist_constraint)
+        print(
+            "[INFO] Play-only waist reference constraint enabled: "
+            f"q_target within q_ref +/- {waist_constraint['margin']:.3f} rad"
         )
-        print(f"[INFO] Arm diagnostic enabled (stride={arm_diagnostic['stride']}) → {arm_diagnostic['path']}")
+
+    diagnostic = None
+    if args_cli.diagnostic:
+        diagnostic = _create_diagnostic(
+            env,
+            log_dir,
+            args_cli.diagnostic_stride,
+            reference_constraints,
+            waist_roll_stiffness_scale,
+        )
+        print("[INFO] Diagnostic scope: arms + waist + pelvis/torso motion.")
+        print(f"[INFO] Diagnostic enabled (stride={diagnostic['stride']}) → {diagnostic['path']}")
 
     # export policy to onnx/jit
     export_targets: list[tuple[str, str]] = []
@@ -1231,21 +1629,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         with torch.inference_mode():
             policy_actions = policy(obs)
             actions = policy_actions
-            if upper_body_constraint is not None:
-                actions = _constrain_upper_body_actions(env, policy_actions, upper_body_constraint)
-            recorded_arm_sample = False
-            if arm_diagnostic is not None:
-                recorded_arm_sample = _append_arm_diagnostic(
-                    arm_diagnostic, env, policy_actions, actions, timestep
+            for reference_constraint in reference_constraints:
+                actions = _constrain_reference_actions(env, actions, reference_constraint)
+            recorded_diagnostic_sample = False
+            if diagnostic is not None:
+                recorded_diagnostic_sample = _append_diagnostic(
+                    diagnostic, env, policy_actions, actions, timestep
                 )
             # env stepping
             obs, reward, dones, _ = env.step(actions)
-            if recorded_arm_sample:
-                _append_upper_body_manifold_diagnostic(arm_diagnostic, env)
-                arm_diagnostic["step_reward"][-1] = float(reward[0].item())
-                arm_diagnostic["done"].append(bool(dones[0].item()))
-                arm_diagnostic["reward_terms"].append(_reward_term_values(base_env))
-                arm_diagnostic["termination_reason"].append(
+            if recorded_diagnostic_sample:
+                _append_upper_body_manifold_diagnostic(diagnostic, env)
+                diagnostic["step_reward"][-1] = float(reward[0].item())
+                diagnostic["done"].append(bool(dones[0].item()))
+                diagnostic["reward_terms"].append(_reward_term_values(base_env))
+                diagnostic["termination_reason"].append(
                     _active_failure_termination_reason(base_env) if bool(dones[0].item()) else ""
                 )
 
@@ -1260,8 +1658,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if video_recorder is not None:
         video_recorder.save()
 
-    if arm_diagnostic is not None:
-        _save_arm_diagnostic(arm_diagnostic)
+    if diagnostic is not None:
+        _save_diagnostic(diagnostic)
 
     # close the simulator
     env.close()
