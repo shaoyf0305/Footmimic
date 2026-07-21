@@ -67,20 +67,68 @@ def upper_body_reference_overflow_penalty(
     return torch.mean(torch.sqrt(1.0 + torch.square(normalized_overflow)) - 1.0, dim=1)
 
 
+def locomotion_turn_relaxation(
+    command: MotionCommand,
+    start_angle: float | None,
+    full_angle: float,
+) -> torch.Tensor:
+    """Return 0 for steady motion and 1 for a large unfinished heading change."""
+    if start_angle is None:
+        return torch.zeros(command.num_envs, device=command.device)
+    if full_angle <= start_angle:
+        raise ValueError("full_angle must exceed start_angle for turn relaxation.")
+    target_heading = getattr(command, "locomotion_cmd_target_heading", command.locomotion_cmd_heading)
+    heading_delta = torch.atan2(
+        torch.sin(target_heading - command.locomotion_cmd_heading),
+        torch.cos(target_heading - command.locomotion_cmd_heading),
+    ).abs()
+    robot = command.robot
+    pelvis_id = robot.body_names.index("pelvis")
+    pelvis_quat = robot.data.body_quat_w[:, pelvis_id]
+    pelvis_yaw = torch.atan2(
+        2.0 * (pelvis_quat[:, 0] * pelvis_quat[:, 3] + pelvis_quat[:, 1] * pelvis_quat[:, 2]),
+        1.0 - 2.0 * (torch.square(pelvis_quat[:, 2]) + torch.square(pelvis_quat[:, 3])),
+    )
+    tracking_error = torch.atan2(
+        torch.sin(command.locomotion_cmd_heading - pelvis_yaw),
+        torch.cos(command.locomotion_cmd_heading - pelvis_yaw),
+    ).abs()
+    heading_delta = torch.maximum(heading_delta, tracking_error)
+    return torch.clamp((heading_delta - start_angle) / (full_angle - start_angle), min=0.0, max=1.0)
+
+
+def _turn_stability_weight(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    turn_relaxation_start_angle: float | None,
+    turn_relaxation_full_angle: float,
+) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    return 1.0 - locomotion_turn_relaxation(
+        command, turn_relaxation_start_angle, turn_relaxation_full_angle
+    )
+
+
 def trunk_pitch_reference_overflow_penalty(
     env: ManagerBasedRLEnv,
     action_name: str = "joint_pos",
     lower_deviation: float = 0.45,
     upper_deviation: float = 0.12,
+    command_name: str = "motion",
+    turn_relaxation_start_angle: float | None = None,
+    turn_relaxation_full_angle: float = 0.45,
 ) -> torch.Tensor:
-    """Penalize pitch targets that exceed the smooth style-relative envelope."""
+    """Penalize pitch overflow, except while a commanded turn needs it."""
     action_term = env.action_manager.get_term(action_name)
     overflow = getattr(action_term, "trunk_pitch_reference_overflow", None)
     if not isinstance(overflow, torch.Tensor):
         return torch.zeros(env.num_envs, device=env.device)
     scale = max(float(lower_deviation), float(upper_deviation), 1.0e-6)
     normalized = overflow / scale
-    return torch.sqrt(1.0 + torch.square(normalized)) - 1.0
+    penalty = torch.sqrt(1.0 + torch.square(normalized)) - 1.0
+    return penalty * _turn_stability_weight(
+        env, command_name, turn_relaxation_start_angle, turn_relaxation_full_angle
+    )
 
 
 def waist_pitch_reference_error_exp(
@@ -88,6 +136,8 @@ def waist_pitch_reference_error_exp(
     command_name: str = "motion",
     joint_name: str = "waist_pitch_joint",
     std: float = 0.45,
+    turn_relaxation_start_angle: float | None = None,
+    turn_relaxation_full_angle: float = 0.45,
 ) -> torch.Tensor:
     """Softly retain the reference's normal forward-lean waist-pitch pose."""
     command: MotionCommand = env.command_manager.get_term(command_name)
@@ -96,7 +146,10 @@ def waist_pitch_reference_error_exp(
     if len(joint_ids) != 1:
         raise RuntimeError(f"Could not resolve waist pitch joint {joint_name!r}; found {found_names}.")
     error = robot.data.joint_pos[:, joint_ids[0]] - command.joint_pos[:, joint_ids[0]]
-    return torch.exp(-torch.square(error) / max(float(std), 1.0e-6) ** 2)
+    reward = torch.exp(-torch.square(error) / max(float(std), 1.0e-6) ** 2)
+    return reward * _turn_stability_weight(
+        env, command_name, turn_relaxation_start_angle, turn_relaxation_full_angle
+    )
 
 
 def _pitch_from_quat(quat: torch.Tensor) -> torch.Tensor:
@@ -111,6 +164,8 @@ def trunk_relative_pitch_reference_error_exp(
     pelvis_body_name: str = "pelvis",
     torso_body_name: str = "torso_link",
     std: float = 0.35,
+    turn_relaxation_start_angle: float | None = None,
+    turn_relaxation_full_angle: float = 0.45,
 ) -> torch.Tensor:
     """Softly track torso pitch relative to pelvis, retaining natural forward lean."""
     command: MotionCommand = env.command_manager.get_term(command_name)
@@ -130,7 +185,10 @@ def trunk_relative_pitch_reference_error_exp(
         torch.sin(_pitch_from_quat(actual_relative_quat) - _pitch_from_quat(reference_relative_quat)),
         torch.cos(_pitch_from_quat(actual_relative_quat) - _pitch_from_quat(reference_relative_quat)),
     )
-    return torch.exp(-torch.square(error) / max(float(std), 1.0e-6) ** 2)
+    reward = torch.exp(-torch.square(error) / max(float(std), 1.0e-6) ** 2)
+    return reward * _turn_stability_weight(
+        env, command_name, turn_relaxation_start_angle, turn_relaxation_full_angle
+    )
 
 
 def trunk_relative_pitch_rate_l2(
@@ -138,6 +196,8 @@ def trunk_relative_pitch_rate_l2(
     command_name: str = "motion",
     pelvis_body_name: str = "pelvis",
     torso_body_name: str = "torso_link",
+    turn_relaxation_start_angle: float | None = None,
+    turn_relaxation_full_angle: float = 0.45,
 ) -> torch.Tensor:
     """Penalize fore/aft torso oscillation relative to the pelvis frame."""
     command: MotionCommand = env.command_manager.get_term(command_name)
@@ -150,17 +210,23 @@ def trunk_relative_pitch_rate_l2(
     relative_ang_vel_pelvis = quat_apply_inverse(
         robot.data.body_quat_w[:, pelvis_id], relative_ang_vel_w
     )
-    return torch.square(relative_ang_vel_pelvis[:, 1]).clamp(max=100.0)
+    penalty = torch.square(relative_ang_vel_pelvis[:, 1]).clamp(max=100.0)
+    return penalty * _turn_stability_weight(
+        env, command_name, turn_relaxation_start_angle, turn_relaxation_full_angle
+    )
 
 
 def trunk_pitch_effective_action_rate_l2(
     env: ManagerBasedRLEnv,
     action_name: str = "joint_pos",
     joint_name: str = "waist_pitch_joint",
+    command_name: str = "motion",
+    turn_relaxation_start_angle: float | None = None,
+    turn_relaxation_full_angle: float = 0.45,
 ) -> torch.Tensor:
     """Penalize only the executed, filtered waist-pitch command rate."""
     action_term = env.action_manager.get_term(action_name)
-    command: MotionCommand = env.command_manager.get_term("motion")
+    command: MotionCommand = env.command_manager.get_term(command_name)
     robot = command.robot
     robot_joint_ids, found_names = robot.find_joints([joint_name], preserve_order=True)
     if len(robot_joint_ids) != 1:
@@ -182,7 +248,10 @@ def trunk_pitch_effective_action_rate_l2(
         raise RuntimeError("joint_pos action term does not expose controlled joint ids.")
     current = getattr(action_term, "effective_raw_actions", action_term.raw_actions)
     previous = getattr(action_term, "prev_effective_raw_actions", env.action_manager.prev_action)
-    return torch.square(current[:, action_id] - previous[:, action_id]).clamp(max=100.0)
+    penalty = torch.square(current[:, action_id] - previous[:, action_id]).clamp(max=100.0)
+    return penalty * _turn_stability_weight(
+        env, command_name, turn_relaxation_start_angle, turn_relaxation_full_angle
+    )
 
 
 def forward_velocity_reward(
@@ -259,6 +328,39 @@ def task_heading_alignment_reward(
     pelvis_index = robot.body_names.index("pelvis")
     pelvis_quat_w = robot.data.body_quat_w[:, pelvis_index]
     return task_pelvis_heading_cos_world_x(pelvis_quat_w).clamp(min=0.0, max=1.0)
+
+
+def locomotion_heading_tracking_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    pelvis_body_name: str = "pelvis",
+    std: float = 0.35,
+    min_command_speed: float = 0.15,
+) -> torch.Tensor:
+    """Reward pelvis yaw tracking of the *effective* locomotion command.
+
+    The command smoother exposes the heading it currently asks the policy to
+    execute.  Tracking that value, rather than the final endpoint, makes the
+    reward feasible throughout a large direction reversal and gives turning a
+    direct training signal instead of relying on velocity tracking alone.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    robot = command.robot
+    pelvis_id = robot.body_names.index(pelvis_body_name)
+    pelvis_quat_w = robot.data.body_quat_w[:, pelvis_id]
+    pelvis_yaw = torch.atan2(
+        2.0 * (pelvis_quat_w[:, 0] * pelvis_quat_w[:, 3] + pelvis_quat_w[:, 1] * pelvis_quat_w[:, 2]),
+        1.0 - 2.0 * (torch.square(pelvis_quat_w[:, 2]) + torch.square(pelvis_quat_w[:, 3])),
+    )
+    heading_error = torch.atan2(
+        torch.sin(command.locomotion_cmd_heading - pelvis_yaw),
+        torch.cos(command.locomotion_cmd_heading - pelvis_yaw),
+    )
+    reward = torch.exp(-torch.square(heading_error) / max(float(std), 1.0e-6) ** 2)
+    speed_gate = torch.clamp(
+        command.locomotion_cmd_speed / max(float(min_command_speed), 1.0e-6), min=0.0, max=1.0
+    )
+    return reward * speed_gate
 
 
 def waist_action_rate_l2_clip(env: ManagerBasedRLEnv, waist_cfg: SceneEntityCfg | None = None) -> torch.Tensor:
@@ -379,6 +481,27 @@ def motion_anchor_xy_speed_excess_penalty(
     actual_speed = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
     excess = torch.clamp(actual_speed - desired_speed - max(tolerance, 0.0), min=0.0)
     return torch.square(excess / max(scale, 1.0e-6)).clamp(max=4.0)
+
+
+def motion_anchor_xy_speed_deficit_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    tolerance: float = 0.15,
+    scale: float = 0.30,
+    min_command_speed: float = 0.25,
+) -> torch.Tensor:
+    """Penalize stopping below a meaningful active command speed.
+
+    Velocity tracking alone becomes a bounded near-zero reward when the policy
+    brakes.  This asymmetric companion makes braking through a turn an actual
+    cost while remaining inactive for deliberate near-zero commands.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    desired_speed = torch.norm(_locomotion_lin_vel_command_w(command)[:, :2], dim=-1)
+    actual_speed = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
+    deficit = torch.clamp(desired_speed - actual_speed - max(tolerance, 0.0), min=0.0)
+    active = (desired_speed >= float(min_command_speed)).to(deficit.dtype)
+    return active * torch.square(deficit / max(scale, 1.0e-6)).clamp(max=4.0)
 
 
 def motion_anchor_ang_vel_tracking_exp(env: ManagerBasedRLEnv, command_name: str, std: float) -> torch.Tensor:

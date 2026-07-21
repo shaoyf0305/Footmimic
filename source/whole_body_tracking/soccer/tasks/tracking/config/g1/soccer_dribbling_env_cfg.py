@@ -694,7 +694,9 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     cfg.commands.motion.locomotion_cmd_decel_limit = 2.4
     cfg.commands.motion.locomotion_cmd_turn_slowdown_angle = 0.55
     cfg.commands.motion.locomotion_cmd_turn_min_speed_scale = 0.60
-    cfg.commands.motion.locomotion_cmd_heading_delta_range = (-0.70, 0.70)
+    # Include full left-to-right reversals.  The previous +/-0.70 rad range
+    # never trained the +0.65 -> -0.65 transition used by control playback.
+    cfg.commands.motion.locomotion_cmd_heading_delta_range = (-1.30, 1.30)
 
     # The playback A/B showed that waist roll is limited by PD tracking rather
     # than effort saturation.  Give it the same 2x stiffness / sqrt(2)x damping
@@ -713,13 +715,33 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     )
     cfg.scene.robot.actuators = control_actuators
 
-    # Follow keeps its demo-velocity tolerance.  Control instead needs a
-    # precise commanded-speed objective and an explicit reason not to overshoot.
+    # Follow keeps its demo-velocity tolerance.  Control needs commanded-speed
+    # tracking, but a turn must not be solved by braking to a stop.  Use balanced
+    # one-sided overspeed/deficit terms instead of the old strong overspeed-only
+    # penalty, which made conservative braking disproportionately attractive.
     cfg.rewards.motion_anchor_lin_vel.params["std"] = 0.35
     cfg.rewards.motion_anchor_xy_speed_excess = RewTerm(
         func=mdp.motion_anchor_xy_speed_excess_penalty,
-        weight=-4.0,
-        params={"command_name": "motion", "tolerance": 0.12, "scale": 0.25},
+        weight=-1.25,
+        params={"command_name": "motion", "tolerance": 0.18, "scale": 0.30},
+    )
+    cfg.rewards.motion_anchor_xy_speed_deficit = RewTerm(
+        func=mdp.motion_anchor_xy_speed_deficit_penalty,
+        weight=-1.25,
+        params={
+            "command_name": "motion",
+            "tolerance": 0.18,
+            "scale": 0.30,
+            "min_command_speed": 0.25,
+        },
+    )
+    # The generic task heading term is intentionally disabled for arbitrary
+    # command headings.  Replace it with an effective-command yaw reward so
+    # a policy cannot satisfy speed tracking by crab-walking or refusing turns.
+    cfg.rewards.locomotion_heading_tracking = RewTerm(
+        func=mdp.locomotion_heading_tracking_exp,
+        weight=2.5,
+        params={"command_name": "motion", "std": 0.35, "min_command_speed": 0.25},
     )
 
     # A turn or recovery necessarily departs from the instantaneous demo pose.
@@ -828,6 +850,13 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         trunk_pitch_lower_deviation=0.45,
         trunk_pitch_upper_deviation=0.12,
         trunk_pitch_cutoff_frequency_hz=1.8,
+        # Let a deliberate, unfinished heading transition borrow pitch
+        # authority; restore the tighter forward-lean envelope in steady motion.
+        trunk_pitch_turn_start_angle=0.12,
+        trunk_pitch_turn_full_angle=0.45,
+        trunk_pitch_turn_lower_deviation=0.65,
+        trunk_pitch_turn_upper_deviation=0.28,
+        trunk_pitch_turn_cutoff_frequency_hz=4.0,
     )
     cfg.actions.joint_pos.scale = old_action_cfg.scale
     cfg.actions.joint_pos.offset = old_action_cfg.offset
@@ -862,27 +891,49 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
             "action_name": "joint_pos",
             "lower_deviation": 0.45,
             "upper_deviation": 0.12,
+            "command_name": "motion",
+            "turn_relaxation_start_angle": 0.12,
+            "turn_relaxation_full_angle": 0.45,
         },
     )
     cfg.rewards.waist_pitch_reference = RewTerm(
         func=mdp.waist_pitch_reference_error_exp,
         weight=0.60,
-        params={"command_name": "motion", "std": 0.45},
+        params={
+            "command_name": "motion",
+            "std": 0.45,
+            "turn_relaxation_start_angle": 0.12,
+            "turn_relaxation_full_angle": 0.45,
+        },
     )
     cfg.rewards.trunk_relative_pitch_reference = RewTerm(
         func=mdp.trunk_relative_pitch_reference_error_exp,
         weight=0.45,
-        params={"command_name": "motion", "std": 0.35},
+        params={
+            "command_name": "motion",
+            "std": 0.35,
+            "turn_relaxation_start_angle": 0.12,
+            "turn_relaxation_full_angle": 0.45,
+        },
     )
     cfg.rewards.trunk_relative_pitch_rate = RewTerm(
         func=mdp.trunk_relative_pitch_rate_l2,
         weight=-0.08,
-        params={"command_name": "motion"},
+        params={
+            "command_name": "motion",
+            "turn_relaxation_start_angle": 0.12,
+            "turn_relaxation_full_angle": 0.45,
+        },
     )
     cfg.rewards.trunk_pitch_effective_action_rate = RewTerm(
         func=mdp.trunk_pitch_effective_action_rate_l2,
         weight=-0.12,
-        params={"action_name": "joint_pos"},
+        params={
+            "action_name": "joint_pos",
+            "command_name": "motion",
+            "turn_relaxation_start_angle": 0.12,
+            "turn_relaxation_full_angle": 0.45,
+        },
     )
 
     cfg.observations.policy.motion_locomotion_polar_cmd = ObsTerm(

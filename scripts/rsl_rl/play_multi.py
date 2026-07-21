@@ -739,6 +739,10 @@ def _create_diagnostic(
         "trunk_pitch_soft_target": [],
         "trunk_pitch_filtered_target": [],
         "trunk_pitch_reference_overflow": [],
+        "trunk_pitch_turn_relaxation": [],
+        "trunk_pitch_active_lower_deviation": [],
+        "trunk_pitch_active_upper_deviation": [],
+        "trunk_pitch_active_cutoff_frequency_hz": [],
         "step_reward": [],
         "reward_terms": [],
         "done": [],
@@ -919,6 +923,18 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
     )
     diagnostic["trunk_pitch_reference_overflow"].append(
         float(_env0("trunk_pitch_reference_overflow", ()).item())
+    )
+    diagnostic["trunk_pitch_turn_relaxation"].append(
+        float(_env0("trunk_pitch_turn_relaxation", ()).item())
+    )
+    diagnostic["trunk_pitch_active_lower_deviation"].append(
+        float(_env0("trunk_pitch_active_lower_deviation", ()).item())
+    )
+    diagnostic["trunk_pitch_active_upper_deviation"].append(
+        float(_env0("trunk_pitch_active_upper_deviation", ()).item())
+    )
+    diagnostic["trunk_pitch_active_cutoff_frequency_hz"].append(
+        float(_env0("trunk_pitch_active_cutoff_frequency_hz", ()).item())
     )
 
     command = base_env.command_manager.get_term("motion")

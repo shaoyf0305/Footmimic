@@ -674,6 +674,20 @@ class MotionCommand(CommandTerm):
         self._locomotion_cmd_hold_steps_remaining[env_id] = int(self._duration_s_to_steps(duration_s).item())
         self._locomotion_segment_idx[env_id] = seg_idx
 
+    def _restart_locomotion_segment_plans(self, env_ids: torch.Tensor | Sequence[int]) -> None:
+        """Restart manual command plans after an environment reset.
+
+        A reset intentionally clears ``_locomotion_cmd_initialized`` so its
+        first command is immediate.  Manual multi-segment playback must then
+        write segment zero straight away; otherwise the global segment clock
+        resumes in the middle of its old plan and the next transition is
+        mistaken for a new episode's initial command.
+        """
+        env_ids_t = self._to_env_id_tensor(env_ids)
+        for env_id in env_ids_t.tolist():
+            if self._locomotion_segment_plans[env_id]:
+                self._apply_locomotion_segment(env_id, 0)
+
     def _advance_locomotion_segments(self, env_ids: torch.Tensor) -> None:
         for env_id in env_ids.tolist():
             plan = self._locomotion_segment_plans[env_id]
@@ -738,11 +752,13 @@ class MotionCommand(CommandTerm):
         if not normalized:
             raise ValueError("locomotion polar sequence must contain at least one segment")
 
+        env_ids_t = self._to_env_id_tensor(env_id_list)
         self._locomotion_segment_hold_last = hold_last
-        for env_id in env_id_list:
+        self._locomotion_cmd_initialized[env_ids_t] = False
+        for env_id in env_ids_t.tolist():
             self._locomotion_segment_plans[env_id] = normalized
-            self._apply_locomotion_segment(env_id, 0)
         self.set_locomotion_command_mode("manual")
+        self._restart_locomotion_segment_plans(env_ids_t)
 
     def _update_locomotion_command_resample(self) -> None:
         """Backward-compatible alias."""
@@ -1416,6 +1432,8 @@ class MotionCommand(CommandTerm):
         self._steps_since_resample[env_ids] = 0
         if self._locomotion_command_mode == "resampled":
             self._sample_locomotion_commands(env_ids)
+        elif self._locomotion_command_mode == "manual":
+            self._restart_locomotion_segment_plans(env_ids)
 
     # Called every step in the IsaacLab main loop.
     def _update_command(self):

@@ -42,6 +42,17 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
                 raise ValueError("trunk_pitch_cutoff_frequency_hz must be positive when enabled.")
             if cfg.trunk_pitch_lower_deviation <= 0.0 or cfg.trunk_pitch_upper_deviation <= 0.0:
                 raise ValueError("trunk pitch reference deviations must be positive when enabled.")
+            if cfg.trunk_pitch_turn_start_angle is not None:
+                if cfg.trunk_pitch_turn_start_angle < 0.0:
+                    raise ValueError("trunk_pitch_turn_start_angle must be non-negative when enabled.")
+                if cfg.trunk_pitch_turn_full_angle <= cfg.trunk_pitch_turn_start_angle:
+                    raise ValueError("trunk_pitch_turn_full_angle must exceed trunk_pitch_turn_start_angle.")
+                if (
+                    cfg.trunk_pitch_turn_lower_deviation <= 0.0
+                    or cfg.trunk_pitch_turn_upper_deviation <= 0.0
+                    or cfg.trunk_pitch_turn_cutoff_frequency_hz <= 0.0
+                ):
+                    raise ValueError("turn-relaxed trunk pitch limits and cutoff must be positive.")
         super().__init__(cfg, env)
         self._manifold_env = env
 
@@ -75,6 +86,7 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
 
         self._trunk_pitch_robot_id: int | None = None
         self._trunk_pitch_action_id: int | None = None
+        self._trunk_pitch_turn_pelvis_body_id: int | None = None
         if cfg.trunk_pitch_joint_name is not None:
             trunk_ids, trunk_names = self._asset.find_joints(
                 [cfg.trunk_pitch_joint_name], preserve_order=True
@@ -91,6 +103,11 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
                 ) from exc
             self._trunk_pitch_robot_id = int(trunk_ids[0])
             self._trunk_pitch_action_id = trunk_action_id
+            if cfg.trunk_pitch_turn_start_angle is not None:
+                try:
+                    self._trunk_pitch_turn_pelvis_body_id = self._asset.body_names.index("pelvis")
+                except ValueError as exc:
+                    raise ValueError("Turn-relaxed trunk pitch control requires a body named 'pelvis'.") from exc
 
         upper_dim = len(upper_action_ids)
         rank = min(int(cfg.manifold_rank), upper_dim)
@@ -120,6 +137,10 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.trunk_pitch_soft_target = torch.full((self.num_envs,), torch.nan, device=self.device)
         self.trunk_pitch_filtered_target = torch.full((self.num_envs,), torch.nan, device=self.device)
         self.trunk_pitch_reference_overflow = torch.zeros(self.num_envs, device=self.device)
+        self.trunk_pitch_turn_relaxation = torch.zeros(self.num_envs, device=self.device)
+        self.trunk_pitch_active_lower_deviation = torch.full((self.num_envs,), torch.nan, device=self.device)
+        self.trunk_pitch_active_upper_deviation = torch.full((self.num_envs,), torch.nan, device=self.device)
+        self.trunk_pitch_active_cutoff_frequency_hz = torch.full((self.num_envs,), torch.nan, device=self.device)
         self.effective_raw_actions = torch.zeros_like(self.raw_actions)
         self.prev_effective_raw_actions = torch.zeros_like(self.raw_actions)
 
@@ -269,17 +290,55 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             command = self._manifold_env.command_manager.get_term(self.cfg.command_name)
             trunk_reference_target = command.joint_pos[:, trunk_robot_id]
             trunk_deviation = trunk_raw_target - trunk_reference_target
-            lower_deviation = float(self.cfg.trunk_pitch_lower_deviation)
-            upper_deviation = float(self.cfg.trunk_pitch_upper_deviation)
+            turn_relaxation = torch.zeros(self.num_envs, device=self.device)
+            if self.cfg.trunk_pitch_turn_start_angle is not None:
+                target_heading = getattr(command, "locomotion_cmd_target_heading", command.locomotion_cmd_heading)
+                heading_delta = torch.atan2(
+                    torch.sin(target_heading - command.locomotion_cmd_heading),
+                    torch.cos(target_heading - command.locomotion_cmd_heading),
+                ).abs()
+                if self._trunk_pitch_turn_pelvis_body_id is not None:
+                    pelvis_quat = self._asset.data.body_quat_w[:, self._trunk_pitch_turn_pelvis_body_id]
+                    pelvis_yaw = torch.atan2(
+                        2.0 * (pelvis_quat[:, 0] * pelvis_quat[:, 3] + pelvis_quat[:, 1] * pelvis_quat[:, 2]),
+                        1.0 - 2.0 * (torch.square(pelvis_quat[:, 2]) + torch.square(pelvis_quat[:, 3])),
+                    )
+                    tracking_error = torch.atan2(
+                        torch.sin(command.locomotion_cmd_heading - pelvis_yaw),
+                        torch.cos(command.locomotion_cmd_heading - pelvis_yaw),
+                    ).abs()
+                    heading_delta = torch.maximum(heading_delta, tracking_error)
+                turn_relaxation = torch.clamp(
+                    (heading_delta - float(self.cfg.trunk_pitch_turn_start_angle))
+                    / (float(self.cfg.trunk_pitch_turn_full_angle) - float(self.cfg.trunk_pitch_turn_start_angle)),
+                    min=0.0,
+                    max=1.0,
+                )
+            lower_deviation = (
+                float(self.cfg.trunk_pitch_lower_deviation)
+                + turn_relaxation
+                * (float(self.cfg.trunk_pitch_turn_lower_deviation) - float(self.cfg.trunk_pitch_lower_deviation))
+            )
+            upper_deviation = (
+                float(self.cfg.trunk_pitch_upper_deviation)
+                + turn_relaxation
+                * (float(self.cfg.trunk_pitch_turn_upper_deviation) - float(self.cfg.trunk_pitch_upper_deviation))
+            )
             trunk_soft_target = trunk_reference_target + torch.where(
                 trunk_deviation < 0.0,
                 lower_deviation * torch.tanh(trunk_deviation / lower_deviation),
                 upper_deviation * torch.tanh(trunk_deviation / upper_deviation),
             )
-            trunk_alpha = 1.0 - math.exp(
-                -2.0 * math.pi * float(self.cfg.trunk_pitch_cutoff_frequency_hz) * step_dt
+            trunk_cutoff_frequency_hz = (
+                float(self.cfg.trunk_pitch_cutoff_frequency_hz)
+                + turn_relaxation
+                * (
+                    float(self.cfg.trunk_pitch_turn_cutoff_frequency_hz)
+                    - float(self.cfg.trunk_pitch_cutoff_frequency_hz)
+                )
             )
-            trunk_alpha = min(max(trunk_alpha, 0.0), 1.0)
+            trunk_alpha = 1.0 - torch.exp(-2.0 * math.pi * trunk_cutoff_frequency_hz * step_dt)
+            trunk_alpha = torch.clamp(trunk_alpha, min=0.0, max=1.0)
             previous_trunk_target = torch.where(
                 self._trunk_pitch_filter_initialized,
                 self._filtered_trunk_pitch_target,
@@ -295,6 +354,10 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             self.trunk_pitch_reference_target[:] = trunk_reference_target
             self.trunk_pitch_soft_target[:] = trunk_soft_target
             self.trunk_pitch_filtered_target[:] = filtered_trunk_target
+            self.trunk_pitch_turn_relaxation[:] = turn_relaxation
+            self.trunk_pitch_active_lower_deviation[:] = lower_deviation
+            self.trunk_pitch_active_upper_deviation[:] = upper_deviation
+            self.trunk_pitch_active_cutoff_frequency_hz[:] = trunk_cutoff_frequency_hz
             self.trunk_pitch_reference_overflow[:] = torch.where(
                 trunk_deviation < 0.0,
                 torch.clamp(-trunk_deviation - lower_deviation, min=0.0),
@@ -352,6 +415,10 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.trunk_pitch_soft_target[env_ids] = torch.nan
         self.trunk_pitch_filtered_target[env_ids] = torch.nan
         self.trunk_pitch_reference_overflow[env_ids] = 0.0
+        self.trunk_pitch_turn_relaxation[env_ids] = 0.0
+        self.trunk_pitch_active_lower_deviation[env_ids] = torch.nan
+        self.trunk_pitch_active_upper_deviation[env_ids] = torch.nan
+        self.trunk_pitch_active_cutoff_frequency_hz[env_ids] = torch.nan
         self.effective_raw_actions[env_ids] = 0.0
         self.prev_effective_raw_actions[env_ids] = 0.0
 
@@ -375,3 +442,11 @@ class UpperBodyManifoldJointPositionActionCfg(JointPositionActionCfg):
     trunk_pitch_lower_deviation: float = 0.45
     trunk_pitch_upper_deviation: float = 0.12
     trunk_pitch_cutoff_frequency_hz: float = 1.8
+    # During an unfinished heading transition the robot needs pitch authority
+    # to redirect its momentum.  The style envelope then returns smoothly as
+    # the effective heading catches the requested heading.
+    trunk_pitch_turn_start_angle: float | None = None
+    trunk_pitch_turn_full_angle: float = 0.45
+    trunk_pitch_turn_lower_deviation: float = 0.65
+    trunk_pitch_turn_upper_deviation: float = 0.28
+    trunk_pitch_turn_cutoff_frequency_hz: float = 4.0
