@@ -842,20 +842,23 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         # envelope.  This is control-only: the base config defaults to None.
         # It prevents saturated PCA latents from locking an arm in a raised pose.
         reference_target_margin=0.25,
-        # Preserve the reference clip's normal forward lean, but smoothly
-        # compress and filter the policy's waist-pitch deviation from it.  The
-        # asymmetric envelope leaves room to lean farther forward for a touch,
-        # while strongly rejecting the recurrent backward target seen in 3.9.
+        # Preserve the reference clip's normal forward lean, but use a reference
+        # that is valid for the simulator's soft joint range.  The diagnostic
+        # showed some clips centre waist pitch beyond that range, which forced
+        # the policy to trade balance and ball control for a joint-limit loss.
+        # A wider steady-state upper deviation then allows small recovery and
+        # gait corrections without reintroducing the old large back-lean.
         trunk_pitch_joint_name="waist_pitch_joint",
+        trunk_pitch_soft_limit_margin=0.03,
         trunk_pitch_lower_deviation=0.45,
-        trunk_pitch_upper_deviation=0.12,
+        trunk_pitch_upper_deviation=0.24,
         trunk_pitch_cutoff_frequency_hz=1.8,
         # Let a deliberate, unfinished heading transition borrow pitch
         # authority; restore the tighter forward-lean envelope in steady motion.
         trunk_pitch_turn_start_angle=0.12,
         trunk_pitch_turn_full_angle=0.45,
         trunk_pitch_turn_lower_deviation=0.65,
-        trunk_pitch_turn_upper_deviation=0.28,
+        trunk_pitch_turn_upper_deviation=0.32,
         trunk_pitch_turn_cutoff_frequency_hz=4.0,
     )
     cfg.actions.joint_pos.scale = old_action_cfg.scale
@@ -890,7 +893,7 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         params={
             "action_name": "joint_pos",
             "lower_deviation": 0.45,
-            "upper_deviation": 0.12,
+            "upper_deviation": 0.24,
             "command_name": "motion",
             "turn_relaxation_start_angle": 0.12,
             "turn_relaxation_full_angle": 0.45,
@@ -901,6 +904,7 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         weight=0.60,
         params={
             "command_name": "motion",
+            "action_name": "joint_pos",
             "std": 0.45,
             "turn_relaxation_start_angle": 0.12,
             "turn_relaxation_full_angle": 0.45,

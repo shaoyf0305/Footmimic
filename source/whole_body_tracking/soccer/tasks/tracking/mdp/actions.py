@@ -42,6 +42,8 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
                 raise ValueError("trunk_pitch_cutoff_frequency_hz must be positive when enabled.")
             if cfg.trunk_pitch_lower_deviation <= 0.0 or cfg.trunk_pitch_upper_deviation <= 0.0:
                 raise ValueError("trunk pitch reference deviations must be positive when enabled.")
+            if cfg.trunk_pitch_soft_limit_margin < 0.0:
+                raise ValueError("trunk_pitch_soft_limit_margin must be non-negative when enabled.")
             if cfg.trunk_pitch_turn_start_angle is not None:
                 if cfg.trunk_pitch_turn_start_angle < 0.0:
                     raise ValueError("trunk_pitch_turn_start_angle must be non-negative when enabled.")
@@ -288,7 +290,21 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             trunk_robot_id = self._trunk_pitch_robot_id
             trunk_raw_target = self.processed_actions[:, trunk_action_id].clone()
             command = self._manifold_env.command_manager.get_term(self.cfg.command_name)
+            # The style clips can contain a waist pitch just outside the
+            # simulator's soft range.  Treating that value as the centre of a
+            # narrow policy envelope makes the policy permanently fight the
+            # soft-limit penalty.  Keep the reference inside the same range
+            # used by the simulator, with an optional guard band.
             trunk_reference_target = command.joint_pos[:, trunk_robot_id]
+            trunk_soft_limits = self._asset.data.soft_joint_pos_limits[:, trunk_robot_id]
+            trunk_limit_margin = float(self.cfg.trunk_pitch_soft_limit_margin)
+            trunk_reference_lower = trunk_soft_limits[:, 0] + trunk_limit_margin
+            trunk_reference_upper = trunk_soft_limits[:, 1] - trunk_limit_margin
+            trunk_reference_target = torch.clamp(
+                trunk_reference_target,
+                min=trunk_reference_lower,
+                max=trunk_reference_upper,
+            )
             trunk_deviation = trunk_raw_target - trunk_reference_target
             turn_relaxation = torch.zeros(self.num_envs, device=self.device)
             if self.cfg.trunk_pitch_turn_start_angle is not None:
@@ -439,6 +455,10 @@ class UpperBodyManifoldJointPositionActionCfg(JointPositionActionCfg):
     # Control-only pitch stabilizer.  It smooths the policy's deviation around
     # the motion's normal forward-lean pose; it is not a hard pose lock.
     trunk_pitch_joint_name: str | None = None
+    # Keep a style reference strictly inside the simulator's soft joint range.
+    # This avoids centring a policy envelope on a pose that the joint-limit
+    # reward will continuously penalize.
+    trunk_pitch_soft_limit_margin: float = 0.0
     trunk_pitch_lower_deviation: float = 0.45
     trunk_pitch_upper_deviation: float = 0.12
     trunk_pitch_cutoff_frequency_hz: float = 1.8

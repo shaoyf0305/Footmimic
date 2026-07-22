@@ -134,18 +134,26 @@ def trunk_pitch_reference_overflow_penalty(
 def waist_pitch_reference_error_exp(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
+    action_name: str = "joint_pos",
     joint_name: str = "waist_pitch_joint",
     std: float = 0.45,
     turn_relaxation_start_angle: float | None = None,
     turn_relaxation_full_angle: float = 0.45,
 ) -> torch.Tensor:
-    """Softly retain the reference's normal forward-lean waist-pitch pose."""
+    """Softly retain the action layer's valid forward-lean waist-pitch reference."""
     command: MotionCommand = env.command_manager.get_term(command_name)
     robot = command.robot
     joint_ids, found_names = robot.find_joints([joint_name], preserve_order=True)
     if len(joint_ids) != 1:
         raise RuntimeError(f"Could not resolve waist pitch joint {joint_name!r}; found {found_names}.")
-    error = robot.data.joint_pos[:, joint_ids[0]] - command.joint_pos[:, joint_ids[0]]
+    # The manifold action may clamp an incompatible style reference to the
+    # simulator's soft range.  Reuse that effective reference so this reward
+    # never competes with the action-layer safety constraint.
+    action_term = env.action_manager.get_term(action_name)
+    reference = getattr(action_term, "trunk_pitch_reference_target", None)
+    if not isinstance(reference, torch.Tensor):
+        reference = command.joint_pos[:, joint_ids[0]]
+    error = robot.data.joint_pos[:, joint_ids[0]] - reference
     reward = torch.exp(-torch.square(error) / max(float(std), 1.0e-6) ** 2)
     return reward * _turn_stability_weight(
         env, command_name, turn_relaxation_start_angle, turn_relaxation_full_angle
