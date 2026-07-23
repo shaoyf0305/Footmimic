@@ -722,8 +722,11 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     cfg.rewards.motion_anchor_lin_vel.params["std"] = 0.35
     cfg.rewards.motion_anchor_xy_speed_excess = RewTerm(
         func=mdp.motion_anchor_xy_speed_excess_penalty,
-        weight=-1.25,
-        params={"command_name": "motion", "tolerance": 0.18, "scale": 0.30},
+        # This must outweigh the already-saturated ball-progress reward:
+        # otherwise a controller can buy extra chase/progress reward by
+        # permanently running faster than its command.
+        weight=-3.5,
+        params={"command_name": "motion", "tolerance": 0.08, "scale": 0.20},
     )
     cfg.rewards.motion_anchor_xy_speed_deficit = RewTerm(
         func=mdp.motion_anchor_xy_speed_deficit_penalty,
@@ -804,6 +807,15 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
             "recovery_max_distance": 0.85,
             "recovery_min_closing_speed": 0.05,
             "recovery_counter_increment": 0.25,
+            # When ball and pelvis are already close and coasting together,
+            # allow one finite recovery attempt even outside a command switch.
+            # This prevents a 50-step no-contact timeout from ending a viable
+            # retouch, while preserving termination for a persistent no-touch
+            # strategy.
+            "proximity_recovery_max_steps": 75,
+            "proximity_recovery_max_distance": 0.70,
+            "proximity_recovery_max_relative_speed": 0.60,
+            "proximity_recovery_counter_increment": 0.25,
         }
     )
 
@@ -842,6 +854,17 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         # envelope.  This is control-only: the base config defaults to None.
         # It prevents saturated PCA latents from locking an arm in a raised pose.
         reference_target_margin=0.25,
+        # The old diagnostic showed large raw arm outputs far outside this
+        # envelope.  Clip normalized actions before projection, then make the
+        # remaining reference-overflow cost meaningful during fine-tuning.
+        upper_body_raw_action_limit=2.5,
+        # Roll/yaw do not need pitch's turn-dependent freedom.  Keeping each
+        # near its style reference and filtering it removes the recurrent
+        # lateral torso sway caused by large one-step waist targets.
+        trunk_stabilized_joint_names=("waist_yaw_joint", "waist_roll_joint"),
+        trunk_stabilized_reference_margin=0.20,
+        trunk_stabilized_cutoff_frequency_hz=1.5,
+        trunk_stabilized_soft_limit_margin=0.03,
         # Preserve the reference clip's normal forward lean, but use a reference
         # that is valid for the simulator's soft joint range.  The diagnostic
         # showed some clips centre waist pitch beyond that range, which forced
@@ -881,7 +904,7 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     # the verified q_ref +/- 0.25 rad envelope.
     cfg.rewards.upper_body_reference_overflow = RewTerm(
         func=mdp.upper_body_reference_overflow_penalty,
-        weight=-0.05,
+        weight=-0.40,
         params={"action_name": "joint_pos"},
     )
     # Keep a reference-relative forward lean without forcing the torso upright.

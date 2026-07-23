@@ -124,6 +124,10 @@ def dribbling_no_ball_contact_timeout(
     recovery_max_distance: float = 0.0,
     recovery_min_closing_speed: float = 0.0,
     recovery_counter_increment: float = 1.0,
+    proximity_recovery_max_steps: int = 0,
+    proximity_recovery_max_distance: float = 0.0,
+    proximity_recovery_max_relative_speed: float = 0.0,
+    proximity_recovery_counter_increment: float = 1.0,
 ) -> torch.Tensor:
     """End the episode if the ball sees no robot contact for too long after warm-up.
 
@@ -133,9 +137,9 @@ def dribbling_no_ball_contact_timeout(
     the ball but never touch" strategies.
 
     A task-specific recovery window can slow (not clear) the counter after a
-    locomotion command change.  It is active only while the ball is nearby and
-    the pelvis is closing the ball distance, so it cannot turn into unlimited
-    no-contact survival.
+    locomotion command change.  A second, bounded recovery allowance applies
+    while the ball is close and coasting at a recoverable relative speed.  Both
+    paths have finite budgets, so neither permits unlimited no-contact survival.
     """
     force_mag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
     has_contact = force_mag > contact_force_threshold
@@ -150,29 +154,58 @@ def dribbling_no_ball_contact_timeout(
         cnt = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
     recovery_active = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    proximity_recovery_active = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
     closing_speed = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+    relative_speed = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
     ball_distance = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
-    if recovery_window_steps > 0 and recovery_max_distance > 0.0:
+    if (
+        (recovery_window_steps > 0 and recovery_max_distance > 0.0)
+        or (proximity_recovery_max_steps > 0 and proximity_recovery_max_distance > 0.0)
+    ):
         command: MotionCommand = env.command_manager.get_term(command_name)
         ball = env.scene["soccer_ball"]
         delta_xy = ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
         ball_distance = torch.norm(delta_xy, dim=-1)
         direction_xy = delta_xy / ball_distance.unsqueeze(-1).clamp(min=1e-6)
         relative_vel_xy = ball.data.root_lin_vel_w[:, :2] - command.robot_anchor_lin_vel_w[:, :2]
+        relative_speed = torch.norm(relative_vel_xy, dim=-1)
         # Positive means the pelvis is reducing the ball distance.
         closing_speed = -torch.sum(relative_vel_xy * direction_xy, dim=-1)
-        command_age = getattr(command, "_locomotion_cmd_steps_since_change", None)
-        if command_age is not None:
-            recovery_active = (
-                (command_age <= int(recovery_window_steps))
-                & (ball_distance <= float(recovery_max_distance))
-                & (closing_speed >= float(recovery_min_closing_speed))
+        if recovery_window_steps > 0 and recovery_max_distance > 0.0:
+            command_age = getattr(command, "_locomotion_cmd_steps_since_change", None)
+            if command_age is not None:
+                recovery_active = (
+                    (command_age <= int(recovery_window_steps))
+                    & (ball_distance <= float(recovery_max_distance))
+                    & (closing_speed >= float(recovery_min_closing_speed))
+                )
+        if proximity_recovery_max_steps > 0 and proximity_recovery_max_distance > 0.0:
+            proximity_buf_name = "_dribbling_no_contact_proximity_recovery_steps"
+            proximity_steps = getattr(env, proximity_buf_name, None)
+            if proximity_steps is None or proximity_steps.shape[0] != env.num_envs:
+                proximity_steps = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+            proximity_candidate = (
+                (ball_distance <= float(proximity_recovery_max_distance))
+                & (relative_speed <= float(proximity_recovery_max_relative_speed))
+                & (proximity_steps < int(proximity_recovery_max_steps))
             )
+            proximity_recovery_active = proximity_candidate & ~has_contact & past_grace
+            proximity_steps = torch.where(
+                reset_m | has_contact,
+                torch.zeros_like(proximity_steps),
+                proximity_steps + proximity_recovery_active.to(proximity_steps.dtype),
+            )
+            setattr(env, proximity_buf_name, proximity_steps)
 
-    increment = torch.where(
+    command_increment = torch.where(
         recovery_active,
         torch.full_like(cnt, float(recovery_counter_increment)),
         torch.ones_like(cnt),
+    )
+    increment = torch.where(
+        proximity_recovery_active,
+        torch.full_like(cnt, float(proximity_recovery_counter_increment)),
+        command_increment,
     )
 
     cnt = torch.where(
@@ -189,8 +222,10 @@ def dribbling_no_ball_contact_timeout(
     setattr(env, "_dribbling_no_contact_force", force_mag)
     setattr(env, "_dribbling_no_contact_count", cnt)
     setattr(env, "_dribbling_no_contact_recovery_active", recovery_active)
+    setattr(env, "_dribbling_no_contact_proximity_recovery_active", proximity_recovery_active)
     setattr(env, "_dribbling_no_contact_ball_distance", ball_distance)
     setattr(env, "_dribbling_no_contact_closing_speed", closing_speed)
+    setattr(env, "_dribbling_no_contact_relative_speed", relative_speed)
 
     return cnt >= max_steps_without_contact
 

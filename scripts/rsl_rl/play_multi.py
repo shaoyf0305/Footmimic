@@ -724,6 +724,8 @@ def _create_diagnostic(
         "heading_error": [],
         "no_contact_count": [],
         "no_contact_recovery_active": [],
+        "no_contact_proximity_recovery_active": [],
+        "no_contact_relative_speed": [],
         "manifold_raw_upper_target": [],
         "manifold_reference_upper_target": [],
         "manifold_constrained_upper_target": [],
@@ -863,6 +865,14 @@ def _append_diagnostic(
     no_contact_recovery = getattr(base_env, "_dribbling_no_contact_recovery_active", None)
     diagnostic["no_contact_recovery_active"].append(
         False if no_contact_recovery is None else bool(no_contact_recovery[0].item())
+    )
+    proximity_recovery = getattr(base_env, "_dribbling_no_contact_proximity_recovery_active", None)
+    diagnostic["no_contact_proximity_recovery_active"].append(
+        False if proximity_recovery is None else bool(proximity_recovery[0].item())
+    )
+    relative_speed = getattr(base_env, "_dribbling_no_contact_relative_speed", None)
+    diagnostic["no_contact_relative_speed"].append(
+        np.nan if relative_speed is None else float(relative_speed[0].item())
     )
     # Filled with the reward returned by the immediately following env.step().
     diagnostic["step_reward"].append(np.nan)
@@ -1360,12 +1370,21 @@ def _get_play_overlay(env) -> str:
 
         if hasattr(base_env, "_dribbling_no_contact_count"):
             no_contact_count = float(base_env._dribbling_no_contact_count[i].item())
-            recovery = bool(base_env._dribbling_no_contact_recovery_active[i].item())
+            command_recovery = bool(base_env._dribbling_no_contact_recovery_active[i].item())
+            proximity_recovery_tensor = getattr(
+                base_env, "_dribbling_no_contact_proximity_recovery_active", None
+            )
+            proximity_recovery = (
+                False if proximity_recovery_tensor is None else bool(proximity_recovery_tensor[i].item())
+            )
             closing = float(base_env._dribbling_no_contact_closing_speed[i].item())
+            relative_speed_tensor = getattr(base_env, "_dribbling_no_contact_relative_speed", None)
+            relative_speed = 0.0 if relative_speed_tensor is None else float(relative_speed_tensor[i].item())
+            recovery = "CMD" if command_recovery else "COAST" if proximity_recovery else "NO"
             lines.append(
                 f"No-contact: count={no_contact_count:5.1f}"
-                f"  recovery={'YES' if recovery else 'NO'}"
-                f"  closing={closing:+.2f} m/s"
+                f"  recovery={recovery}"
+                f"  closing={closing:+.2f} m/s  relative={relative_speed:.2f} m/s"
             )
 
         _update_last_termination_reason(base_env, env_idx=i)

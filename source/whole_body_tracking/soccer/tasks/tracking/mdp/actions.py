@@ -37,6 +37,15 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             raise ValueError("orthogonal_residual_limit must be non-negative and cutoff_frequency_hz positive.")
         if cfg.reference_target_margin is not None and cfg.reference_target_margin <= 0.0:
             raise ValueError("reference_target_margin must be positive when enabled.")
+        if cfg.upper_body_raw_action_limit is not None and cfg.upper_body_raw_action_limit <= 0.0:
+            raise ValueError("upper_body_raw_action_limit must be positive when enabled.")
+        if cfg.trunk_stabilized_joint_names:
+            if cfg.trunk_stabilized_reference_margin <= 0.0:
+                raise ValueError("trunk_stabilized_reference_margin must be positive when enabled.")
+            if cfg.trunk_stabilized_cutoff_frequency_hz <= 0.0:
+                raise ValueError("trunk_stabilized_cutoff_frequency_hz must be positive when enabled.")
+            if cfg.trunk_stabilized_soft_limit_margin < 0.0:
+                raise ValueError("trunk_stabilized_soft_limit_margin must be non-negative when enabled.")
         if cfg.trunk_pitch_joint_name is not None:
             if cfg.trunk_pitch_cutoff_frequency_hz <= 0.0:
                 raise ValueError("trunk_pitch_cutoff_frequency_hz must be positive when enabled.")
@@ -89,6 +98,26 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self._trunk_pitch_robot_id: int | None = None
         self._trunk_pitch_action_id: int | None = None
         self._trunk_pitch_turn_pelvis_body_id: int | None = None
+        stabilized_robot_ids, stabilized_names = self._asset.find_joints(
+            cfg.trunk_stabilized_joint_names, preserve_order=True
+        )
+        if len(stabilized_robot_ids) != len(cfg.trunk_stabilized_joint_names):
+            raise ValueError(
+                "Could not resolve every stabilized trunk joint: "
+                f"expected {cfg.trunk_stabilized_joint_names}, found {stabilized_names}."
+            )
+        try:
+            stabilized_action_ids = [robot_to_action[int(robot_id)] for robot_id in stabilized_robot_ids]
+        except KeyError as exc:
+            raise ValueError(
+                f"The joint-position action does not control stabilized trunk joint id {exc.args[0]}."
+            ) from exc
+        self._trunk_stabilized_robot_ids = torch.as_tensor(
+            stabilized_robot_ids, dtype=torch.long, device=self.device
+        )
+        self._trunk_stabilized_action_ids = torch.as_tensor(
+            stabilized_action_ids, dtype=torch.long, device=self.device
+        )
         if cfg.trunk_pitch_joint_name is not None:
             trunk_ids, trunk_names = self._asset.find_joints(
                 [cfg.trunk_pitch_joint_name], preserve_order=True
@@ -118,6 +147,12 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self._filter_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._filtered_trunk_pitch_target = torch.zeros(self.num_envs, device=self.device)
         self._trunk_pitch_filter_initialized = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._filtered_trunk_stabilized_target = torch.zeros(
+            self.num_envs, len(stabilized_action_ids), device=self.device
+        )
+        self._trunk_stabilized_filter_initialized = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
 
@@ -214,6 +249,16 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         return torch.full_like(self.raw_actions, float(self._offset))
 
     def process_actions(self, actions: torch.Tensor) -> None:
+        # A warm-start policy can emit very large arm actions before it learns
+        # the control-only manifold semantics.  Clamp those normalized values
+        # before the base action term converts them to position targets; the
+        # later reference envelope remains the tighter physical safeguard.
+        if self.cfg.upper_body_raw_action_limit is not None:
+            actions = actions.clone()
+            limit = float(self.cfg.upper_body_raw_action_limit)
+            actions[:, self._upper_action_ids] = torch.clamp(
+                actions[:, self._upper_action_ids], min=-limit, max=limit
+            )
         super().process_actions(actions)
         if self._manifold_mean is None:
             self._fit_manifold_from_motion_bank()
@@ -223,7 +268,7 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         assert self._manifold_latent_limit is not None
 
         action_ids = self._upper_action_ids
-        raw_target = self.processed_actions[:, action_ids].clone()
+        upper_raw_target = self.processed_actions[:, action_ids].clone()
 
         # Control can use the current style pose as a bounded safety envelope.
         # This is deliberately applied before PCA: a target far outside the
@@ -233,18 +278,18 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         # action semantics.
         reference_margin = self.cfg.reference_target_margin
         if reference_margin is None:
-            reference_target = torch.zeros_like(raw_target)
-            constrained_target = raw_target
-            reference_overflow = torch.zeros_like(raw_target)
+            reference_target = torch.zeros_like(upper_raw_target)
+            constrained_target = upper_raw_target
+            reference_overflow = torch.zeros_like(upper_raw_target)
         else:
             command = self._manifold_env.command_manager.get_term(self.cfg.command_name)
             reference_target = command.joint_pos[:, self._upper_robot_ids]
             reference_overflow = torch.clamp(
-                torch.abs(raw_target - reference_target) - reference_margin,
+                torch.abs(upper_raw_target - reference_target) - reference_margin,
                 min=0.0,
             )
             constrained_target = torch.clamp(
-                raw_target,
+                upper_raw_target,
                 min=reference_target - reference_margin,
                 max=reference_target + reference_margin,
             )
@@ -284,6 +329,37 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self._filtered_upper_target[:] = filtered_target
         self._filter_initialized[:] = True
         self._processed_actions[:, action_ids] = filtered_target
+
+        if self._trunk_stabilized_action_ids.numel() > 0:
+            stabilized_action_ids = self._trunk_stabilized_action_ids
+            stabilized_robot_ids = self._trunk_stabilized_robot_ids
+            command = self._manifold_env.command_manager.get_term(self.cfg.command_name)
+            stabilized_raw_target = self.processed_actions[:, stabilized_action_ids].clone()
+            soft_limits = self._asset.data.soft_joint_pos_limits[:, stabilized_robot_ids]
+            limit_margin = float(self.cfg.trunk_stabilized_soft_limit_margin)
+            stabilized_reference_target = torch.clamp(
+                command.joint_pos[:, stabilized_robot_ids],
+                min=soft_limits[..., 0] + limit_margin,
+                max=soft_limits[..., 1] - limit_margin,
+            )
+            deviation = stabilized_raw_target - stabilized_reference_target
+            envelope = float(self.cfg.trunk_stabilized_reference_margin)
+            soft_target = stabilized_reference_target + envelope * torch.tanh(deviation / envelope)
+            soft_target = torch.clamp(soft_target, min=soft_limits[..., 0], max=soft_limits[..., 1])
+            alpha = 1.0 - math.exp(
+                -2.0 * math.pi * float(self.cfg.trunk_stabilized_cutoff_frequency_hz) * step_dt
+            )
+            alpha = min(max(alpha, 0.0), 1.0)
+            initialized = self._trunk_stabilized_filter_initialized[:, None]
+            previous_target = torch.where(
+                initialized,
+                self._filtered_trunk_stabilized_target,
+                self._asset.data.joint_pos[:, stabilized_robot_ids],
+            )
+            stabilized_filtered_target = previous_target + alpha * (soft_target - previous_target)
+            self._filtered_trunk_stabilized_target[:] = stabilized_filtered_target
+            self._trunk_stabilized_filter_initialized[:] = True
+            self._processed_actions[:, stabilized_action_ids] = stabilized_filtered_target
 
         if self._trunk_pitch_robot_id is not None and self._trunk_pitch_action_id is not None:
             trunk_action_id = self._trunk_pitch_action_id
@@ -404,13 +480,24 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             self.effective_raw_actions[:, trunk_action_id] = (
                 self._processed_actions[:, trunk_action_id] - offset[:, trunk_action_id]
             ) / safe_trunk_scale
+        if self._trunk_stabilized_action_ids.numel() > 0:
+            stabilized_action_ids = self._trunk_stabilized_action_ids
+            stabilized_scale = scale[:, stabilized_action_ids]
+            safe_stabilized_scale = torch.where(
+                torch.abs(stabilized_scale) < 1.0e-8,
+                torch.ones_like(stabilized_scale),
+                stabilized_scale,
+            )
+            self.effective_raw_actions[:, stabilized_action_ids] = (
+                self._processed_actions[:, stabilized_action_ids] - offset[:, stabilized_action_ids]
+            ) / safe_stabilized_scale
 
-        self.manifold_raw_upper_target[:] = raw_target
+        self.manifold_raw_upper_target[:] = upper_raw_target
         self.manifold_reference_upper_target[:] = reference_target
         self.manifold_constrained_upper_target[:] = constrained_target
         self.manifold_projected_upper_target[:] = filtered_target
         self.manifold_latent[:] = filtered_latent
-        self.manifold_projection_error[:] = torch.mean(torch.abs(filtered_target - raw_target), dim=1)
+        self.manifold_projection_error[:] = torch.mean(torch.abs(filtered_target - upper_raw_target), dim=1)
         self.manifold_projection_error_after_reference_constraint[:] = torch.mean(
             torch.abs(filtered_target - constrained_target), dim=1
         )
@@ -426,6 +513,8 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self._filter_initialized[env_ids] = False
         self._filtered_trunk_pitch_target[env_ids] = 0.0
         self._trunk_pitch_filter_initialized[env_ids] = False
+        self._filtered_trunk_stabilized_target[env_ids] = 0.0
+        self._trunk_stabilized_filter_initialized[env_ids] = False
         self.trunk_pitch_raw_target[env_ids] = torch.nan
         self.trunk_pitch_reference_target[env_ids] = torch.nan
         self.trunk_pitch_soft_target[env_ids] = torch.nan
@@ -452,6 +541,15 @@ class UpperBodyManifoldJointPositionActionCfg(JointPositionActionCfg):
     orthogonal_residual_limit: float = 0.10
     cutoff_frequency_hz: float = 1.8
     reference_target_margin: float | None = None
+    # Clamp large normalized arm commands before target scaling.  This is
+    # intentionally disabled by default to preserve non-control action semantics.
+    upper_body_raw_action_limit: float | None = None
+    # Reference-relative stabilizer for waist roll/yaw.  Pitch is separate
+    # because it needs an asymmetric, turn-aware envelope.
+    trunk_stabilized_joint_names: tuple[str, ...] = ()
+    trunk_stabilized_reference_margin: float = 0.20
+    trunk_stabilized_cutoff_frequency_hz: float = 1.5
+    trunk_stabilized_soft_limit_margin: float = 0.0
     # Control-only pitch stabilizer.  It smooths the policy's deviation around
     # the motion's normal forward-lean pose; it is not a hard pose lock.
     trunk_pitch_joint_name: str | None = None
