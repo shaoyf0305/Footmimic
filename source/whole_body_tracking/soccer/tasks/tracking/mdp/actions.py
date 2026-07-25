@@ -19,14 +19,29 @@ if TYPE_CHECKING:
 class UpperBodyManifoldJointPositionAction(JointPositionAction):
     """Project upper-body targets onto a motion-bank coordination manifold.
 
-    The policy still emits one action per robot joint.  Lower-body targets pass
-    through unchanged, while the selected upper-body targets are represented by
-    a low-rank PCA model fitted once from every valid frame in the configured
-    motion bank.  The model is independent of the current reference clip,
-    motion index, and style phase.
+    Lower-body targets pass through unchanged.  In legacy mode the policy emits
+    one target per robot joint and the selected upper-body targets are projected
+    onto a PCA manifold.  Control mode can instead expose the PCA coordinates
+    directly: the policy emits only ``manifold_rank`` upper-body latent actions
+    and the term decodes them around the current motion reference.  This removes
+    the redundant upper-body action null space that otherwise lets raw actions
+    grow without changing the executed pose.
     """
 
     cfg: UpperBodyManifoldJointPositionActionCfg
+
+    @property
+    def action_dim(self) -> int:
+        """External policy-action dimension.
+
+        ``JointPositionAction`` is initialized with the full robot-joint action
+        layout.  Once the controlled joints are known, direct-latent mode
+        exposes the lower-body joint actions plus only the PCA latent actions.
+        The internal joint target buffers deliberately remain full-sized.
+        """
+        if getattr(self, "_use_direct_upper_body_latent", False):
+            return self._policy_action_dim
+        return super().action_dim
 
     def __init__(self, cfg: UpperBodyManifoldJointPositionActionCfg, env: ManagerBasedEnv):
         if cfg.manifold_rank <= 0:
@@ -46,6 +61,18 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
                 raise ValueError("trunk_stabilized_cutoff_frequency_hz must be positive when enabled.")
             if cfg.trunk_stabilized_soft_limit_margin < 0.0:
                 raise ValueError("trunk_stabilized_soft_limit_margin must be non-negative when enabled.")
+            if cfg.trunk_stabilized_turn_start_angle is not None:
+                if cfg.trunk_stabilized_turn_start_angle < 0.0:
+                    raise ValueError("trunk_stabilized_turn_start_angle must be non-negative when enabled.")
+                if cfg.trunk_stabilized_turn_full_angle <= cfg.trunk_stabilized_turn_start_angle:
+                    raise ValueError(
+                        "trunk_stabilized_turn_full_angle must exceed trunk_stabilized_turn_start_angle."
+                    )
+                if (
+                    cfg.trunk_stabilized_turn_reference_margin <= 0.0
+                    or cfg.trunk_stabilized_turn_cutoff_frequency_hz <= 0.0
+                ):
+                    raise ValueError("turn-relaxed trunk stabilization margin and cutoff must be positive.")
         if cfg.trunk_pitch_joint_name is not None:
             if cfg.trunk_pitch_cutoff_frequency_hz <= 0.0:
                 raise ValueError("trunk_pitch_cutoff_frequency_hz must be positive when enabled.")
@@ -64,6 +91,9 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
                     or cfg.trunk_pitch_turn_cutoff_frequency_hz <= 0.0
                 ):
                     raise ValueError("turn-relaxed trunk pitch limits and cutoff must be positive.")
+        # Keep the parent buffers in the full joint-action layout while it is
+        # constructed.  The public action dimension is reduced afterwards.
+        self._use_direct_upper_body_latent = False
         super().__init__(cfg, env)
         self._manifold_env = env
 
@@ -80,6 +110,7 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             controlled_robot_ids = list(range(self._asset.num_joints))
         else:
             controlled_robot_ids = [int(index) for index in self._joint_ids]
+        self._controlled_robot_ids = tuple(controlled_robot_ids)
         robot_to_action = {robot_id: action_id for action_id, robot_id in enumerate(controlled_robot_ids)}
         try:
             upper_action_ids = [robot_to_action[int(robot_id)] for robot_id in robot_joint_ids]
@@ -142,6 +173,18 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
 
         upper_dim = len(upper_action_ids)
         rank = min(int(cfg.manifold_rank), upper_dim)
+        self._full_action_dim = int(super().action_dim)
+        upper_action_id_set = set(upper_action_ids)
+        lower_action_ids = [index for index in range(self._full_action_dim) if index not in upper_action_id_set]
+        self._lower_action_ids = torch.as_tensor(lower_action_ids, dtype=torch.long, device=self.device)
+        self._lower_robot_ids = torch.as_tensor(
+            [controlled_robot_ids[index] for index in lower_action_ids], dtype=torch.long, device=self.device
+        )
+        self._policy_action_dim = len(lower_action_ids) + rank
+        self._latent_policy_action_ids = torch.arange(
+            len(lower_action_ids), self._policy_action_dim, dtype=torch.long, device=self.device
+        )
+        self._use_direct_upper_body_latent = bool(cfg.direct_upper_body_latent_action)
         self._filtered_latent = torch.zeros(self.num_envs, rank, device=self.device)
         self._filtered_upper_target = torch.zeros(self.num_envs, upper_dim, device=self.device)
         self._filter_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -169,6 +212,7 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.manifold_latent_clip_fraction = torch.zeros(self.num_envs, device=self.device)
         self.manifold_reference_overflow = torch.zeros_like(self._filtered_upper_target)
         self.manifold_reference_clamp_fraction = torch.zeros(self.num_envs, device=self.device)
+        self.manifold_policy_latent = torch.zeros(self.num_envs, rank, device=self.device)
         self.trunk_pitch_raw_target = torch.full((self.num_envs,), torch.nan, device=self.device)
         self.trunk_pitch_reference_target = torch.full((self.num_envs,), torch.nan, device=self.device)
         self.trunk_pitch_soft_target = torch.full((self.num_envs,), torch.nan, device=self.device)
@@ -248,12 +292,77 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             return self._offset
         return torch.full_like(self.raw_actions, float(self._offset))
 
+    @property
+    def uses_direct_upper_body_latent(self) -> bool:
+        """Whether the external policy emits PCA coordinates instead of arm joints."""
+        return self._use_direct_upper_body_latent
+
+    def policy_action_ids_for_robot_joint_ids(self, robot_joint_ids: Sequence[int]) -> list[int]:
+        """Return external policy indices for lower-body robot joints.
+
+        Upper-body joints intentionally have no one-to-one policy action in
+        direct-latent mode and therefore cannot be queried through this method.
+        """
+        if not self._use_direct_upper_body_latent:
+            robot_to_action = {
+                int(robot_id): action_id for action_id, robot_id in enumerate(self._controlled_robot_ids)
+            }
+        else:
+            robot_to_action = {
+                int(robot_id): action_id for action_id, robot_id in enumerate(self._lower_robot_ids.tolist())
+            }
+        try:
+            return [robot_to_action[int(robot_id)] for robot_id in robot_joint_ids]
+        except KeyError as exc:
+            raise ValueError(
+                "Upper-body joints are represented by PCA latent actions and do not have individual "
+                f"policy-action indices (robot joint id {exc.args[0]})."
+            ) from exc
+
+    def _turn_relaxation(self, command) -> torch.Tensor:
+        """Return the shared turn/recovery relaxation signal for trunk controls."""
+        start_angle = self.cfg.trunk_stabilized_turn_start_angle
+        if start_angle is None:
+            return torch.zeros(self.num_envs, device=self.device)
+        target_heading = getattr(command, "locomotion_cmd_target_heading", command.locomotion_cmd_heading)
+        heading_delta = torch.atan2(
+            torch.sin(target_heading - command.locomotion_cmd_heading),
+            torch.cos(target_heading - command.locomotion_cmd_heading),
+        ).abs()
+        if self._trunk_pitch_turn_pelvis_body_id is not None:
+            pelvis_quat = self._asset.data.body_quat_w[:, self._trunk_pitch_turn_pelvis_body_id]
+            pelvis_yaw = torch.atan2(
+                2.0 * (pelvis_quat[:, 0] * pelvis_quat[:, 3] + pelvis_quat[:, 1] * pelvis_quat[:, 2]),
+                1.0 - 2.0 * (torch.square(pelvis_quat[:, 2]) + torch.square(pelvis_quat[:, 3])),
+            )
+            tracking_error = torch.atan2(
+                torch.sin(command.locomotion_cmd_heading - pelvis_yaw),
+                torch.cos(command.locomotion_cmd_heading - pelvis_yaw),
+            ).abs()
+            heading_delta = torch.maximum(heading_delta, tracking_error)
+        return torch.clamp(
+            (heading_delta - float(start_angle))
+            / (float(self.cfg.trunk_stabilized_turn_full_angle) - float(start_angle)),
+            min=0.0,
+            max=1.0,
+        )
+
     def process_actions(self, actions: torch.Tensor) -> None:
-        # A warm-start policy can emit very large arm actions before it learns
-        # the control-only manifold semantics.  Clamp those normalized values
-        # before the base action term converts them to position targets; the
-        # later reference envelope remains the tighter physical safeguard.
-        if self.cfg.upper_body_raw_action_limit is not None:
+        policy_latent = None
+        if self._use_direct_upper_body_latent:
+            if actions.shape[1] != self._policy_action_dim:
+                raise ValueError(
+                    f"Expected {self._policy_action_dim} direct-latent actions, got {actions.shape[1]}. "
+                    "This control environment requires a freshly initialized policy head."
+                )
+            policy_latent = actions[:, self._latent_policy_action_ids]
+            full_actions = torch.zeros(
+                actions.shape[0], self._full_action_dim, device=actions.device, dtype=actions.dtype
+            )
+            full_actions[:, self._lower_action_ids] = actions[:, : self._lower_action_ids.numel()]
+            actions = full_actions
+        # Legacy mode keeps the optional replay-only guard for old policies.
+        elif self.cfg.upper_body_raw_action_limit is not None:
             actions = actions.clone()
             limit = float(self.cfg.upper_body_raw_action_limit)
             actions[:, self._upper_action_ids] = torch.clamp(
@@ -266,24 +375,43 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         assert self._manifold_mean is not None
         assert self._manifold_basis is not None
         assert self._manifold_latent_limit is not None
+        step_dt = float(getattr(self._manifold_env, "step_dt", 0.02))
 
         action_ids = self._upper_action_ids
-        upper_raw_target = self.processed_actions[:, action_ids].clone()
-
-        # Control can use the current style pose as a bounded safety envelope.
-        # This is deliberately applied before PCA: a target far outside the
-        # motion bank otherwise saturates every latent dimension and collapses
-        # the arm into one static pose.  The default remains disabled so the
-        # regular tracking and non-control environments retain their original
-        # action semantics.
         reference_margin = self.cfg.reference_target_margin
+        command = self._manifold_env.command_manager.get_term(self.cfg.command_name)
+        reference_target = command.joint_pos[:, self._upper_robot_ids]
+        soft_limits = self._asset.data.soft_joint_pos_limits[:, self._upper_robot_ids]
+
+        if self._use_direct_upper_body_latent:
+            assert policy_latent is not None
+            # ``tanh`` gives every latent a continuous bounded physical meaning.
+            # The policy therefore cannot hide in the old 14-D target-space null
+            # directions or produce an unbounded arm target before PCA.
+            bounded_latent = self._manifold_latent_limit * torch.tanh(policy_latent)
+            alpha = 1.0 - math.exp(-2.0 * math.pi * float(self.cfg.cutoff_frequency_hz) * step_dt)
+            alpha = min(max(alpha, 0.0), 1.0)
+            filtered_latent = torch.where(
+                self._filter_initialized[:, None],
+                self._filtered_latent + alpha * (bounded_latent - self._filtered_latent),
+                bounded_latent,
+            )
+            self._filtered_latent[:] = filtered_latent
+            self._filter_initialized[:] = True
+            upper_raw_target = reference_target + filtered_latent @ self._manifold_basis.transpose(0, 1)
+            clipped = torch.abs(torch.tanh(policy_latent)) >= 0.95
+            self.manifold_policy_latent[:] = policy_latent
+        else:
+            upper_raw_target = self.processed_actions[:, action_ids].clone()
+            clipped = None
+
+        # The reference envelope remains the physical/style safety guard in
+        # both interfaces.  In direct-latent mode it constrains decoded targets,
+        # not an arbitrary 14-D policy target.
         if reference_margin is None:
-            reference_target = torch.zeros_like(upper_raw_target)
             constrained_target = upper_raw_target
             reference_overflow = torch.zeros_like(upper_raw_target)
         else:
-            command = self._manifold_env.command_manager.get_term(self.cfg.command_name)
-            reference_target = command.joint_pos[:, self._upper_robot_ids]
             reference_overflow = torch.clamp(
                 torch.abs(upper_raw_target - reference_target) - reference_margin,
                 min=0.0,
@@ -294,40 +422,41 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
                 max=reference_target + reference_margin,
             )
 
-        centered = constrained_target - self._manifold_mean
-        raw_latent = centered @ self._manifold_basis
-        bounded_latent = torch.clamp(
-            raw_latent,
-            min=-self._manifold_latent_limit,
-            max=self._manifold_latent_limit,
-        )
-        parallel = bounded_latent @ self._manifold_basis.transpose(0, 1)
-        orthogonal = centered - (raw_latent @ self._manifold_basis.transpose(0, 1))
-        residual_limit = float(self.cfg.orthogonal_residual_limit)
-        bounded_orthogonal = residual_limit * torch.tanh(orthogonal / max(residual_limit, 1.0e-6))
-        projected = self._manifold_mean + parallel + bounded_orthogonal
-
-        soft_limits = self._asset.data.soft_joint_pos_limits[:, self._upper_robot_ids]
-        projected = torch.clamp(projected, min=soft_limits[..., 0], max=soft_limits[..., 1])
-
-        step_dt = float(getattr(self._manifold_env, "step_dt", 0.02))
-        alpha = 1.0 - math.exp(-2.0 * math.pi * float(self.cfg.cutoff_frequency_hz) * step_dt)
-        alpha = min(max(alpha, 0.0), 1.0)
-        initialized = self._filter_initialized[:, None]
-        filtered_latent = torch.where(
-            initialized,
-            self._filtered_latent + alpha * (bounded_latent - self._filtered_latent),
-            bounded_latent,
-        )
-        previous_target = torch.where(
-            initialized,
-            self._filtered_upper_target,
-            self._asset.data.joint_pos[:, self._upper_robot_ids],
-        )
-        filtered_target = previous_target + alpha * (projected - previous_target)
-        self._filtered_latent[:] = filtered_latent
+        if self._use_direct_upper_body_latent:
+            filtered_target = torch.clamp(constrained_target, min=soft_limits[..., 0], max=soft_limits[..., 1])
+        else:
+            centered = constrained_target - self._manifold_mean
+            raw_latent = centered @ self._manifold_basis
+            bounded_latent = torch.clamp(
+                raw_latent,
+                min=-self._manifold_latent_limit,
+                max=self._manifold_latent_limit,
+            )
+            parallel = bounded_latent @ self._manifold_basis.transpose(0, 1)
+            orthogonal = centered - (raw_latent @ self._manifold_basis.transpose(0, 1))
+            residual_limit = float(self.cfg.orthogonal_residual_limit)
+            bounded_orthogonal = residual_limit * torch.tanh(orthogonal / max(residual_limit, 1.0e-6))
+            projected = self._manifold_mean + parallel + bounded_orthogonal
+            projected = torch.clamp(projected, min=soft_limits[..., 0], max=soft_limits[..., 1])
+            alpha = 1.0 - math.exp(-2.0 * math.pi * float(self.cfg.cutoff_frequency_hz) * step_dt)
+            alpha = min(max(alpha, 0.0), 1.0)
+            initialized = self._filter_initialized[:, None]
+            filtered_latent = torch.where(
+                initialized,
+                self._filtered_latent + alpha * (bounded_latent - self._filtered_latent),
+                bounded_latent,
+            )
+            previous_target = torch.where(
+                initialized,
+                self._filtered_upper_target,
+                self._asset.data.joint_pos[:, self._upper_robot_ids],
+            )
+            filtered_target = previous_target + alpha * (projected - previous_target)
+            filtered_target = torch.clamp(filtered_target, min=soft_limits[..., 0], max=soft_limits[..., 1])
+            self._filtered_latent[:] = filtered_latent
+            self._filter_initialized[:] = True
+            clipped = torch.abs(raw_latent) > self._manifold_latent_limit
         self._filtered_upper_target[:] = filtered_target
-        self._filter_initialized[:] = True
         self._processed_actions[:, action_ids] = filtered_target
 
         if self._trunk_stabilized_action_ids.numel() > 0:
@@ -343,13 +472,28 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
                 max=soft_limits[..., 1] - limit_margin,
             )
             deviation = stabilized_raw_target - stabilized_reference_target
-            envelope = float(self.cfg.trunk_stabilized_reference_margin)
+            turn_relaxation = self._turn_relaxation(command)
+            envelope = (
+                float(self.cfg.trunk_stabilized_reference_margin)
+                + turn_relaxation
+                * (
+                    float(self.cfg.trunk_stabilized_turn_reference_margin)
+                    - float(self.cfg.trunk_stabilized_reference_margin)
+                )
+            )[:, None]
             soft_target = stabilized_reference_target + envelope * torch.tanh(deviation / envelope)
-            soft_target = torch.clamp(soft_target, min=soft_limits[..., 0], max=soft_limits[..., 1])
-            alpha = 1.0 - math.exp(
-                -2.0 * math.pi * float(self.cfg.trunk_stabilized_cutoff_frequency_hz) * step_dt
+            soft_target = torch.clamp(
+                soft_target, min=soft_limits[..., 0] + limit_margin, max=soft_limits[..., 1] - limit_margin
             )
-            alpha = min(max(alpha, 0.0), 1.0)
+            cutoff = (
+                float(self.cfg.trunk_stabilized_cutoff_frequency_hz)
+                + turn_relaxation
+                * (
+                    float(self.cfg.trunk_stabilized_turn_cutoff_frequency_hz)
+                    - float(self.cfg.trunk_stabilized_cutoff_frequency_hz)
+                )
+            )
+            alpha = torch.clamp(1.0 - torch.exp(-2.0 * math.pi * cutoff * step_dt), min=0.0, max=1.0)[:, None]
             initialized = self._trunk_stabilized_filter_initialized[:, None]
             previous_target = torch.where(
                 initialized,
@@ -357,6 +501,11 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
                 self._asset.data.joint_pos[:, stabilized_robot_ids],
             )
             stabilized_filtered_target = previous_target + alpha * (soft_target - previous_target)
+            stabilized_filtered_target = torch.clamp(
+                stabilized_filtered_target,
+                min=soft_limits[..., 0] + limit_margin,
+                max=soft_limits[..., 1] - limit_margin,
+            )
             self._filtered_trunk_stabilized_target[:] = stabilized_filtered_target
             self._trunk_stabilized_filter_initialized[:] = True
             self._processed_actions[:, stabilized_action_ids] = stabilized_filtered_target
@@ -421,6 +570,9 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
                 lower_deviation * torch.tanh(trunk_deviation / lower_deviation),
                 upper_deviation * torch.tanh(trunk_deviation / upper_deviation),
             )
+            trunk_soft_target = torch.clamp(
+                trunk_soft_target, min=trunk_reference_lower, max=trunk_reference_upper
+            )
             trunk_cutoff_frequency_hz = (
                 float(self.cfg.trunk_pitch_cutoff_frequency_hz)
                 + turn_relaxation
@@ -438,6 +590,9 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             )
             filtered_trunk_target = previous_trunk_target + trunk_alpha * (
                 trunk_soft_target - previous_trunk_target
+            )
+            filtered_trunk_target = torch.clamp(
+                filtered_trunk_target, min=trunk_reference_lower, max=trunk_reference_upper
             )
             self._filtered_trunk_pitch_target[:] = filtered_trunk_target
             self._trunk_pitch_filter_initialized[:] = True
@@ -501,7 +656,6 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.manifold_projection_error_after_reference_constraint[:] = torch.mean(
             torch.abs(filtered_target - constrained_target), dim=1
         )
-        clipped = torch.abs(raw_latent) > self._manifold_latent_limit
         self.manifold_latent_clip_fraction[:] = clipped.float().mean(dim=1)
         self.manifold_reference_overflow[:] = reference_overflow
         self.manifold_reference_clamp_fraction[:] = (reference_overflow > 0.0).float().mean(dim=1)
@@ -524,6 +678,7 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.trunk_pitch_active_lower_deviation[env_ids] = torch.nan
         self.trunk_pitch_active_upper_deviation[env_ids] = torch.nan
         self.trunk_pitch_active_cutoff_frequency_hz[env_ids] = torch.nan
+        self.manifold_policy_latent[env_ids] = 0.0
         self.effective_raw_actions[env_ids] = 0.0
         self.prev_effective_raw_actions[env_ids] = 0.0
 
@@ -541,6 +696,9 @@ class UpperBodyManifoldJointPositionActionCfg(JointPositionActionCfg):
     orthogonal_residual_limit: float = 0.10
     cutoff_frequency_hz: float = 1.8
     reference_target_margin: float | None = None
+    # Control-only interface: policy outputs one PCA coordinate per manifold
+    # component instead of one raw action per upper-body joint.
+    direct_upper_body_latent_action: bool = False
     # Clamp large normalized arm commands before target scaling.  This is
     # intentionally disabled by default to preserve non-control action semantics.
     upper_body_raw_action_limit: float | None = None
@@ -550,6 +708,10 @@ class UpperBodyManifoldJointPositionActionCfg(JointPositionActionCfg):
     trunk_stabilized_reference_margin: float = 0.20
     trunk_stabilized_cutoff_frequency_hz: float = 1.5
     trunk_stabilized_soft_limit_margin: float = 0.0
+    trunk_stabilized_turn_start_angle: float | None = None
+    trunk_stabilized_turn_full_angle: float = 0.45
+    trunk_stabilized_turn_reference_margin: float = 0.45
+    trunk_stabilized_turn_cutoff_frequency_hz: float = 4.0
     # Control-only pitch stabilizer.  It smooths the policy's deviation around
     # the motion's normal forward-lean pose; it is not a hard pose lock.
     trunk_pitch_joint_name: str | None = None

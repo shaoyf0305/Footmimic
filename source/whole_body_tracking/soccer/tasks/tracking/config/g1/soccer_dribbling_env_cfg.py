@@ -681,10 +681,10 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     # A control episode owns the task clock.  Demo time is a looping style
     # phase and must not reset the robot, ball, or locomotion command.
     cfg.commands.motion.motion_clip_end_resample = False
-    # 2.0 m/s is a normal control target, not an out-of-distribution play-only
-    # command.  Sampling speed and heading transitions covers acceleration,
-    # braking, and turning rather than only steady straight runs.
-    cfg.commands.motion.locomotion_cmd_speed_range = (0.40, 2.00)
+    # Establish a reproducible ball-control baseline before expanding the speed
+    # curriculum.  At 2.0 m/s the old policy had to chase the ball faster than
+    # the ball-speed objective allows, which made speed and touch rewards fight.
+    cfg.commands.motion.locomotion_cmd_speed_range = (0.40, 1.50)
     cfg.commands.motion.locomotion_cmd_heading_range = (-0.75, 0.75)
     cfg.commands.motion.locomotion_cmd_duration_range = (3.0, 6.0)
     cfg.commands.motion.locomotion_cmd_wz_range = (0.0, 0.0)
@@ -697,23 +697,6 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     # Include full left-to-right reversals.  The previous +/-0.70 rad range
     # never trained the +0.65 -> -0.65 transition used by control playback.
     cfg.commands.motion.locomotion_cmd_heading_delta_range = (-1.30, 1.30)
-
-    # The playback A/B showed that waist roll is limited by PD tracking rather
-    # than effort saturation.  Give it the same 2x stiffness / sqrt(2)x damping
-    # pair in training, while keeping pitch at its validated baseline gains.
-    # Splitting the original two-joint actuator also makes this control-only;
-    # forward/follow environments retain the robot's default actuator layout.
-    control_actuators = dict(cfg.scene.robot.actuators)
-    waist_actuator = control_actuators.pop("waist")
-    control_actuators["waist_roll_control"] = waist_actuator.replace(
-        joint_names_expr=["waist_roll_joint"],
-        stiffness=2.0 * waist_actuator.stiffness,
-        damping=(2.0**0.5) * waist_actuator.damping,
-    )
-    control_actuators["waist_pitch_control"] = waist_actuator.replace(
-        joint_names_expr=["waist_pitch_joint"],
-    )
-    cfg.scene.robot.actuators = control_actuators
 
     # Follow keeps its demo-velocity tolerance.  Control needs commanded-speed
     # tracking, but a turn must not be solved by braking to a stop.  Use balanced
@@ -825,10 +808,13 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     if hasattr(cfg.rewards, "motion_body_ori"):
         cfg.rewards.motion_body_ori.weight = 0.35
 
-    # Preserve the 37-D policy interface for Stage-1 checkpoint loading, but
-    # interpret the 14 upper-body targets as one coordinated subsystem.  PCA is
-    # fitted from the complete configured motion bank, never the active frame;
-    # lower-body actions are copied through exactly as before.
+    # Lower-body joints retain their direct actions.  The policy emits only the
+    # six PCA coordinates for the 14-joint upper body, eliminating the old
+    # target-space null directions that caused persistent raw-action saturation.
+    # This changes the policy output from 29 to 21 dimensions (15 lower-body
+    # joints plus six arm latents).  The checkpoint loader warm-starts a legacy
+    # 29-D head by retaining its lower-body rows and initializing the six new
+    # latent rows at the motion reference.
     old_action_cfg = cfg.actions.joint_pos
     cfg.actions.joint_pos = mdp.UpperBodyManifoldJointPositionActionCfg(
         asset_name=old_action_cfg.asset_name,
@@ -845,10 +831,18 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         # envelope.  This is control-only: the base config defaults to None.
         # It prevents saturated PCA latents from locking an arm in a raised pose.
         reference_target_margin=0.25,
-        # Keep 3.9's reference envelope and manifold projection, but leave
-        # raw arm output and waist yaw/roll free during a turn.  The stricter
-        # 3.14 clamp/filter combination reduced retouch reachability on the
-        # failing turn side.
+        direct_upper_body_latent_action=True,
+        # Keep yaw/roll quiet while moving straight, but relax the envelope and
+        # increase responsiveness during an unfinished turn.  This replaces
+        # both the 3.14 all-time filter and the 3.15 fully unconstrained mode.
+        trunk_stabilized_joint_names=("waist_yaw_joint", "waist_roll_joint"),
+        trunk_stabilized_reference_margin=0.20,
+        trunk_stabilized_cutoff_frequency_hz=1.5,
+        trunk_stabilized_soft_limit_margin=0.03,
+        trunk_stabilized_turn_start_angle=0.12,
+        trunk_stabilized_turn_full_angle=0.45,
+        trunk_stabilized_turn_reference_margin=0.45,
+        trunk_stabilized_turn_cutoff_frequency_hz=4.0,
         # Preserve the reference clip's normal forward lean, but use a reference
         # that is valid for the simulator's soft joint range.  The diagnostic
         # showed some clips centre waist pitch beyond that range, which forced
@@ -874,8 +868,9 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     if hasattr(old_action_cfg, "clip"):
         cfg.actions.joint_pos.clip = old_action_cfg.clip
 
-    # Feed back the effective action after manifold projection.  Observation
-    # dimensions stay unchanged, so Stage-1 actor/critic weights remain loadable.
+    # Feed back the full 29-D effective joint command after latent decoding so
+    # the policy can observe what is physically executed.  The actor action
+    # head itself is 21-D; the loader adapts legacy 29-D heads for fine-tuning.
     cfg.observations.policy.actions.func = mdp.effective_joint_action
     cfg.observations.policy.actions.params = {"action_name": "joint_pos"}
     cfg.observations.critic.actions.func = mdp.effective_joint_action

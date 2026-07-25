@@ -124,6 +124,62 @@ def _state_dict_needs_obs_expand(checkpoint_sd: dict[str, torch.Tensor], current
     return False
 
 
+def _direct_upper_latent_layout(runner) -> tuple[list[int], int] | None:
+    """Return old joint-action rows and new action size for a latent-action task.
+
+    The direct upper-body interface keeps the original lower-body action order,
+    then appends PCA latent coordinates.  It is therefore possible to preserve
+    the trained lower-body output rows while intentionally reinitializing only
+    the new latent rows.
+    """
+    env = getattr(runner, "env", None)
+    base_env = getattr(env, "unwrapped", env)
+    try:
+        action_term = base_env.action_manager.get_term("joint_pos")
+    except (AttributeError, KeyError):
+        return None
+    if not getattr(action_term, "uses_direct_upper_body_latent", False):
+        return None
+    lower_ids = getattr(action_term, "_lower_action_ids", None)
+    if not isinstance(lower_ids, torch.Tensor):
+        return None
+    return [int(index) for index in lower_ids.detach().cpu().tolist()], int(action_term.action_dim)
+
+
+def _migrate_direct_latent_action_output(
+    old: torch.Tensor,
+    cur: torch.Tensor,
+    *,
+    key: str,
+    lower_action_ids: list[int],
+) -> torch.Tensor:
+    """Warm-start a 29-D joint-action head into a 21-D latent-action head.
+
+    Lower-body action rows are copied exactly.  The six new upper-body latent
+    rows are initialized at zero mean (and conservative exploration variance),
+    which decodes to the current reference pose.  A fixed linear conversion of
+    old arm targets is deliberately avoided: those targets were absolute and
+    reference-clamped, whereas the new coordinates are reference-relative.
+    """
+    if old.ndim != cur.ndim or old.shape[0] <= max(lower_action_ids, default=-1):
+        raise ValueError(f"Cannot migrate direct-latent action tensor {key}: {old.shape} -> {cur.shape}")
+    if old.ndim == 2 and old.shape[1] != cur.shape[1]:
+        raise ValueError(f"Cannot migrate direct-latent action tensor {key}: {old.shape} -> {cur.shape}")
+
+    migrated = cur.clone()
+    lower_count = len(lower_action_ids)
+    migrated[:lower_count] = old[lower_action_ids]
+    if old.ndim == 1:
+        # ``std`` is the only 1-D action parameter.  Start the new latent
+        # coordinates with moderate exploration so tanh does not saturate.
+        migrated[lower_count:] = 0.5
+    else:
+        # Actor-output weights and biases for latent rows must decode to the
+        # reference pose at the first step of fine-tuning.
+        migrated[lower_count:] = 0.0
+    return migrated
+
+
 def _maybe_expand_normalizer_entry(loaded_dict: dict[str, Any], key: str, current_sd: dict[str, torch.Tensor]) -> bool:
     if key not in loaded_dict:
         return False
@@ -135,7 +191,7 @@ def _maybe_expand_normalizer_entry(loaded_dict: dict[str, Any], key: str, curren
 
 
 def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> bool:
-    """Mutate ``loaded_dict`` in place when resuming a smaller-obs checkpoint. Returns True if expanded."""
+    """Adapt smaller-observation and legacy joint-action checkpoints in place."""
     policy = _get_alg_policy(runner)
     model_key = "model_state_dict"
     if model_key not in loaded_dict:
@@ -143,15 +199,60 @@ def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> b
 
     ckpt_sd = loaded_dict[model_key]
     current_sd = policy.state_dict()
-    if not _state_dict_needs_obs_expand(ckpt_sd, current_sd):
+    layout = _direct_upper_latent_layout(runner)
+    old_action_dim = int(ckpt_sd["std"].numel()) if isinstance(ckpt_sd.get("std"), torch.Tensor) else None
+    new_action_dim = int(current_sd["std"].numel()) if isinstance(current_sd.get("std"), torch.Tensor) else None
+
+    transformed_sd: dict[str, torch.Tensor] = {}
+    notes: list[str] = []
+    changed = False
+    for key, cur in current_sd.items():
+        if key not in ckpt_sd:
+            transformed_sd[key] = cur.clone()
+            notes.append(f"keep init: {key}")
+            changed = True
+            continue
+
+        old = ckpt_sd[key]
+        if old.shape == cur.shape:
+            transformed_sd[key] = old
+            continue
+
+        is_action_output = (
+            layout is not None
+            and old_action_dim is not None
+            and new_action_dim is not None
+            and old.shape[0] == old_action_dim
+            and cur.shape[0] == new_action_dim
+            and (old.ndim == 1 or (old.ndim == 2 and old.shape[1] == cur.shape[1]))
+        )
+        if is_action_output:
+            lower_action_ids, _ = layout
+            transformed_sd[key] = _migrate_direct_latent_action_output(
+                old, cur, key=key, lower_action_ids=lower_action_ids
+            )
+            notes.append(f"{key}: migrated {old_action_dim}-D joint actions -> {new_action_dim}-D latent actions")
+            changed = True
+            continue
+
+        if old.ndim == 2 and cur.ndim == 2 and old.shape[0] == cur.shape[0] and cur.shape[1] > old.shape[1]:
+            transformed_sd[key] = _expand_2d_input_weights(old, cur)
+            notes.append(f"{key}: {tuple(old.shape)} -> {tuple(cur.shape)}")
+            changed = True
+            continue
+
+        raise ValueError(
+            f"Incompatible checkpoint tensor '{key}': ckpt {tuple(old.shape)} vs env {tuple(cur.shape)}"
+        )
+
+    if not changed:
         return False
 
-    expanded_sd, notes = expand_state_dict_for_obs_growth(ckpt_sd, current_sd)
-    loaded_dict[model_key] = expanded_sd
+    loaded_dict[model_key] = transformed_sd
     loaded_dict.pop("optimizer_state_dict", None)
     loaded_dict.pop("rnd_optimizer_state_dict", None)
 
-    print("[INFO] Warm-start: expanded checkpoint for new locomotion-cmd obs (zero-padded input weights).")
+    print("[INFO] Warm-start: adapted checkpoint for observation and/or action-interface growth.")
     for note in notes:
         if "->" in note:
             print(f"  {note}")

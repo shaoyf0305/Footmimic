@@ -484,6 +484,11 @@ def _create_joint_reference_constraint(env, margin: float, group: str, joint_nam
     command = base_env.command_manager.get_term("motion")
     robot = base_env.scene[command.cfg.asset_name]
     action_term, action_joint_ids = _get_joint_position_action_term(base_env)
+    if getattr(action_term, "uses_direct_upper_body_latent", False):
+        raise ValueError(
+            "Play-only joint reference clamps are incompatible with the direct upper-body latent interface. "
+            "Use the environment's reference envelope and turn-aware trunk limits instead."
+        )
     robot_joint_ids, found_names = robot.find_joints(joint_names, preserve_order=True)
     if len(robot_joint_ids) != len(joint_names):
         raise RuntimeError(f"Could not resolve all {group} constraint joints; found {found_names}.")
@@ -633,9 +638,13 @@ def _create_diagnostic(
         raise RuntimeError(
             f"Motion command does not expose every trunk diagnostic body: {_TRUNK_DIAGNOSTIC_BODY_NAMES}."
         ) from exc
-    _, action_joint_ids = _get_joint_position_action_term(base_env)
+    action_term, action_joint_ids = _get_joint_position_action_term(base_env)
     arm_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, joint_ids)
-    trunk_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, trunk_joint_ids)
+    direct_upper_latent = bool(getattr(action_term, "uses_direct_upper_body_latent", False))
+    if direct_upper_latent:
+        trunk_action_ids = action_term.policy_action_ids_for_robot_joint_ids(trunk_joint_ids)
+    else:
+        trunk_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, trunk_joint_ids)
 
     output_dir = os.path.join(log_dir, "diagnostics")
     os.makedirs(output_dir, exist_ok=True)
@@ -656,6 +665,7 @@ def _create_diagnostic(
         "joint_ids": torch.as_tensor(joint_ids, dtype=torch.long, device=base_env.device),
         "joint_names": np.asarray(_ARM_DIAGNOSTIC_JOINT_NAMES),
         "action_ids": torch.as_tensor(arm_action_ids, dtype=torch.long, device=base_env.device),
+        "direct_upper_body_latent": direct_upper_latent,
         "trunk_joint_ids": torch.as_tensor(trunk_joint_ids, dtype=torch.long, device=base_env.device),
         "trunk_joint_names": np.asarray(_TRUNK_DIAGNOSTIC_JOINT_NAMES),
         "trunk_action_ids": torch.as_tensor(trunk_action_ids, dtype=torch.long, device=base_env.device),
@@ -684,6 +694,7 @@ def _create_diagnostic(
         "actual_joint_vel": [],
         "policy_action": [],
         "applied_action": [],
+        "upper_policy_latent": [],
         "trunk_reference_joint_pos": [],
         "trunk_reference_joint_vel": [],
         "trunk_actual_joint_pos": [],
@@ -796,8 +807,18 @@ def _append_diagnostic(
     diagnostic["reference_joint_vel"].append(_cpu(command.joint_vel[:, ids]))
     diagnostic["actual_joint_pos"].append(_cpu(robot.data.joint_pos[:, ids]))
     diagnostic["actual_joint_vel"].append(_cpu(robot.data.joint_vel[:, ids]))
-    diagnostic["policy_action"].append(_cpu(policy_actions[:, action_ids]))
-    diagnostic["applied_action"].append(_cpu(applied_actions[:, action_ids]))
+    action_term = base_env.action_manager.get_term("joint_pos")
+    if diagnostic["direct_upper_body_latent"]:
+        # A direct-latent policy has no per-arm input actions.  Store the
+        # decoded pre-envelope target alongside the physically effective arm
+        # action so the diagnostic remains comparable with legacy traces.
+        diagnostic["policy_action"].append(_cpu(action_term.manifold_raw_upper_target))
+        diagnostic["applied_action"].append(_cpu(action_term.effective_raw_actions[:, action_ids]))
+        diagnostic["upper_policy_latent"].append(_cpu(action_term.manifold_policy_latent))
+    else:
+        diagnostic["policy_action"].append(_cpu(policy_actions[:, action_ids]))
+        diagnostic["applied_action"].append(_cpu(applied_actions[:, action_ids]))
+        diagnostic["upper_policy_latent"].append(np.empty(0, dtype=np.float32))
     diagnostic["trunk_reference_joint_pos"].append(_cpu(command.joint_pos[:, trunk_ids]))
     diagnostic["trunk_reference_joint_vel"].append(_cpu(command.joint_vel[:, trunk_ids]))
     diagnostic["trunk_actual_joint_pos"].append(_cpu(robot.data.joint_pos[:, trunk_ids]))
@@ -1016,6 +1037,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         "trunk_reference_body_ids", "trunk_body_names",
         "constraint_group", "constraint_margin", "constraint_joint_names", "constraint_groups",
         "constraint_margins", "waist_roll_stiffness_scale", "waist_roll_damping_scale",
+        "direct_upper_body_latent",
     }
     arrays = {
         key: np.asarray(value)
@@ -1033,6 +1055,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["constraint_margins"] = diagnostic["constraint_margins"]
     arrays["waist_roll_stiffness_scale"] = np.asarray(diagnostic["waist_roll_stiffness_scale"])
     arrays["waist_roll_damping_scale"] = np.asarray(diagnostic["waist_roll_damping_scale"])
+    arrays["direct_upper_body_latent"] = np.asarray(diagnostic["direct_upper_body_latent"])
     np.savez_compressed(diagnostic["path"], **arrays)
     contact_rate = float(np.mean(arrays["ball_contact"]))
     ball_distance = float(np.mean(arrays["ball_pelvis_xy_distance"]))
@@ -1518,7 +1541,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-
     log_dir = os.path.dirname(resume_path)
 
     # convert to single-agent instance if required by the RL algorithm
