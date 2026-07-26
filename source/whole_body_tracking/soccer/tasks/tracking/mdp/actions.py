@@ -209,6 +209,10 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.manifold_projection_error_after_reference_constraint = torch.zeros(
             self.num_envs, device=self.device
         )
+        # Amount of the reference-bounded upper target that lies outside the
+        # PCA subspace.  This is diagnostic/reward telemetry only; it does not
+        # add a second action constraint.
+        self.manifold_nullspace_residual = torch.zeros(self.num_envs, device=self.device)
         self.manifold_latent_clip_fraction = torch.zeros(self.num_envs, device=self.device)
         self.manifold_reference_overflow = torch.zeros_like(self._filtered_upper_target)
         self.manifold_reference_clamp_fraction = torch.zeros(self.num_envs, device=self.device)
@@ -424,6 +428,7 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
 
         if self._use_direct_upper_body_latent:
             filtered_target = torch.clamp(constrained_target, min=soft_limits[..., 0], max=soft_limits[..., 1])
+            nullspace_residual = torch.zeros(self.num_envs, device=self.device)
         else:
             centered = constrained_target - self._manifold_mean
             raw_latent = centered @ self._manifold_basis
@@ -434,6 +439,7 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             )
             parallel = bounded_latent @ self._manifold_basis.transpose(0, 1)
             orthogonal = centered - (raw_latent @ self._manifold_basis.transpose(0, 1))
+            nullspace_residual = torch.mean(torch.abs(orthogonal), dim=1)
             residual_limit = float(self.cfg.orthogonal_residual_limit)
             bounded_orthogonal = residual_limit * torch.tanh(orthogonal / max(residual_limit, 1.0e-6))
             projected = self._manifold_mean + parallel + bounded_orthogonal
@@ -656,6 +662,7 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.manifold_projection_error_after_reference_constraint[:] = torch.mean(
             torch.abs(filtered_target - constrained_target), dim=1
         )
+        self.manifold_nullspace_residual[:] = nullspace_residual
         self.manifold_latent_clip_fraction[:] = clipped.float().mean(dim=1)
         self.manifold_reference_overflow[:] = reference_overflow
         self.manifold_reference_clamp_fraction[:] = (reference_overflow > 0.0).float().mean(dim=1)
@@ -679,6 +686,7 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.trunk_pitch_active_upper_deviation[env_ids] = torch.nan
         self.trunk_pitch_active_cutoff_frequency_hz[env_ids] = torch.nan
         self.manifold_policy_latent[env_ids] = 0.0
+        self.manifold_nullspace_residual[env_ids] = 0.0
         self.effective_raw_actions[env_ids] = 0.0
         self.prev_effective_raw_actions[env_ids] = 0.0
 

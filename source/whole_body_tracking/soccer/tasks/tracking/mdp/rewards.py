@@ -67,6 +67,26 @@ def upper_body_reference_overflow_penalty(
     return torch.mean(torch.sqrt(1.0 + torch.square(normalized_overflow)) - 1.0, dim=1)
 
 
+def upper_body_manifold_nullspace_penalty(
+    env: ManagerBasedRLEnv,
+    action_name: str = "joint_pos",
+    scale: float = 0.10,
+) -> torch.Tensor:
+    """Penalize arm targets that PCA will discard, without changing the action.
+
+    The value is measured after the v3.9 reference envelope and before PCA
+    projection.  Unlike an additional clip or filter, this leaves the executed
+    control path unchanged and gives PPO a continuous reason not to spend its
+    14-D arm command in the manifold's null space.
+    """
+    action_term = env.action_manager.get_term(action_name)
+    residual = getattr(action_term, "manifold_nullspace_residual", None)
+    if not isinstance(residual, torch.Tensor):
+        return torch.zeros(env.num_envs, device=env.device)
+    normalized = residual / max(float(scale), 1.0e-6)
+    return torch.sqrt(1.0 + torch.square(normalized)) - 1.0
+
+
 def locomotion_turn_relaxation(
     command: MotionCommand,
     start_angle: float | None,

@@ -744,6 +744,7 @@ def _create_diagnostic(
         "manifold_latent": [],
         "manifold_projection_error": [],
         "manifold_projection_error_after_reference_constraint": [],
+        "manifold_nullspace_residual": [],
         "manifold_latent_clip_fraction": [],
         "manifold_reference_overflow": [],
         "manifold_reference_clamp_fraction": [],
@@ -930,6 +931,9 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
     )
     diagnostic["manifold_projection_error_after_reference_constraint"].append(
         float(_env0("manifold_projection_error_after_reference_constraint", ()).item())
+    )
+    diagnostic["manifold_nullspace_residual"].append(
+        float(_env0("manifold_nullspace_residual", ()).item())
     )
     diagnostic["manifold_latent_clip_fraction"].append(
         float(_env0("manifold_latent_clip_fraction", ()).item())
@@ -1123,10 +1127,14 @@ def _save_diagnostic(diagnostic: dict) -> None:
     finite_projection = arrays["manifold_projection_error"][
         np.isfinite(arrays["manifold_projection_error"])
     ]
+    finite_nullspace = arrays["manifold_nullspace_residual"][
+        np.isfinite(arrays["manifold_nullspace_residual"])
+    ]
     finite_clip = arrays["manifold_latent_clip_fraction"][
         np.isfinite(arrays["manifold_latent_clip_fraction"])
     ]
     projection_error = float(np.mean(finite_projection)) if finite_projection.size else np.nan
+    nullspace_residual = float(np.mean(finite_nullspace)) if finite_nullspace.size else np.nan
     latent_clip = float(np.mean(finite_clip)) if finite_clip.size else np.nan
     term_reasons = arrays["termination_reason"][arrays["termination_reason"] != ""]
     unique_reasons, reason_counts = np.unique(term_reasons, return_counts=True)
@@ -1142,6 +1150,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"waist_action_step={trunk_action_step:.3f}  torso_rel_tilt={torso_rel_tilt:.3f} rad  "
         f"torso_rel_tilt_err={torso_rel_tilt_error:.3f} rad  "
         f"torso_rel_ang_vel={torso_rel_ang_vel:.3f} rad/s  manifold_projection={projection_error:.3f} rad  "
+        f"manifold_nullspace={nullspace_residual:.3f} rad  "
         f"waist_target_err={trunk_target_error:.3f} rad  "
         f"waist_target_ref_offset={trunk_target_reference_offset:.3f} rad  "
         f"waist_pitch_filter_delta={trunk_pitch_filter_delta:.3f} rad  "

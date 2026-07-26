@@ -681,54 +681,12 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     # A control episode owns the task clock.  Demo time is a looping style
     # phase and must not reset the robot, ball, or locomotion command.
     cfg.commands.motion.motion_clip_end_resample = False
-    # Establish a reproducible ball-control baseline before expanding the speed
-    # curriculum.  At 2.0 m/s the old policy had to chase the ball faster than
-    # the ball-speed objective allows, which made speed and touch rewards fight.
+    # 1.5 m/s is a normal control target, not an out-of-distribution play-only
+    # command.  Long holds force the policy to keep control across turns.
     cfg.commands.motion.locomotion_cmd_speed_range = (0.40, 1.50)
     cfg.commands.motion.locomotion_cmd_heading_range = (-0.75, 0.75)
     cfg.commands.motion.locomotion_cmd_duration_range = (3.0, 6.0)
     cfg.commands.motion.locomotion_cmd_wz_range = (0.0, 0.0)
-    cfg.commands.motion.locomotion_cmd_smoothing_enabled = True
-    cfg.commands.motion.locomotion_cmd_heading_rate_limit = 0.85
-    cfg.commands.motion.locomotion_cmd_accel_limit = 1.4
-    cfg.commands.motion.locomotion_cmd_decel_limit = 2.4
-    cfg.commands.motion.locomotion_cmd_turn_slowdown_angle = 0.55
-    cfg.commands.motion.locomotion_cmd_turn_min_speed_scale = 0.60
-    # Include full left-to-right reversals.  The previous +/-0.70 rad range
-    # never trained the +0.65 -> -0.65 transition used by control playback.
-    cfg.commands.motion.locomotion_cmd_heading_delta_range = (-1.30, 1.30)
-
-    # Follow keeps its demo-velocity tolerance.  Control needs commanded-speed
-    # tracking, but a turn must not be solved by braking to a stop.  Use balanced
-    # one-sided overspeed/deficit terms instead of the old strong overspeed-only
-    # penalty, which made conservative braking disproportionately attractive.
-    cfg.rewards.motion_anchor_lin_vel.params["std"] = 0.35
-    cfg.rewards.motion_anchor_xy_speed_excess = RewTerm(
-        func=mdp.motion_anchor_xy_speed_excess_penalty,
-        # This must outweigh the already-saturated ball-progress reward:
-        # otherwise a controller can buy extra chase/progress reward by
-        # permanently running faster than its command.
-        weight=-3.5,
-        params={"command_name": "motion", "tolerance": 0.08, "scale": 0.20},
-    )
-    cfg.rewards.motion_anchor_xy_speed_deficit = RewTerm(
-        func=mdp.motion_anchor_xy_speed_deficit_penalty,
-        weight=-1.25,
-        params={
-            "command_name": "motion",
-            "tolerance": 0.18,
-            "scale": 0.30,
-            "min_command_speed": 0.25,
-        },
-    )
-    # The generic task heading term is intentionally disabled for arbitrary
-    # command headings.  Replace it with an effective-command yaw reward so
-    # a policy cannot satisfy speed tracking by crab-walking or refusing turns.
-    cfg.rewards.locomotion_heading_tracking = RewTerm(
-        func=mdp.locomotion_heading_tracking_exp,
-        weight=2.5,
-        params={"command_name": "motion", "std": 0.35, "min_command_speed": 0.25},
-    )
 
     # A turn or recovery necessarily departs from the instantaneous demo pose.
     # Keep these references as soft rewards, but never end a control episode
@@ -808,13 +766,9 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     if hasattr(cfg.rewards, "motion_body_ori"):
         cfg.rewards.motion_body_ori.weight = 0.35
 
-    # Lower-body joints retain their direct actions.  The policy emits only the
-    # six PCA coordinates for the 14-joint upper body, eliminating the old
-    # target-space null directions that caused persistent raw-action saturation.
-    # This changes the policy output from 29 to 21 dimensions (15 lower-body
-    # joints plus six arm latents).  The checkpoint loader warm-starts a legacy
-    # 29-D head by retaining its lower-body rows and initializing the six new
-    # latent rows at the motion reference.
+    # The policy retains the v3.9 29-D joint-action interface.  Upper-body
+    # targets are constrained and then projected onto the motion-bank PCA
+    # manifold; lower-body actions pass through unchanged.
     old_action_cfg = cfg.actions.joint_pos
     cfg.actions.joint_pos = mdp.UpperBodyManifoldJointPositionActionCfg(
         asset_name=old_action_cfg.asset_name,
@@ -831,36 +785,6 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         # envelope.  This is control-only: the base config defaults to None.
         # It prevents saturated PCA latents from locking an arm in a raised pose.
         reference_target_margin=0.25,
-        direct_upper_body_latent_action=True,
-        # Keep yaw/roll quiet while moving straight, but relax the envelope and
-        # increase responsiveness during an unfinished turn.  This replaces
-        # both the 3.14 all-time filter and the 3.15 fully unconstrained mode.
-        trunk_stabilized_joint_names=("waist_yaw_joint", "waist_roll_joint"),
-        trunk_stabilized_reference_margin=0.20,
-        trunk_stabilized_cutoff_frequency_hz=1.5,
-        trunk_stabilized_soft_limit_margin=0.03,
-        trunk_stabilized_turn_start_angle=0.12,
-        trunk_stabilized_turn_full_angle=0.45,
-        trunk_stabilized_turn_reference_margin=0.45,
-        trunk_stabilized_turn_cutoff_frequency_hz=4.0,
-        # Preserve the reference clip's normal forward lean, but use a reference
-        # that is valid for the simulator's soft joint range.  The diagnostic
-        # showed some clips centre waist pitch beyond that range, which forced
-        # the policy to trade balance and ball control for a joint-limit loss.
-        # A wider steady-state upper deviation then allows small recovery and
-        # gait corrections without reintroducing the old large back-lean.
-        trunk_pitch_joint_name="waist_pitch_joint",
-        trunk_pitch_soft_limit_margin=0.03,
-        trunk_pitch_lower_deviation=0.45,
-        trunk_pitch_upper_deviation=0.24,
-        trunk_pitch_cutoff_frequency_hz=1.8,
-        # Let a deliberate, unfinished heading transition borrow pitch
-        # authority; restore the tighter forward-lean envelope in steady motion.
-        trunk_pitch_turn_start_angle=0.12,
-        trunk_pitch_turn_full_angle=0.45,
-        trunk_pitch_turn_lower_deviation=0.65,
-        trunk_pitch_turn_upper_deviation=0.32,
-        trunk_pitch_turn_cutoff_frequency_hz=4.0,
     )
     cfg.actions.joint_pos.scale = old_action_cfg.scale
     cfg.actions.joint_pos.offset = old_action_cfg.offset
@@ -868,77 +792,26 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     if hasattr(old_action_cfg, "clip"):
         cfg.actions.joint_pos.clip = old_action_cfg.clip
 
-    # Feed back the full 29-D effective joint command after latent decoding so
-    # the policy can observe what is physically executed.  The actor action
-    # head itself is 21-D; the loader adapts legacy 29-D heads for fine-tuning.
+    # Feed back the effective joint command after manifold projection.
     cfg.observations.policy.actions.func = mdp.effective_joint_action
     cfg.observations.policy.actions.params = {"action_name": "joint_pos"}
     cfg.observations.critic.actions.func = mdp.effective_joint_action
     cfg.observations.critic.actions.params = {"action_name": "joint_pos"}
     cfg.rewards.action_rate_l2.func = mdp.effective_action_rate_l2_clip
     cfg.rewards.action_rate_l2.params = {"action_name": "joint_pos"}
-    # Keep the original light overflow cost.  The reference envelope remains
-    # the safety guard, while the policy retains enough reachability to retouch
-    # the ball during a turn.
+    # Keep the light v3.9 pre-constraint overflow signal.  It is diagnostic and
+    # trainable, but does not add another action transform.
     cfg.rewards.upper_body_reference_overflow = RewTerm(
         func=mdp.upper_body_reference_overflow_penalty,
         weight=-0.05,
         params={"action_name": "joint_pos"},
     )
-    # Keep a reference-relative forward lean without forcing the torso upright.
-    # These terms target the mechanism identified in the 3.9 diagnostic:
-    # recurrent waist-pitch target excursions and torso-vs-pelvis pitch rate.
-    cfg.rewards.trunk_pitch_reference_overflow = RewTerm(
-        func=mdp.trunk_pitch_reference_overflow_penalty,
-        weight=-0.10,
-        params={
-            "action_name": "joint_pos",
-            "lower_deviation": 0.45,
-            "upper_deviation": 0.24,
-            "command_name": "motion",
-            "turn_relaxation_start_angle": 0.12,
-            "turn_relaxation_full_angle": 0.45,
-        },
-    )
-    cfg.rewards.waist_pitch_reference = RewTerm(
-        func=mdp.waist_pitch_reference_error_exp,
-        weight=0.60,
-        params={
-            "command_name": "motion",
-            "action_name": "joint_pos",
-            "std": 0.45,
-            "turn_relaxation_start_angle": 0.12,
-            "turn_relaxation_full_angle": 0.45,
-        },
-    )
-    cfg.rewards.trunk_relative_pitch_reference = RewTerm(
-        func=mdp.trunk_relative_pitch_reference_error_exp,
-        weight=0.45,
-        params={
-            "command_name": "motion",
-            "std": 0.35,
-            "turn_relaxation_start_angle": 0.12,
-            "turn_relaxation_full_angle": 0.45,
-        },
-    )
-    cfg.rewards.trunk_relative_pitch_rate = RewTerm(
-        func=mdp.trunk_relative_pitch_rate_l2,
-        weight=-0.08,
-        params={
-            "command_name": "motion",
-            "turn_relaxation_start_angle": 0.12,
-            "turn_relaxation_full_angle": 0.45,
-        },
-    )
-    cfg.rewards.trunk_pitch_effective_action_rate = RewTerm(
-        func=mdp.trunk_pitch_effective_action_rate_l2,
-        weight=-0.12,
-        params={
-            "action_name": "joint_pos",
-            "command_name": "motion",
-            "turn_relaxation_start_angle": 0.12,
-            "turn_relaxation_full_angle": 0.45,
-        },
+    # The sole post-v3.9 intervention: make PCA null-space effort visible to
+    # PPO without adding another action transform or reducing ball reach.
+    cfg.rewards.upper_body_manifold_nullspace = RewTerm(
+        func=mdp.upper_body_manifold_nullspace_penalty,
+        weight=-0.02,
+        params={"action_name": "joint_pos", "scale": 0.10},
     )
 
     cfg.observations.policy.motion_locomotion_polar_cmd = ObsTerm(
