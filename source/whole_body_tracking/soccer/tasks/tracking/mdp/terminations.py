@@ -12,7 +12,10 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
-from soccer.tasks.tracking.mdp.rewards_dribbling import soccer_ball_contact_force_magnitude
+from soccer.tasks.tracking.mdp.rewards_dribbling import (
+    dribbling_stable_coast_state,
+    soccer_ball_contact_force_magnitude,
+)
 
 from soccer.tasks.tracking.mdp.rewards import _get_body_indexes
 
@@ -128,6 +131,15 @@ def dribbling_no_ball_contact_timeout(
     proximity_recovery_max_distance: float = 0.0,
     proximity_recovery_max_relative_speed: float = 0.0,
     proximity_recovery_counter_increment: float = 1.0,
+    allow_stable_coast: bool = False,
+    stable_coast_counter_decrement: float = 1.0,
+    coast_min_command_speed: float = 0.35,
+    coast_min_ball_speed_ratio: float = 0.70,
+    coast_min_pelvis_speed_ratio: float = 0.70,
+    coast_max_forward_speed_error: float = 0.25,
+    coast_min_forward_offset: float = 0.22,
+    coast_max_forward_offset: float = 0.75,
+    coast_max_lateral_offset: float = 0.22,
 ) -> torch.Tensor:
     """End the episode if the ball sees no robot contact for too long after warm-up.
 
@@ -140,6 +152,11 @@ def dribbling_no_ball_contact_timeout(
     locomotion command change.  A second, bounded recovery allowance applies
     while the ball is close and coasting at a recoverable relative speed.  Both
     paths have finite budgets, so neither permits unlimited no-contact survival.
+
+    Control tasks may additionally classify a well-contained, matched-speed
+    ball as stable coast.  That is not loss of control: its counter decays
+    while the state remains safe and resumes immediately when speed or geometry
+    leaves the configured coast envelope.
     """
     force_mag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
     has_contact = force_mag > contact_force_threshold
@@ -155,6 +172,7 @@ def dribbling_no_ball_contact_timeout(
 
     recovery_active = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
     proximity_recovery_active = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    stable_coast_active = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
     closing_speed = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
     relative_speed = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
     ball_distance = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
@@ -197,6 +215,19 @@ def dribbling_no_ball_contact_timeout(
             )
             setattr(env, proximity_buf_name, proximity_steps)
 
+    if allow_stable_coast:
+        stable_coast_active = dribbling_stable_coast_state(
+            env,
+            command_name=command_name,
+            min_command_speed=coast_min_command_speed,
+            min_ball_speed_ratio=coast_min_ball_speed_ratio,
+            min_pelvis_speed_ratio=coast_min_pelvis_speed_ratio,
+            max_forward_speed_error=coast_max_forward_speed_error,
+            min_forward_offset=coast_min_forward_offset,
+            max_forward_offset=coast_max_forward_offset,
+            max_lateral_offset=coast_max_lateral_offset,
+        )
+
     command_increment = torch.where(
         recovery_active,
         torch.full_like(cnt, float(recovery_counter_increment)),
@@ -208,12 +239,17 @@ def dribbling_no_ball_contact_timeout(
         command_increment,
     )
 
+    no_contact_cnt = torch.where(
+        stable_coast_active,
+        torch.clamp(cnt - float(stable_coast_counter_decrement), min=0.0),
+        cnt + increment,
+    )
     cnt = torch.where(
         reset_m,
         torch.zeros_like(cnt),
         torch.where(
             past_grace,
-            torch.where(has_contact, torch.zeros_like(cnt), cnt + increment),
+            torch.where(has_contact, torch.zeros_like(cnt), no_contact_cnt),
             torch.zeros_like(cnt),
         ),
     )
@@ -223,6 +259,7 @@ def dribbling_no_ball_contact_timeout(
     setattr(env, "_dribbling_no_contact_count", cnt)
     setattr(env, "_dribbling_no_contact_recovery_active", recovery_active)
     setattr(env, "_dribbling_no_contact_proximity_recovery_active", proximity_recovery_active)
+    setattr(env, "_dribbling_no_contact_stable_coast_active", stable_coast_active)
     setattr(env, "_dribbling_no_contact_ball_distance", ball_distance)
     setattr(env, "_dribbling_no_contact_closing_speed", closing_speed)
     setattr(env, "_dribbling_no_contact_relative_speed", relative_speed)

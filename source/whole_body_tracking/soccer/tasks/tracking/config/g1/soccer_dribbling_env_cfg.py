@@ -735,6 +735,35 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     if hasattr(cfg.rewards, "dribbling_cg_foot_consistency"):
         cfg.rewards.dribbling_cg_foot_consistency.weight = 0.5
 
+    # A ball that is centred in the command-frame corridor and already matches
+    # the commanded/pelvis forward speed should be allowed to roll.  Previously
+    # its forward-progress reward expired after ten no-contact steps while the
+    # no-contact timeout kept advancing, yet rapid-retouch penalised the very
+    # correction that those terms forced.  Use one shared coast predicate so
+    # contact is required only after the ball slows, drifts, or escapes.
+    stable_coast_params = {
+        "coast_min_command_speed": 0.35,
+        "coast_min_ball_speed_ratio": 0.70,
+        "coast_min_pelvis_speed_ratio": 0.70,
+        "coast_max_forward_speed_error": 0.25,
+        "coast_min_forward_offset": 0.22,
+        "coast_max_forward_offset": 0.75,
+        "coast_max_lateral_offset": 0.22,
+    }
+    cfg.rewards.dribbling_ball_forward_progress.params.update(
+        {"allow_stable_coast_without_contact": True, **stable_coast_params}
+    )
+    cfg.rewards.dribbling_legal_foot_touch.params.update(
+        {"suppress_when_stable_coast": True, **stable_coast_params}
+    )
+    cfg.rewards.dribbling_rapid_retouch_penalty.params.update(
+        {"penalize_only_when_stable_coast": True, **stable_coast_params}
+    )
+    if hasattr(cfg.rewards, "dribbling_cg_contact_consistency"):
+        cfg.rewards.dribbling_cg_contact_consistency.params.update(
+            {"ignore_stable_coast": True, **stable_coast_params}
+        )
+
     # During a labeled touch, retain only the opposite (support) ankle's roll
     # style.  The touching ankle remains unrestricted, so this small cosmetic
     # correction cannot trade away reachability or ball-control recovery.
@@ -758,6 +787,9 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
             "recovery_max_distance": 0.85,
             "recovery_min_closing_speed": 0.05,
             "recovery_counter_increment": 0.25,
+            "allow_stable_coast": True,
+            "stable_coast_counter_decrement": 1.0,
+            **stable_coast_params,
         }
     )
 

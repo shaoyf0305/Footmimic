@@ -737,6 +737,12 @@ def _create_diagnostic(
         "no_contact_recovery_active": [],
         "no_contact_proximity_recovery_active": [],
         "no_contact_relative_speed": [],
+        "stable_coast_active": [],
+        "coast_ball_forward_speed": [],
+        "coast_pelvis_forward_speed": [],
+        "coast_forward_speed_error": [],
+        "coast_forward_offset": [],
+        "coast_lateral_offset": [],
         "manifold_raw_upper_target": [],
         "manifold_reference_upper_target": [],
         "manifold_constrained_upper_target": [],
@@ -896,6 +902,19 @@ def _append_diagnostic(
     diagnostic["no_contact_relative_speed"].append(
         np.nan if relative_speed is None else float(relative_speed[0].item())
     )
+    stable_coast = getattr(base_env, "_dribbling_stable_coast_active", None)
+    diagnostic["stable_coast_active"].append(
+        False if stable_coast is None else bool(stable_coast[0].item())
+    )
+    for key, attr in (
+        ("coast_ball_forward_speed", "_dribbling_coast_ball_forward_speed"),
+        ("coast_pelvis_forward_speed", "_dribbling_coast_pelvis_forward_speed"),
+        ("coast_forward_speed_error", "_dribbling_coast_forward_speed_error"),
+        ("coast_forward_offset", "_dribbling_coast_forward_offset"),
+        ("coast_lateral_offset", "_dribbling_coast_lateral_offset"),
+    ):
+        value = getattr(base_env, attr, None)
+        diagnostic[key].append(np.nan if value is None else float(value[0].item()))
     # Filled with the reward returned by the immediately following env.step().
     diagnostic["step_reward"].append(np.nan)
     return True
@@ -1068,6 +1087,13 @@ def _save_diagnostic(diagnostic: dict) -> None:
     pelvis_speed = float(np.mean(arrays["pelvis_xy_speed"]))
     foot_error = float(np.mean(arrays["foot_reference_position_error"]))
     heading_error = float(np.mean(np.abs(arrays["heading_error"])))
+    stable_coast_fraction = float(np.mean(arrays["stable_coast_active"]))
+    finite_coast_speed_error = arrays["coast_forward_speed_error"][
+        np.isfinite(arrays["coast_forward_speed_error"])
+    ]
+    coast_speed_error = (
+        float(np.mean(finite_coast_speed_error)) if finite_coast_speed_error.size else np.nan
+    )
     arm_error = float(np.mean(np.abs(arrays["actual_joint_pos"] - arrays["reference_joint_pos"])))
     trunk_error = float(
         np.mean(np.abs(arrays["trunk_actual_joint_pos"] - arrays["trunk_reference_joint_pos"]))
@@ -1145,6 +1171,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"contact_rate={contact_rate:.3f}  ball_pelvis_xy={ball_distance:.3f} m  "
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
         f"pelvis_xy_speed={pelvis_speed:.3f} m/s  "
+        f"stable_coast={stable_coast_fraction:.3f}  coast_speed_err={coast_speed_error:.3f} m/s  "
         f"foot_ref_err={foot_error:.3f} m  mean_abs_heading_err={heading_error:.3f} rad  "
         f"arm_joint_err={arm_error:.3f} rad  waist_joint_err={trunk_error:.3f} rad  "
         f"waist_action_step={trunk_action_step:.3f}  torso_rel_tilt={torso_rel_tilt:.3f} rad  "
@@ -1409,13 +1436,15 @@ def _get_play_overlay(env) -> str:
             proximity_recovery = (
                 False if proximity_recovery_tensor is None else bool(proximity_recovery_tensor[i].item())
             )
+            stable_coast_tensor = getattr(base_env, "_dribbling_stable_coast_active", None)
+            stable_coast = False if stable_coast_tensor is None else bool(stable_coast_tensor[i].item())
             closing = float(base_env._dribbling_no_contact_closing_speed[i].item())
             relative_speed_tensor = getattr(base_env, "_dribbling_no_contact_relative_speed", None)
             relative_speed = 0.0 if relative_speed_tensor is None else float(relative_speed_tensor[i].item())
-            recovery = "CMD" if command_recovery else "COAST" if proximity_recovery else "NO"
+            recovery = "CMD" if command_recovery else "PROX" if proximity_recovery else "NO"
             lines.append(
                 f"No-contact: count={no_contact_count:5.1f}"
-                f"  recovery={recovery}"
+                f"  recovery={recovery}  stable_coast={'YES' if stable_coast else 'NO'}"
                 f"  closing={closing:+.2f} m/s  relative={relative_speed:.2f} m/s"
             )
 
