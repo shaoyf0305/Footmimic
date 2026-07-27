@@ -1349,9 +1349,12 @@ class MotionCommand(CommandTerm):
         if env_ids.numel() == 0:
             return
 
-        # The next sampled command is an episode initial condition, not a
-        # transition from the previous terminated episode.
-        self._locomotion_cmd_initialized[env_ids] = False
+        # A resampled command is an episode initial condition.  A manual
+        # multi-segment diagnostic, however, deliberately keeps one global
+        # command timeline across episode resets.  Preserve its filter state
+        # so the next segment continues to slew instead of hard-switching.
+        if self._locomotion_command_mode != "manual":
+            self._locomotion_cmd_initialized[env_ids] = False
 
         # In style-looping control this method is reached only for a real
         # episode reset, so restart the per-episode diagnostic counter.
@@ -1432,8 +1435,6 @@ class MotionCommand(CommandTerm):
         self._steps_since_resample[env_ids] = 0
         if self._locomotion_command_mode == "resampled":
             self._sample_locomotion_commands(env_ids)
-        elif self._locomotion_command_mode == "manual":
-            self._restart_locomotion_segment_plans(env_ids)
 
     # Called every step in the IsaacLab main loop.
     def _update_command(self):

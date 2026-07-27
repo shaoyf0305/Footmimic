@@ -687,6 +687,16 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     cfg.commands.motion.locomotion_cmd_heading_range = (-0.75, 0.75)
     cfg.commands.motion.locomotion_cmd_duration_range = (3.0, 6.0)
     cfg.commands.motion.locomotion_cmd_wz_range = (0.0, 0.0)
+    # Keep command transitions within the distribution used by the good
+    # control replay: heading slews at 0.85 rad/s while speed brakes into a
+    # turn and recovers afterwards.  The policy observes this effective
+    # command, rather than an instantaneous 0 -> +/-0.65 rad jump.
+    cfg.commands.motion.locomotion_cmd_smoothing_enabled = True
+    cfg.commands.motion.locomotion_cmd_heading_rate_limit = 0.85
+    cfg.commands.motion.locomotion_cmd_accel_limit = 1.4
+    cfg.commands.motion.locomotion_cmd_decel_limit = 2.4
+    cfg.commands.motion.locomotion_cmd_turn_slowdown_angle = 0.55
+    cfg.commands.motion.locomotion_cmd_turn_min_speed_scale = 0.60
 
     # A turn or recovery necessarily departs from the instantaneous demo pose.
     # Keep these references as soft rewards, but never end a control episode
