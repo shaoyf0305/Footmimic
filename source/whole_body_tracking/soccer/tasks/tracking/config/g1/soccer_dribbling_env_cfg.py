@@ -698,6 +698,21 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     cfg.commands.motion.locomotion_cmd_turn_slowdown_angle = 0.55
     cfg.commands.motion.locomotion_cmd_turn_min_speed_scale = 0.60
 
+    # The legacy task_heading_alignment term faces world +X and therefore
+    # cannot supervise arbitrary-heading control.  Use the smoothed effective
+    # heading instead: it remains feasible during a direction reversal while
+    # giving PPO a direct signal to recover pelvis yaw before the ball drifts
+    # sideways.
+    cfg.rewards.locomotion_heading_tracking = RewTerm(
+        func=mdp.locomotion_heading_tracking_exp,
+        weight=1.0,
+        params={
+            "command_name": "motion",
+            "std": 0.45,
+            "min_command_speed": 0.25,
+        },
+    )
+
     # A turn or recovery necessarily departs from the instantaneous demo pose.
     # Keep these references as soft rewards, but never end a control episode
     # because of a style-tracking height/orientation error.  Real falls and
