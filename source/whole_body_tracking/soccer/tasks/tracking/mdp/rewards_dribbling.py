@@ -1405,13 +1405,14 @@ def dribbling_command_chase_ball_reward(
     max_chase_xy_dist: float = 1.1,
     pelvis_forward_speed_min: float = 0.22,
     forward_speed_scale: float = 0.45,
+    max_lateral_offset: float | None = None,
 ) -> torch.Tensor:
-    """Reward closing on a nearby ball ahead along the active command direction."""
+    """Reward closing on a nearby, command-frame-centred ball ahead."""
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
     direction_xy, _ = _command_direction_xy(command)
     offset_xy = soccer_ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
-    ball_ahead, _ = _command_frame_components(offset_xy, direction_xy)
+    ball_ahead, lateral_offset = _command_frame_components(offset_xy, direction_xy)
     dist_xy = torch.norm(offset_xy, dim=-1)
     pelvis_forward, _ = _command_frame_components(command.robot_anchor_lin_vel_w[:, :2], direction_xy)
 
@@ -1421,8 +1422,66 @@ def dribbling_command_chase_ball_reward(
         max=1.0,
     )
     no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
-    active = no_ball & (ball_ahead >= min_ball_ahead) & (dist_xy <= max_chase_xy_dist)
+    in_lateral_corridor = torch.ones_like(no_ball)
+    if max_lateral_offset is not None:
+        if max_lateral_offset < 0.0:
+            raise ValueError("max_lateral_offset must be non-negative when provided")
+        in_lateral_corridor = torch.abs(lateral_offset) <= max_lateral_offset
+    active = no_ball & (ball_ahead >= min_ball_ahead) & (dist_xy <= max_chase_xy_dist) & in_lateral_corridor
     return speed_reward * active.to(torch.float32)
+
+
+def dribbling_command_lateral_recovery_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    lateral_start: float = 0.20,
+    lateral_full: float = 0.45,
+    min_forward_offset: float = 0.10,
+    max_recovery_xy_dist: float = 0.90,
+    min_closing_speed: float = 0.05,
+    closing_speed_scale: float = 0.30,
+) -> torch.Tensor:
+    """Reward closing command-frame lateral ball error after a sideways escape.
+
+    The reward is active only without ball contact.  It measures relative lateral
+    velocity, so moving sideways is rewarded only when it actually reduces the
+    ball-pelvis lateral separation.
+    """
+    if lateral_start < 0.0 or lateral_full <= lateral_start:
+        raise ValueError("lateral_full must be greater than non-negative lateral_start")
+    if min_forward_offset < 0.0 or max_recovery_xy_dist <= 0.0:
+        raise ValueError("recovery offsets and distance must be positive")
+    if closing_speed_scale <= 0.0:
+        raise ValueError("closing_speed_scale must be positive")
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+    direction_xy, _ = _command_direction_xy(command)
+    lateral_axis = torch.stack((-direction_xy[:, 1], direction_xy[:, 0]), dim=-1)
+    offset_xy = soccer_ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
+    forward_offset, lateral_offset = _command_frame_components(offset_xy, direction_xy)
+    dist_xy = torch.norm(offset_xy, dim=-1)
+
+    ball_lateral_speed = torch.sum(soccer_ball.data.root_lin_vel_w[:, :2] * lateral_axis, dim=-1)
+    pelvis_lateral_speed = torch.sum(command.robot_anchor_lin_vel_w[:, :2] * lateral_axis, dim=-1)
+    relative_lateral_speed = ball_lateral_speed - pelvis_lateral_speed
+    closing_lateral_speed = -torch.sign(lateral_offset) * relative_lateral_speed
+    closing_reward = torch.clamp(
+        (closing_lateral_speed - min_closing_speed) / closing_speed_scale,
+        min=0.0,
+        max=1.0,
+    )
+    lateral_activation = torch.clamp(
+        (torch.abs(lateral_offset) - lateral_start) / (lateral_full - lateral_start),
+        min=0.0,
+        max=1.0,
+    )
+
+    no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
+    active = no_ball & (forward_offset >= min_forward_offset) & (dist_xy <= max_recovery_xy_dist)
+    return lateral_activation * closing_reward * active.to(torch.float32)
 
 
 def dribbling_rapid_retouch_penalty(

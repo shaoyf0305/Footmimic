@@ -728,6 +728,25 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     cfg.rewards.dribbling_ball_forward_progress.func = mdp.dribbling_command_ball_progress_reward
     cfg.rewards.dribbling_ball_trapped_penalty.func = mdp.dribbling_command_ball_trapped_penalty
     cfg.rewards.dribbling_chase_ball.func = mdp.dribbling_command_chase_ball_reward
+    # Once the ball leaves the stable-coast lateral corridor, forward-only
+    # chasing amplifies the escape.  Stop that signal and reward the velocity
+    # component that genuinely closes the command-frame lateral error instead.
+    cfg.rewards.dribbling_chase_ball.params["max_lateral_offset"] = 0.22
+    cfg.rewards.dribbling_lateral_recovery = RewTerm(
+        func=mdp.dribbling_command_lateral_recovery_reward,
+        weight=1.5,
+        params={
+            "command_name": "motion",
+            "ball_sensor_name": "soccer_ball_contact",
+            "contact_force_threshold": 1.0,
+            "lateral_start": 0.20,
+            "lateral_full": 0.45,
+            "min_forward_offset": 0.10,
+            "max_recovery_xy_dist": 0.90,
+            "min_closing_speed": 0.05,
+            "closing_speed_scale": 0.30,
+        },
+    )
     cfg.rewards.dribbling_face_ball.func = mdp.dribbling_command_face_ball
     cfg.rewards.dribbling_ball_forward_progress.params.update(
         {
