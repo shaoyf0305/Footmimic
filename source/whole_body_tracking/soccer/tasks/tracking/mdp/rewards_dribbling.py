@@ -1442,18 +1442,23 @@ def dribbling_command_lateral_recovery_reward(
     max_recovery_xy_dist: float = 0.90,
     min_closing_speed: float = 0.05,
     closing_speed_scale: float = 0.30,
+    min_diverging_speed: float = 0.03,
+    divergence_penalty_scale: float = 0.35,
 ) -> torch.Tensor:
     """Reward closing command-frame lateral ball error after a sideways escape.
 
     The reward is active only without ball contact.  It measures relative lateral
     velocity, so moving sideways is rewarded only when it actually reduces the
-    ball-pelvis lateral separation.
+    ball-pelvis lateral separation.  Conversely, a small signed penalty applies
+    when the relative velocity makes an already-lateral ball escape further.
     """
     if lateral_start < 0.0 or lateral_full <= lateral_start:
         raise ValueError("lateral_full must be greater than non-negative lateral_start")
     if min_forward_offset < 0.0 or max_recovery_xy_dist <= 0.0:
         raise ValueError("recovery offsets and distance must be positive")
-    if closing_speed_scale <= 0.0:
+    if min_closing_speed < 0.0 or min_diverging_speed < 0.0:
+        raise ValueError("lateral speed thresholds must be non-negative")
+    if closing_speed_scale <= 0.0 or divergence_penalty_scale < 0.0:
         raise ValueError("closing_speed_scale must be positive")
 
     command: MotionCommand = env.command_manager.get_term(command_name)
@@ -1473,6 +1478,11 @@ def dribbling_command_lateral_recovery_reward(
         min=0.0,
         max=1.0,
     )
+    diverging_penalty = torch.clamp(
+        (-closing_lateral_speed - min_diverging_speed) / closing_speed_scale,
+        min=0.0,
+        max=1.0,
+    )
     lateral_activation = torch.clamp(
         (torch.abs(lateral_offset) - lateral_start) / (lateral_full - lateral_start),
         min=0.0,
@@ -1481,7 +1491,8 @@ def dribbling_command_lateral_recovery_reward(
 
     no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
     active = no_ball & (forward_offset >= min_forward_offset) & (dist_xy <= max_recovery_xy_dist)
-    return lateral_activation * closing_reward * active.to(torch.float32)
+    lateral_score = closing_reward - divergence_penalty_scale * diverging_penalty
+    return lateral_activation * lateral_score * active.to(torch.float32)
 
 
 def dribbling_rapid_retouch_penalty(

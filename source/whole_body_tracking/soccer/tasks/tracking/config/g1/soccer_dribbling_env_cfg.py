@@ -739,12 +739,14 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
             "command_name": "motion",
             "ball_sensor_name": "soccer_ball_contact",
             "contact_force_threshold": 1.0,
-            "lateral_start": 0.20,
-            "lateral_full": 0.45,
+            "lateral_start": 0.16,
+            "lateral_full": 0.40,
             "min_forward_offset": 0.10,
             "max_recovery_xy_dist": 0.90,
             "min_closing_speed": 0.05,
             "closing_speed_scale": 0.30,
+            "min_diverging_speed": 0.03,
+            "divergence_penalty_scale": 0.35,
         },
     )
     cfg.rewards.dribbling_face_ball.func = mdp.dribbling_command_face_ball
