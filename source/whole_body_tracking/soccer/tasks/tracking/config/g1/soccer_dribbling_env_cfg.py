@@ -673,6 +673,22 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     """Control: external speed/heading/duration — ref provides pose/gait/CG only, not root vel."""
     _apply_dribbling_locomotion_velocity_terms(cfg)
     cfg.commands.motion.locomotion_command_mode = "resampled"
+    # The task input is distinct from speed: both IDLE and STOP command zero
+    # velocity, but only STOP asks the policy to settle the ball after a run.
+    # Each episode begins with a genuine stationary wait, then trains the
+    # complete start -> dribble -> stop loop rather than isolated gait clips.
+    cfg.commands.motion.locomotion_task_state_enabled = True
+    cfg.commands.motion.locomotion_task_state_sequence = ("idle", "dribble", "stop")
+    # Explicit play/evaluation sequences restart from IDLE after either a
+    # failure or a successful STOP reset, instead of remaining at their last
+    # held segment.
+    cfg.commands.motion.locomotion_task_state_restart_manual_sequence_on_reset = True
+    cfg.commands.motion.locomotion_task_idle_duration_range = (1.0, 2.5)
+    cfg.commands.motion.locomotion_task_dribble_duration_range = (3.0, 6.0)
+    cfg.commands.motion.locomotion_task_stop_duration_range = (2.0, 3.5)
+    # The longest IDLE -> DRIBBLE -> STOP schedule is 12 s; leave margin for
+    # a complete stop phase instead of truncating it at the generic 10 s cap.
+    cfg.episode_length_s = 15.0
     # The control heading is also the intended facing direction (see
     # ``dribbling_command_face_ball``).  Rotate the style pose into that frame
     # so the upper-body mimic reward does not hold arms and wrists at world +X
@@ -683,7 +699,11 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     cfg.commands.motion.motion_clip_end_resample = False
     # 1.5 m/s is a normal control target, not an out-of-distribution play-only
     # command.  Long holds force the policy to keep control across turns.
-    cfg.commands.motion.locomotion_cmd_speed_range = (0.40, 1.50)
+    # The complete training command range now includes exactly zero.  Positive
+    # speeds remain a separate DRIBBLE-only range, while IDLE/STOP generate
+    # stable zero-speed targets with explicit state semantics.
+    cfg.commands.motion.locomotion_cmd_speed_range = (0.0, 1.50)
+    cfg.commands.motion.locomotion_cmd_dribble_speed_range = (0.40, 1.50)
     cfg.commands.motion.locomotion_cmd_heading_range = (-0.75, 0.75)
     cfg.commands.motion.locomotion_cmd_duration_range = (3.0, 6.0)
     cfg.commands.motion.locomotion_cmd_wz_range = (0.0, 0.0)
@@ -749,6 +769,26 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
             "divergence_penalty_scale": 0.35,
         },
     )
+    cfg.rewards.dribbling_idle_stand = RewTerm(
+        func=mdp.dribbling_idle_stand_reward,
+        weight=2.5,
+        params={
+            "command_name": "motion",
+            "linear_speed_std": 0.10,
+            "angular_speed_std": 0.35,
+        },
+    )
+    cfg.rewards.dribbling_stop_settle = RewTerm(
+        func=mdp.dribbling_stop_settle_reward,
+        weight=6.0,
+        params={
+            "command_name": "motion",
+            "pelvis_speed_std": 0.10,
+            "pelvis_angular_speed_std": 0.35,
+            "settled_pelvis_speed": 0.05,
+            "settled_pelvis_angular_speed": 0.20,
+        },
+    )
     cfg.rewards.dribbling_face_ball.func = mdp.dribbling_command_face_ball
     cfg.rewards.dribbling_ball_forward_progress.params.update(
         {
@@ -770,6 +810,24 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         cfg.rewards.dribbling_cg_premature_contact.weight = 0.0
     if hasattr(cfg.rewards, "dribbling_cg_foot_consistency"):
         cfg.rewards.dribbling_cg_foot_consistency.weight = 0.5
+
+    # Moving gait and contact-graph priors are meaningful only while carrying
+    # the ball.  Leaving them active in IDLE/STOP would make a zero-speed
+    # request conflict with the walking reference clip.
+    if hasattr(cfg.rewards, "motion_body_pos"):
+        cfg.rewards.motion_body_pos.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
+    if hasattr(cfg.rewards, "motion_foot_pos"):
+        cfg.rewards.motion_foot_pos.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
+    if hasattr(cfg.rewards, "dribbling_gait_foot_tracking"):
+        cfg.rewards.dribbling_gait_foot_tracking.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
+    if hasattr(cfg.rewards, "dribbling_stall_no_touch_penalty"):
+        cfg.rewards.dribbling_stall_no_touch_penalty.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
+    if hasattr(cfg.rewards, "dribbling_cg_foot_ball_distance"):
+        cfg.rewards.dribbling_cg_foot_ball_distance.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
+    if hasattr(cfg.rewards, "dribbling_cg_contact_consistency"):
+        cfg.rewards.dribbling_cg_contact_consistency.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
+    if hasattr(cfg.rewards, "dribbling_cg_foot_consistency"):
+        cfg.rewards.dribbling_cg_foot_consistency.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
 
     # A ball that is centred in the command-frame corridor and already matches
     # the commanded/pelvis forward speed should be allowed to roll.  Previously
@@ -811,8 +869,14 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
             "std": 0.24,
             "deadzone": 0.10,
             "error_cap": 0.35,
+            "active_task_states": (mdp.TASK_STATE_DRIBBLE,),
         },
     )
+
+    # Once STOP is requested, the ball is intentionally no longer a task
+    # target.  It may roll away while the robot stabilizes, so ball-loss is a
+    # DRIBBLE-only failure condition.
+    cfg.terminations.ball_lost.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
 
     # Keep the no-contact termination, but give an actual command-change
     # recovery attempt a bounded extra window.  The counter only slows while
@@ -825,9 +889,69 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
             "recovery_counter_increment": 0.25,
             "allow_stable_coast": True,
             "stable_coast_counter_decrement": 1.0,
+            # A stationary wait or a deliberate settle must not accrue the
+            # running-only no-contact failure counter.
+            "active_task_states": (mdp.TASK_STATE_DRIBBLE,),
             **stable_coast_params,
         }
     )
+    # Completing a stable STOP is a success terminal, not an indefinitely
+    # held command.  The next episode is reset into IDLE by the command term.
+    cfg.terminations.dribbling_stop_success = DoneTerm(
+        func=mdp.dribbling_stop_success,
+        params={
+            "command_name": "motion",
+            "min_settle_duration_s": 0.5,
+            "settled_pelvis_speed": 0.05,
+            "settled_pelvis_angular_speed": 0.20,
+        },
+    )
+
+    # STOP is a robot-stability endpoint, not a ball-control objective.  Gate
+    # every dribble-specific shaping term to DRIBBLE so a freely rolling ball
+    # neither improves nor harms return during IDLE/STOP.
+    dribble_only_reward_names = (
+        "dribbling_face_ball",
+        "dribbling_velocity_tracking",
+        "dribbling_dynamic_proximity",
+        "dribbling_stall_no_touch_penalty",
+        "dribbling_approach_foot_ball",
+        "dribbling_pelvis_quat_tracking",
+        "dribbling_ball_speed_excess",
+        "dribbling_ball_coast_penalty",
+        "dribbling_ball_trapped_penalty",
+        "dribbling_sustained_contact_penalty",
+        "dribbling_ball_bounce_penalty",
+        "dribbling_ball_forward_progress",
+        "dribbling_orbiting_penalty",
+        "dribbling_gait_foot_tracking",
+        "dribbling_chase_ball",
+        "dribbling_rapid_retouch_penalty",
+        "dribbling_legal_foot_touch",
+        "dribbling_micro_contact_filter",
+        "dribbling_undesired_contact_penalty",
+        "dribbling_phase_graph_alignment",
+        "dribbling_cg_demo_ball_tracking",
+        "dribbling_cg_foot_ball_distance",
+        "dribbling_cg_contact_consistency",
+        "dribbling_cg_premature_contact",
+        "dribbling_cg_foot_consistency",
+        "dribbling_lateral_recovery",
+        "dribbling_support_ankle_roll",
+    )
+    for reward_name in dribble_only_reward_names:
+        if not hasattr(cfg.rewards, reward_name):
+            continue
+        term = getattr(cfg.rewards, reward_name)
+        original_func = term.func
+        original_params = dict(term.params or {})
+        term.func = mdp.task_state_gated_reward
+        term.params = {
+            "reward_func": original_func,
+            "reward_params": original_params,
+            "command_name": "motion",
+            "active_task_states": (mdp.TASK_STATE_DRIBBLE,),
+        }
 
     # Do not pull linear/angular vel from demo bodies — velocity comes from the command only.
     if hasattr(cfg.rewards, "motion_body_lin_vel"):
@@ -898,6 +1022,14 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     )
     cfg.observations.critic.motion_locomotion_polar_cmd = ObsTerm(
         func=mdp.motion_locomotion_polar_command,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.policy.motion_locomotion_task_state = ObsTerm(
+        func=mdp.motion_locomotion_task_state,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.critic.motion_locomotion_task_state = ObsTerm(
+        func=mdp.motion_locomotion_task_state,
         params={"command_name": "motion"},
     )
 

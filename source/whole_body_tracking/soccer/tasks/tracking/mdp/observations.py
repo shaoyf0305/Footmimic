@@ -7,7 +7,10 @@ from typing import TYPE_CHECKING
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms, quat_apply, quat_inv
 
-from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
+from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import (
+    TASK_STATE_DRIBBLE,
+    MotionCommand,
+)
 from soccer.tasks.tracking.mdp.task_frame import mimic_anchor_yaw_delta_quat
 
 if TYPE_CHECKING:
@@ -147,6 +150,20 @@ def motion_locomotion_polar_command(env: ManagerBasedEnv, command_name: str) -> 
         speed = torch.norm(lin[:, :2], dim=-1)
         heading = torch.atan2(lin[:, 1], lin[:, 0])
     return torch.stack([speed, torch.cos(heading), torch.sin(heading)], dim=-1)
+
+
+def motion_locomotion_task_state(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """One-hot IDLE/DRIBBLE/STOP task input, ordered ``[idle, dribble, stop]``.
+
+    It intentionally remains separate from the polar velocity input: zero
+    speed alone is ambiguous between waiting for a start request and settling
+    the ball after a completed run.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    state = getattr(command, "locomotion_task_state", None)
+    if not isinstance(state, torch.Tensor):
+        state = torch.full((env.num_envs,), TASK_STATE_DRIBBLE, device=env.device, dtype=torch.long)
+    return torch.nn.functional.one_hot(state.to(torch.long), num_classes=3).to(torch.float32)
 
 
 def _get_motion_command(env: ManagerBasedEnv, command_name: str) -> MotionCommand:

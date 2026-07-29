@@ -11,8 +11,9 @@ if TYPE_CHECKING:
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 
-from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
+from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand, locomotion_task_state_mask
 from soccer.tasks.tracking.mdp.rewards_dribbling import (
+    dribbling_stop_settle_state,
     dribbling_stable_coast_state,
     soccer_ball_contact_force_magnitude,
 )
@@ -84,6 +85,7 @@ def ball_lost_dribbling(
     max_distance: float = 1.0,
     max_vel_divergence: float = 2.0,
     grace_steps: int = 50,
+    active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Terminate the episode if the ball is lost during dribbling.
 
@@ -96,6 +98,7 @@ def ball_lost_dribbling(
     so the robot has time to approach the ball before termination kicks in.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
+    active_task_state = locomotion_task_state_mask(command, active_task_states)
     soccer_ball = env.scene["soccer_ball"]
 
     # XY distance between ball and pelvis
@@ -112,7 +115,8 @@ def ball_lost_dribbling(
     step_buf = getattr(env, "episode_length_buf", torch.zeros(env.num_envs, device=env.device))
     past_grace = step_buf > grace_steps
 
-    lost = past_grace & ((dist_xy > max_distance) | (vel_diff > max_vel_divergence))
+    lost = active_task_state & past_grace & ((dist_xy > max_distance) | (vel_diff > max_vel_divergence))
+    setattr(env, "_dribbling_ball_lost_task_active", active_task_state)
     return lost
 
 
@@ -140,6 +144,7 @@ def dribbling_no_ball_contact_timeout(
     coast_min_forward_offset: float = 0.22,
     coast_max_forward_offset: float = 0.75,
     coast_max_lateral_offset: float = 0.22,
+    active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """End the episode if the ball sees no robot contact for too long after warm-up.
 
@@ -158,6 +163,8 @@ def dribbling_no_ball_contact_timeout(
     while the state remains safe and resumes immediately when speed or geometry
     leaves the configured coast envelope.
     """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    active_task_state = locomotion_task_state_mask(command, active_task_states)
     force_mag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
     has_contact = force_mag > contact_force_threshold
 
@@ -180,7 +187,6 @@ def dribbling_no_ball_contact_timeout(
         (recovery_window_steps > 0 and recovery_max_distance > 0.0)
         or (proximity_recovery_max_steps > 0 and proximity_recovery_max_distance > 0.0)
     ):
-        command: MotionCommand = env.command_manager.get_term(command_name)
         ball = env.scene["soccer_ball"]
         delta_xy = ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
         ball_distance = torch.norm(delta_xy, dim=-1)
@@ -207,9 +213,9 @@ def dribbling_no_ball_contact_timeout(
                 & (relative_speed <= float(proximity_recovery_max_relative_speed))
                 & (proximity_steps < int(proximity_recovery_max_steps))
             )
-            proximity_recovery_active = proximity_candidate & ~has_contact & past_grace
+            proximity_recovery_active = proximity_candidate & ~has_contact & past_grace & active_task_state
             proximity_steps = torch.where(
-                reset_m | has_contact,
+                reset_m | has_contact | ~active_task_state,
                 torch.zeros_like(proximity_steps),
                 proximity_steps + proximity_recovery_active.to(proximity_steps.dtype),
             )
@@ -245,7 +251,7 @@ def dribbling_no_ball_contact_timeout(
         cnt + increment,
     )
     cnt = torch.where(
-        reset_m,
+        reset_m | ~active_task_state,
         torch.zeros_like(cnt),
         torch.where(
             past_grace,
@@ -256,6 +262,7 @@ def dribbling_no_ball_contact_timeout(
     setattr(env, buf_name, cnt)
     # Compact diagnostics for the play HUD and evaluation collectors.
     setattr(env, "_dribbling_no_contact_force", force_mag)
+    setattr(env, "_dribbling_no_contact_task_active", active_task_state)
     setattr(env, "_dribbling_no_contact_count", cnt)
     setattr(env, "_dribbling_no_contact_recovery_active", recovery_active)
     setattr(env, "_dribbling_no_contact_proximity_recovery_active", proximity_recovery_active)
@@ -264,7 +271,62 @@ def dribbling_no_ball_contact_timeout(
     setattr(env, "_dribbling_no_contact_closing_speed", closing_speed)
     setattr(env, "_dribbling_no_contact_relative_speed", relative_speed)
 
-    return cnt >= max_steps_without_contact
+    return active_task_state & (cnt >= max_steps_without_contact)
+
+
+def dribbling_stop_success(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    min_settle_duration_s: float = 0.5,
+    settled_pelvis_speed: float = 0.05,
+    settled_pelvis_angular_speed: float = 0.20,
+) -> torch.Tensor:
+    """End a successful episode after a sustained, stable robot STOP.
+
+    The ball is deliberately outside this completion condition and may keep
+    rolling after the final dribble. Count elapsed *control* time only while
+    the robot remains stationary and stable, then request a normal environment
+    reset. The command term's reset path restarts the task at its IDLE state.
+    """
+    (
+        active,
+        pelvis_speed,
+        pelvis_angular_speed,
+        ball_speed,
+        forward_offset,
+        lateral_offset,
+        settled,
+    ) = dribbling_stop_settle_state(
+        env,
+        command_name=command_name,
+        settled_pelvis_speed=settled_pelvis_speed,
+        settled_pelvis_angular_speed=settled_pelvis_angular_speed,
+    )
+    elapsed_name = "_dribbling_stop_settle_elapsed_s"
+    elapsed = getattr(env, elapsed_name, None)
+    if elapsed is None or elapsed.shape[0] != env.num_envs:
+        elapsed = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+    step_buf = getattr(env, "episode_length_buf", torch.zeros(env.num_envs, device=env.device))
+    reset_m = step_buf == 0
+    step_dt = float(getattr(env, "step_dt", 0.02))
+    elapsed = torch.where(
+        reset_m | ~settled,
+        torch.zeros_like(elapsed),
+        elapsed + step_dt,
+    )
+    success = active & (elapsed >= float(min_settle_duration_s))
+    setattr(env, elapsed_name, elapsed)
+    setattr(env, "_dribbling_stop_success", success)
+    # The reward normally publishes these too, but the termination manager may
+    # execute first, so diagnostics must be complete regardless of manager order.
+    setattr(env, "_dribbling_stop_active", active)
+    setattr(env, "_dribbling_stop_pelvis_speed", pelvis_speed)
+    setattr(env, "_dribbling_stop_pelvis_angular_speed", pelvis_angular_speed)
+    setattr(env, "_dribbling_stop_ball_speed", ball_speed)
+    setattr(env, "_dribbling_stop_forward_offset", forward_offset)
+    setattr(env, "_dribbling_stop_lateral_offset", lateral_offset)
+    setattr(env, "_dribbling_stop_settled", settled)
+    return success
 
 
 def contact_phase_violation(

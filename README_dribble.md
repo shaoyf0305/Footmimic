@@ -170,6 +170,7 @@ Speed channel:
 locomotion_cmd_speed 0.0 0.55 0.0
 locomotion_cmd_heading 0.0 0.0 0.0
 locomotion_cmd_duration 5.0 5.0 5.0
+locomotion_task_state idle dribble stop
 
 Heading channel:
 locomotion_cmd_speed 0.5 0.5 0.5
@@ -177,6 +178,33 @@ locomotion_cmd_heading 0.0 0.75 -0.75
 locomotion_cmd_duration 4.0 6.0 6.0
 
 Compare Loco cmd to Robot actual, hdg_err, and Pelvis v_xy. The track percent field is velocity-direction cosine only. It does not prove heading tracking.
+
+### Stateful start / stop control
+
+The control task now observes a one-hot task state in addition to the robot
+velocity command: `IDLE`, `DRIBBLE`, or `STOP`.  IDLE and STOP both request
+zero velocity, but their goals differ: IDLE rewards a quiet robot waiting for a
+start request; STOP rewards a quiet, stable robot only. The ball is no longer
+a STOP target and may roll away after the final touch. The training command
+schedule is `IDLE -> DRIBBLE -> STOP`, and it includes zero speed by
+construction. STOP is successful only after the robot's linear and angular
+speeds remain below threshold continuously for 0.5 s; that success terminates
+the episode and the next one begins again at IDLE.
+
+Use the explicit state argument for a manual regression run:
+
+```
+--locomotion_cmd_speed 0.0 0.6 0.0 \
+--locomotion_cmd_heading 0.0 0.0 0.0 \
+--locomotion_cmd_duration 3.0 6.0 3.0 \
+--locomotion_task_state idle dribble stop \
+--locomotion_cmd_hold_last --diagnostic
+```
+
+The diagnostic records the requested and effective speed, task state, active
+no-contact gate, and IDLE/STOP metrics.  For STOP, require a sustained
+`stop_settled` interval and a `stop_success` event; ball values are recorded
+for observation only and do not affect STOP reward or success.
 
 ## Older baseline (do not redo)
 

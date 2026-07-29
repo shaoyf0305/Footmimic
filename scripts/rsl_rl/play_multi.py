@@ -107,6 +107,17 @@ parser.add_argument(
     help="Hold duration(s) in seconds per segment. Must match length of --locomotion_cmd_speed.",
 )
 parser.add_argument(
+    "--locomotion_task_state",
+    type=str,
+    nargs="+",
+    choices=["idle", "dribble", "stop"],
+    default=None,
+    help=(
+        "High-level state(s) for polar segments: idle, dribble, or stop. "
+        "Must match --locomotion_cmd_speed; omitted states infer dribble for positive speed and stop for zero."
+    ),
+)
+parser.add_argument(
     "--locomotion_cmd_wz",
     type=float,
     nargs="*",
@@ -675,6 +686,7 @@ def _create_diagnostic(
         ),
         "trunk_body_names": np.asarray(_TRUNK_DIAGNOSTIC_BODY_NAMES),
         "reward_term_names": reward_term_names,
+        "task_state_names": np.asarray(["idle", "dribble", "stop"]),
         "constraint_group": "none" if not constraints else "+".join(constraint_groups.tolist()),
         "constraint_margin": float(constraint_margins[0]) if len(constraints) == 1 else np.nan,
         "constraint_joint_names": constraint_joint_names,
@@ -686,7 +698,10 @@ def _create_diagnostic(
         "motion_idx": [],
         "style_phase": [],
         "segment_idx": [],
+        "task_state": [],
         "command_heading": [],
+        "effective_command_speed": [],
+        "effective_command_heading": [],
         "pelvis_yaw": [],
         "reference_joint_pos": [],
         "reference_joint_vel": [],
@@ -734,6 +749,7 @@ def _create_diagnostic(
         "foot_reference_position_error": [],
         "heading_error": [],
         "no_contact_count": [],
+        "no_contact_task_active": [],
         "no_contact_recovery_active": [],
         "no_contact_proximity_recovery_active": [],
         "no_contact_relative_speed": [],
@@ -743,6 +759,20 @@ def _create_diagnostic(
         "coast_forward_speed_error": [],
         "coast_forward_offset": [],
         "coast_lateral_offset": [],
+        "idle_active": [],
+        "idle_pelvis_speed": [],
+        "idle_pelvis_angular_speed": [],
+        "stop_active": [],
+        "stop_settled": [],
+        "stop_success": [],
+        "stop_settle_elapsed_s": [],
+        "stop_pelvis_speed": [],
+        "stop_pelvis_angular_speed": [],
+        "stop_ball_speed": [],
+        "stop_forward_offset": [],
+        "stop_lateral_offset": [],
+        "stop_position_score": [],
+        "stop_speed_score": [],
         "manifold_raw_upper_target": [],
         "manifold_reference_upper_target": [],
         "manifold_constrained_upper_target": [],
@@ -798,11 +828,15 @@ def _append_diagnostic(
     diagnostic["motion_idx"].append(int(command.motion_idx[0].item()))
     diagnostic["style_phase"].append(int(command.style_phase_steps[0].item()))
     diagnostic["segment_idx"].append(int(command._locomotion_segment_idx[0].item()))
+    task_state = getattr(command, "locomotion_task_state", None)
+    diagnostic["task_state"].append(1 if task_state is None else int(task_state[0].item()))
     diagnostic["command_heading"].append(float(command.locomotion_cmd_heading[0].item()))
     target_speed = getattr(command, "locomotion_cmd_target_speed", command.locomotion_cmd_speed)
     target_heading = getattr(command, "locomotion_cmd_target_heading", command.locomotion_cmd_heading)
     diagnostic["command_target_speed"].append(float(target_speed[0].item()))
     diagnostic["command_target_heading"].append(float(target_heading[0].item()))
+    diagnostic["effective_command_speed"].append(float(command.locomotion_cmd_speed[0].item()))
+    diagnostic["effective_command_heading"].append(float(command.locomotion_cmd_heading[0].item()))
 
     pelvis_id = robot.body_names.index("pelvis")
     pelvis_quat = robot.data.body_quat_w[0, pelvis_id]
@@ -890,6 +924,10 @@ def _append_diagnostic(
     diagnostic["no_contact_count"].append(
         np.nan if no_contact_count is None else float(no_contact_count[0].item())
     )
+    no_contact_task_active = getattr(base_env, "_dribbling_no_contact_task_active", None)
+    diagnostic["no_contact_task_active"].append(
+        False if no_contact_task_active is None else bool(no_contact_task_active[0].item())
+    )
     no_contact_recovery = getattr(base_env, "_dribbling_no_contact_recovery_active", None)
     diagnostic["no_contact_recovery_active"].append(
         False if no_contact_recovery is None else bool(no_contact_recovery[0].item())
@@ -915,6 +953,29 @@ def _append_diagnostic(
     ):
         value = getattr(base_env, attr, None)
         diagnostic[key].append(np.nan if value is None else float(value[0].item()))
+    for key, attr in (
+        ("idle_active", "_dribbling_idle_active"),
+        ("idle_pelvis_speed", "_dribbling_idle_pelvis_speed"),
+        ("idle_pelvis_angular_speed", "_dribbling_idle_pelvis_angular_speed"),
+        ("stop_active", "_dribbling_stop_active"),
+        ("stop_settled", "_dribbling_stop_settled"),
+        ("stop_success", "_dribbling_stop_success"),
+        ("stop_settle_elapsed_s", "_dribbling_stop_settle_elapsed_s"),
+        ("stop_pelvis_speed", "_dribbling_stop_pelvis_speed"),
+        ("stop_pelvis_angular_speed", "_dribbling_stop_pelvis_angular_speed"),
+        ("stop_ball_speed", "_dribbling_stop_ball_speed"),
+        ("stop_forward_offset", "_dribbling_stop_forward_offset"),
+        ("stop_lateral_offset", "_dribbling_stop_lateral_offset"),
+        ("stop_position_score", "_dribbling_stop_position_score"),
+        ("stop_speed_score", "_dribbling_stop_speed_score"),
+    ):
+        value = getattr(base_env, attr, None)
+        if value is None:
+            diagnostic[key].append(False if key.endswith(("active", "settled", "success")) else np.nan)
+        elif key.endswith(("active", "settled", "success")):
+            diagnostic[key].append(bool(value[0].item()))
+        else:
+            diagnostic[key].append(float(value[0].item()))
     # Filled with the reward returned by the immediately following env.step().
     diagnostic["step_reward"].append(np.nan)
     return True
@@ -1055,7 +1116,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         print("[WARN] Diagnostic requested but no samples were recorded.")
         return
     metadata_keys = {
-        "path", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names",
+        "path", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names", "task_state_names",
         "trunk_joint_ids", "trunk_joint_names", "trunk_action_ids", "trunk_body_ids",
         "trunk_reference_body_ids", "trunk_body_names",
         "constraint_group", "constraint_margin", "constraint_joint_names", "constraint_groups",
@@ -1071,6 +1132,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["trunk_joint_names"] = diagnostic["trunk_joint_names"]
     arrays["trunk_body_names"] = diagnostic["trunk_body_names"]
     arrays["reward_term_names"] = diagnostic["reward_term_names"]
+    arrays["task_state_names"] = diagnostic["task_state_names"]
     arrays["constraint_group"] = np.asarray(diagnostic["constraint_group"])
     arrays["constraint_margin"] = np.asarray(diagnostic["constraint_margin"])
     arrays["constraint_joint_names"] = diagnostic["constraint_joint_names"]
@@ -1088,6 +1150,25 @@ def _save_diagnostic(diagnostic: dict) -> None:
     foot_error = float(np.mean(arrays["foot_reference_position_error"]))
     heading_error = float(np.mean(np.abs(arrays["heading_error"])))
     stable_coast_fraction = float(np.mean(arrays["stable_coast_active"]))
+    task_state_names = np.asarray(["idle", "dribble", "stop"])
+    task_state_counts = np.bincount(arrays["task_state"].astype(np.int64), minlength=3)[:3]
+    task_state_summary = ", ".join(
+        f"{name}={count}" for name, count in zip(task_state_names, task_state_counts)
+    )
+    stop_mask = arrays["stop_active"].astype(bool)
+    stop_settle_rate = (
+        float(np.mean(arrays["stop_settled"][stop_mask])) if np.any(stop_mask) else np.nan
+    )
+    stop_successes = int(np.count_nonzero(arrays["stop_success"].astype(bool)))
+    stop_ball_speed = (
+        float(np.mean(arrays["stop_ball_speed"][stop_mask])) if np.any(stop_mask) else np.nan
+    )
+    stop_pelvis_speed = (
+        float(np.mean(arrays["stop_pelvis_speed"][stop_mask])) if np.any(stop_mask) else np.nan
+    )
+    stop_pelvis_angular_speed = (
+        float(np.mean(arrays["stop_pelvis_angular_speed"][stop_mask])) if np.any(stop_mask) else np.nan
+    )
     finite_coast_speed_error = arrays["coast_forward_speed_error"][
         np.isfinite(arrays["coast_forward_speed_error"])
     ]
@@ -1171,6 +1252,10 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"contact_rate={contact_rate:.3f}  ball_pelvis_xy={ball_distance:.3f} m  "
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
         f"pelvis_xy_speed={pelvis_speed:.3f} m/s  "
+        f"task_states=({task_state_summary})  stop_settled={stop_settle_rate:.3f}  "
+        f"stop_successes={stop_successes}  "
+        f"stop_ball_speed={stop_ball_speed:.3f} m/s  stop_pelvis_speed={stop_pelvis_speed:.3f} m/s  "
+        f"stop_pelvis_w={stop_pelvis_angular_speed:.3f} rad/s  "
         f"stable_coast={stable_coast_fraction:.3f}  coast_speed_err={coast_speed_error:.3f} m/s  "
         f"foot_ref_err={foot_error:.3f} m  mean_abs_heading_err={heading_error:.3f} rad  "
         f"arm_joint_err={arm_error:.3f} rad  waist_joint_err={trunk_error:.3f} rad  "
@@ -1196,6 +1281,7 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
         args_cli.locomotion_cmd_speed is not None
         or args_cli.locomotion_cmd_heading is not None
         or args_cli.locomotion_cmd_duration is not None
+        or args_cli.locomotion_task_state is not None
     )
     cartesian_fields = (
         args_cli.locomotion_cmd_vx,
@@ -1217,9 +1303,17 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
         speeds = args_cli.locomotion_cmd_speed
         headings = args_cli.locomotion_cmd_heading
         durations = args_cli.locomotion_cmd_duration
+        task_states = args_cli.locomotion_task_state
 
         if speeds is None:
-            speeds = [float(torch.norm(cmd.locomotion_manual_lin_vel[0, :2]).item())]
+            if task_states is not None:
+                if len(task_states) != 1:
+                    raise ValueError("State-only polar control accepts exactly one --locomotion_task_state.")
+                speeds = [0.0 if task_states[0] in {"idle", "stop"} else float(
+                    torch.norm(cmd.locomotion_manual_lin_vel[0, :2]).item()
+                )]
+            else:
+                speeds = [float(torch.norm(cmd.locomotion_manual_lin_vel[0, :2]).item())]
         if headings is None:
             headings = [
                 float(
@@ -1235,6 +1329,12 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
                 f"--locomotion_cmd_speed ({n}), --locomotion_cmd_heading ({len(headings)}), "
                 f"and --locomotion_cmd_duration ({len(durations)}) must have the same length."
             )
+        if task_states is not None and len(task_states) != n:
+            raise ValueError(
+                f"--locomotion_task_state ({len(task_states)}) must match --locomotion_cmd_speed ({n})."
+            )
+        if task_states is None:
+            task_states = ["dribble" if float(speed) > 0.05 else "stop" for speed in speeds]
 
         wz_raw = args_cli.locomotion_cmd_wz
         if wz_raw is None or len(wz_raw) == 0:
@@ -1249,11 +1349,14 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
             )
 
         if n > 1 and hasattr(cmd, "set_locomotion_polar_sequence"):
-            segments = [(speeds[i], headings[i], durations[i], wz_list[i]) for i in range(n)]
+            segments = [(speeds[i], headings[i], durations[i], wz_list[i], task_states[i]) for i in range(n)]
             cmd.set_locomotion_polar_sequence(segments, hold_last=not args_cli.locomotion_cmd_loop)
             print(f"[INFO] Locomotion sequence ({n} segments):")
-            for i, (sp, hd, dur, wz) in enumerate(segments):
-                print(f"  [{i + 1}] speed={sp:.3f} m/s  heading={hd:.3f} rad  duration={dur:.2f} s  wz={wz:.3f}")
+            for i, (sp, hd, dur, wz, state) in enumerate(segments):
+                print(
+                    f"  [{i + 1}] state={state.upper():7s}  speed={sp:.3f} m/s  "
+                    f"heading={hd:.3f} rad  duration={dur:.2f} s  wz={wz:.3f}"
+                )
             if args_cli.locomotion_cmd_loop:
                 print("  looping: final segment -> first segment")
             return True
@@ -1264,9 +1367,11 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
             heading=headings[0],
             duration_s=durations[0],
             wz=wz_list[0],
+            task_state=task_states[0],
         )
         print(
-            f"[INFO] Locomotion polar cmd: speed={speeds[0]:.3f} m/s  heading={headings[0]:.3f} rad  "
+            f"[INFO] Locomotion polar cmd: state={task_states[0].upper()}  speed={speeds[0]:.3f} m/s  "
+            f"heading={headings[0]:.3f} rad  "
             f"duration={durations[0]:.2f} s  wz={wz_list[0]:.3f} rad/s"
         )
         return True
@@ -1285,7 +1390,12 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
         cur_ang[1] if args_cli.locomotion_cmd_wy is None else args_cli.locomotion_cmd_wy,
         cur_ang[2],
     ]
-    cmd.set_locomotion_manual_command(lin_vel=lin, ang_vel=ang)
+    cartesian_task_state = None
+    if args_cli.locomotion_task_state is not None:
+        if len(args_cli.locomotion_task_state) != 1:
+            raise ValueError("Cartesian manual control accepts exactly one --locomotion_task_state.")
+        cartesian_task_state = args_cli.locomotion_task_state[0]
+    cmd.set_locomotion_manual_command(lin_vel=lin, ang_vel=ang, task_state=cartesian_task_state)
     print(
         f"[INFO] Locomotion manual cmd: lin_vel={lin} m/s  ang_vel={ang} rad/s  (task +X/+Y/+Z)"
     )
@@ -1333,6 +1443,13 @@ def _get_play_overlay(env) -> str:
         if hasattr(cmd, "locomotion_lin_vel_command_w"):
             mode = getattr(cmd, "locomotion_command_mode", "?")
             lcmd = cmd.locomotion_lin_vel_command_w()[i].detach().cpu().numpy()
+            task_state = getattr(cmd, "locomotion_task_state", None)
+            task_state_names = ("IDLE", "DRIBBLE", "STOP")
+            task_state_name = "DRIBBLE"
+            if isinstance(task_state, torch.Tensor):
+                task_state_idx = int(task_state[i].item())
+                if 0 <= task_state_idx < len(task_state_names):
+                    task_state_name = task_state_names[task_state_idx]
 
             # heading / arrow helpers — ASCII-only for safe video font rendering
             _ARROWS = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"]
@@ -1380,6 +1497,7 @@ def _get_play_overlay(env) -> str:
                 f"{track_str}"
                 f"{hold_str}"
             )
+            lines.append(f"Task state         : {task_state_name}")
             # Control smooths a requested endpoint into the effective command
             # above.  Show both during a turn so speed reduction is observable.
             target_speed_buf = getattr(cmd, "locomotion_cmd_target_speed", None)

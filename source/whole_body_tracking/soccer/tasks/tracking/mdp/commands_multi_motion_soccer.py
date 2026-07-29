@@ -31,6 +31,52 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+# Task-level modes are intentionally independent from the velocity command.
+# Both IDLE and STOP request zero velocity, but the policy must distinguish
+# waiting for a start signal from settling the ball after a completed dribble.
+TASK_STATE_IDLE = 0
+TASK_STATE_DRIBBLE = 1
+TASK_STATE_STOP = 2
+TASK_STATE_NAMES = ("idle", "dribble", "stop")
+_TASK_STATE_NAME_TO_ID = {name: index for index, name in enumerate(TASK_STATE_NAMES)}
+
+
+def normalize_locomotion_task_state(value: str | int) -> int:
+    """Convert a public task-state name/id to its canonical integer id."""
+    if isinstance(value, str):
+        normalized = value.lower().strip()
+        if normalized not in _TASK_STATE_NAME_TO_ID:
+            raise ValueError(
+                f"Unsupported locomotion task state {value!r}; expected one of {TASK_STATE_NAMES}."
+            )
+        return _TASK_STATE_NAME_TO_ID[normalized]
+    state = int(value)
+    if state < TASK_STATE_IDLE or state > TASK_STATE_STOP:
+        raise ValueError(
+            f"Unsupported locomotion task state id {state}; expected 0=idle, 1=dribble, or 2=stop."
+        )
+    return state
+
+
+def locomotion_task_state_mask(command, active_task_states: Sequence[int] | None = None) -> torch.Tensor:
+    """Return a boolean mask for task-state-gated objectives.
+
+    Legacy commands that do not expose a task state are treated as DRIBBLE so
+    existing task rewards preserve their original behavior.
+    """
+    state = getattr(command, "locomotion_task_state", None)
+    if not isinstance(state, torch.Tensor):
+        state = torch.full(
+            (command.num_envs,), TASK_STATE_DRIBBLE, dtype=torch.long, device=command.device
+        )
+    if active_task_states is None:
+        return torch.ones_like(state, dtype=torch.bool)
+    allowed = torch.as_tensor(active_task_states, dtype=state.dtype, device=state.device)
+    if allowed.numel() == 0:
+        return torch.zeros_like(state, dtype=torch.bool)
+    return (state.unsqueeze(-1) == allowed.view(1, -1)).any(dim=-1)
+
+
 class MultiMotionLoader:
     def __init__(self, motion_files: list[str], body_indexes: Sequence[int], device: str = "cpu"):
         assert len(motion_files) > 0, "motion_files must not be empty"
@@ -440,12 +486,27 @@ class MotionCommand(CommandTerm):
         self.locomotion_cmd_target_heading = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.locomotion_cmd_target_wz = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self._locomotion_cmd_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self._locomotion_segment_plans: list[list[tuple[float, float, float, float]]] = [[] for _ in range(self.num_envs)]
+        self._locomotion_task_state_enabled = bool(getattr(cfg, "locomotion_task_state_enabled", False))
+        sequence_cfg = getattr(cfg, "locomotion_task_state_sequence", ("dribble",))
+        sequence = tuple(normalize_locomotion_task_state(state) for state in sequence_cfg)
+        if not sequence:
+            raise ValueError("locomotion_task_state_sequence must contain at least one state.")
+        self._locomotion_task_state_sequence = torch.tensor(sequence, dtype=torch.long, device=self.device)
+        default_task_state = TASK_STATE_IDLE if self._locomotion_task_state_enabled else TASK_STATE_DRIBBLE
+        self.locomotion_task_state = torch.full(
+            (self.num_envs,), default_task_state, dtype=torch.long, device=self.device
+        )
+        self._locomotion_task_state_sequence_idx = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._locomotion_segment_plans: list[list[tuple[float, float, float, float, int]]] = [
+            [] for _ in range(self.num_envs)
+        ]
         self._locomotion_segment_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._locomotion_segment_hold_last = True
         if self._locomotion_command_mode == "resampled":
             all_env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
-            self._sample_locomotion_commands(all_env_ids)
+            self._sample_locomotion_commands(all_env_ids, reset_task_sequence=True)
         self._radius_offset_min = None
         self._radius_offset_max = None
         curve_cfg = cfg.curve_offset_range or {}
@@ -542,8 +603,13 @@ class MotionCommand(CommandTerm):
         speed: torch.Tensor,
         heading: torch.Tensor,
         wz: torch.Tensor,
+        task_state: torch.Tensor | None = None,
     ) -> None:
         """Set a requested polar command, smoothing later changes when configured."""
+        if task_state is not None:
+            self.locomotion_task_state[env_ids] = task_state.to(
+                device=self.device, dtype=self.locomotion_task_state.dtype
+            )
         self.locomotion_cmd_target_speed[env_ids] = speed
         self.locomotion_cmd_target_heading[env_ids] = heading
         self.locomotion_cmd_target_wz[env_ids] = wz
@@ -621,7 +687,64 @@ class MotionCommand(CommandTerm):
 
         self._write_effective_polar_locomotion(ids, speed, heading, self.locomotion_cmd_target_wz[ids])
 
-    def _sample_locomotion_commands(self, env_ids: torch.Tensor | Sequence[int]) -> None:
+    def _task_state_ids(
+        self,
+        task_state: str | int | torch.Tensor | Sequence[str | int],
+        count: int,
+    ) -> torch.Tensor:
+        """Return validated per-environment task-state ids for public command APIs."""
+        if isinstance(task_state, torch.Tensor):
+            states = task_state.to(device=self.device, dtype=torch.long).flatten()
+        elif isinstance(task_state, str) or isinstance(task_state, int):
+            states = torch.full(
+                (count,), normalize_locomotion_task_state(task_state), device=self.device, dtype=torch.long
+            )
+        else:
+            values = list(task_state)
+            if len(values) != count:
+                raise ValueError(f"Expected {count} task states, received {len(values)}.")
+            states = torch.as_tensor(
+                [normalize_locomotion_task_state(value) for value in values],
+                device=self.device,
+                dtype=torch.long,
+            )
+        if states.numel() == 1 and count != 1:
+            states = states.expand(count)
+        if states.numel() != count:
+            raise ValueError(f"Expected {count} task states, received {states.numel()}.")
+        if torch.any((states < TASK_STATE_IDLE) | (states > TASK_STATE_STOP)):
+            raise ValueError("Task-state ids must be 0=idle, 1=dribble, or 2=stop.")
+        return states
+
+    def _infer_task_state_from_speed(self, speed: torch.Tensor) -> torch.Tensor:
+        """Infer a safe manual state when an older caller supplies no explicit mode."""
+        stationary_threshold = float(getattr(self.cfg, "locomotion_task_state_stationary_speed", 0.05))
+        return torch.where(
+            speed > stationary_threshold,
+            torch.full_like(speed, TASK_STATE_DRIBBLE, dtype=torch.long),
+            torch.full_like(speed, TASK_STATE_STOP, dtype=torch.long),
+        )
+
+    def set_locomotion_task_state(
+        self,
+        task_state: str | int | torch.Tensor | Sequence[str | int],
+        env_ids: torch.Tensor | slice | None = None,
+    ) -> None:
+        """Set only the high-level IDLE/DRIBBLE/STOP input without changing velocity."""
+        if env_ids is None:
+            env_ids_t = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        elif isinstance(env_ids, slice):
+            env_ids_t = torch.arange(self.num_envs, device=self.device, dtype=torch.long)[env_ids]
+        else:
+            env_ids_t = env_ids.to(device=self.device, dtype=torch.long)
+        if env_ids_t.numel() > 0:
+            self.locomotion_task_state[env_ids_t] = self._task_state_ids(task_state, env_ids_t.numel())
+
+    def _sample_locomotion_commands(
+        self,
+        env_ids: torch.Tensor | Sequence[int],
+        reset_task_sequence: bool = False,
+    ) -> None:
         """Sample speed + heading (+ optional wz) and a random hold duration per env."""
         if isinstance(env_ids, Sequence) and not isinstance(env_ids, torch.Tensor):
             env_ids = torch.as_tensor(list(env_ids), dtype=torch.long, device=self.device)
@@ -636,7 +759,6 @@ class MotionCommand(CommandTerm):
         wz_range = getattr(self.cfg, "locomotion_cmd_wz_range", (0.0, 0.0))
 
         n = env_ids.numel()
-        speed = sample_uniform(speed_range[0], speed_range[1], (n,), device=self.device)
         heading_delta_range = getattr(self.cfg, "locomotion_cmd_heading_delta_range", None)
         initialized = self._locomotion_cmd_initialized[env_ids]
         if heading_delta_range is not None and torch.any(initialized):
@@ -653,23 +775,67 @@ class MotionCommand(CommandTerm):
             heading = torch.where(initialized, transitioned_heading, heading)
         else:
             heading = sample_uniform(heading_range[0], heading_range[1], (n,), device=self.device)
-        wz = sample_uniform(wz_range[0], wz_range[1], (n,), device=self.device)
-        duration_s = sample_uniform(duration_range[0], duration_range[1], (n,), device=self.device)
+        if not self._locomotion_task_state_enabled:
+            speed = sample_uniform(speed_range[0], speed_range[1], (n,), device=self.device)
+            wz = sample_uniform(wz_range[0], wz_range[1], (n,), device=self.device)
+            duration_s = sample_uniform(duration_range[0], duration_range[1], (n,), device=self.device)
+            self._apply_polar_locomotion(env_ids, speed, heading, wz)
+            self._locomotion_cmd_hold_steps_remaining[env_ids] = self._duration_s_to_steps(duration_s)
+            return
 
-        self._apply_polar_locomotion(env_ids, speed, heading, wz)
+        # Stateful control deliberately trains the complete interaction loop:
+        # wait still (IDLE), carry the ball (DRIBBLE), then decelerate and
+        # settle both robot and ball (STOP).  State changes remain immediate,
+        # while the existing velocity smoother makes motion transitions safe.
+        if reset_task_sequence:
+            self._locomotion_task_state_sequence_idx[env_ids] = 0
+        else:
+            self._locomotion_task_state_sequence_idx[env_ids] = (
+                self._locomotion_task_state_sequence_idx[env_ids] + 1
+            ) % self._locomotion_task_state_sequence.numel()
+        state_index = self._locomotion_task_state_sequence_idx[env_ids]
+        task_state = self._locomotion_task_state_sequence[state_index]
+        dribble_mask = task_state == TASK_STATE_DRIBBLE
+
+        speed = torch.zeros(n, dtype=torch.float32, device=self.device)
+        dribble_speed_range = getattr(self.cfg, "locomotion_cmd_dribble_speed_range", None) or speed_range
+        if torch.any(dribble_mask):
+            speed[dribble_mask] = sample_uniform(
+                dribble_speed_range[0], dribble_speed_range[1], (int(dribble_mask.sum().item()),), device=self.device
+            )
+        # A zero-speed state retains the last heading.  This makes STOP's ball
+        # corridor continuous with the preceding dribble instead of snapping
+        # back to world +X at the instant braking begins.
+        heading = torch.where(dribble_mask, heading, self.locomotion_cmd_heading[env_ids])
+        wz = torch.zeros(n, dtype=torch.float32, device=self.device)
+        duration_s = torch.empty(n, dtype=torch.float32, device=self.device)
+        state_duration_ranges = {
+            TASK_STATE_IDLE: getattr(self.cfg, "locomotion_task_idle_duration_range", duration_range),
+            TASK_STATE_DRIBBLE: getattr(self.cfg, "locomotion_task_dribble_duration_range", duration_range),
+            TASK_STATE_STOP: getattr(self.cfg, "locomotion_task_stop_duration_range", duration_range),
+        }
+        for state, state_range in state_duration_ranges.items():
+            mask = task_state == state
+            if torch.any(mask):
+                duration_s[mask] = sample_uniform(
+                    state_range[0], state_range[1], (int(mask.sum().item()),), device=self.device
+                )
+
+        self._apply_polar_locomotion(env_ids, speed, heading, wz, task_state=task_state)
         self._locomotion_cmd_hold_steps_remaining[env_ids] = self._duration_s_to_steps(duration_s)
 
     def _apply_locomotion_segment(self, env_id: int, seg_idx: int) -> None:
         plan = self._locomotion_segment_plans[env_id]
         if not plan or seg_idx < 0 or seg_idx >= len(plan):
             return
-        speed, heading, duration_s, wz = plan[seg_idx]
+        speed, heading, duration_s, wz, task_state = plan[seg_idx]
         eid = torch.tensor([env_id], device=self.device, dtype=torch.long)
         self._apply_polar_locomotion(
             eid,
             torch.tensor([speed], device=self.device, dtype=torch.float32),
             torch.tensor([heading], device=self.device, dtype=torch.float32),
             torch.tensor([wz], device=self.device, dtype=torch.float32),
+            task_state=torch.tensor([task_state], device=self.device, dtype=torch.long),
         )
         self._locomotion_cmd_hold_steps_remaining[env_id] = int(self._duration_s_to_steps(duration_s).item())
         self._locomotion_segment_idx[env_id] = seg_idx
@@ -725,12 +891,17 @@ class MotionCommand(CommandTerm):
 
     def set_locomotion_polar_sequence(
         self,
-        segments: Sequence[tuple[float, float, float] | tuple[float, float, float, float]],
+        segments: Sequence[
+            tuple[float, float, float]
+            | tuple[float, float, float, float]
+            | tuple[float, float, float, float, str | int]
+        ],
         env_ids: torch.Tensor | Sequence[int] | None = None,
         hold_last: bool = True,
     ) -> None:
-        """Queue piecewise polar commands: each segment is ``(speed, heading, duration_s[, wz])``.
+        """Queue polar commands as ``(speed, heading, duration_s[, wz, task_state])``.
 
+        Omitted state is inferred from speed (positive=DRIBBLE, zero=STOP).
         Segments run in order; when ``hold_last=True`` the final segment repeats after the queue ends.
         """
         if env_ids is None:
@@ -740,14 +911,27 @@ class MotionCommand(CommandTerm):
         else:
             env_id_list = list(env_ids)
 
-        normalized: list[tuple[float, float, float, float]] = []
+        normalized: list[tuple[float, float, float, float, int]] = []
         for seg in segments:
             if len(seg) == 3:
-                normalized.append((float(seg[0]), float(seg[1]), float(seg[2]), 0.0))
+                speed = float(seg[0])
+                normalized.append(
+                    (speed, float(seg[1]), float(seg[2]), 0.0, normalize_locomotion_task_state(
+                        "dribble" if speed > 0.05 else "stop"
+                    ))
+                )
             elif len(seg) >= 4:
-                normalized.append((float(seg[0]), float(seg[1]), float(seg[2]), float(seg[3])))
+                speed = float(seg[0])
+                state = (
+                    normalize_locomotion_task_state(seg[4])
+                    if len(seg) >= 5
+                    else normalize_locomotion_task_state("dribble" if speed > 0.05 else "stop")
+                )
+                normalized.append((speed, float(seg[1]), float(seg[2]), float(seg[3]), state))
             else:
-                raise ValueError(f"Each segment needs (speed, heading, duration_s[, wz]); got {seg!r}")
+                raise ValueError(
+                    f"Each segment needs (speed, heading, duration_s[, wz, task_state]); got {seg!r}"
+                )
 
         if not normalized:
             raise ValueError("locomotion polar sequence must contain at least one segment")
@@ -770,12 +954,15 @@ class MotionCommand(CommandTerm):
         heading: float | torch.Tensor,
         duration_s: float | torch.Tensor | None = None,
         wz: float | torch.Tensor = 0.0,
+        task_state: str | int | torch.Tensor | Sequence[str | int] | None = None,
         env_ids: torch.Tensor | slice | None = None,
     ) -> None:
         """Set locomotion by speed (m/s) and heading (rad from task +X) for a hold duration.
 
         ``heading=0`` → +X forward; ``heading=+pi/2`` → +Y lateral. Independent of demo root vel.
-        ``duration_s=None`` holds until the next manual/resample update.
+        ``task_state`` is IDLE/DRIBBLE/STOP; if omitted, non-zero speed maps to
+        DRIBBLE and zero speed maps to STOP.  ``duration_s=None`` holds until
+        the next manual/resample update.
         """
         if env_ids is None:
             env_ids_t = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
@@ -795,7 +982,8 @@ class MotionCommand(CommandTerm):
         if not isinstance(wz, torch.Tensor):
             wz = torch.full((n,), float(wz), device=self.device, dtype=torch.float32)
 
-        self._apply_polar_locomotion(env_ids_t, speed, heading, wz)
+        states = self._infer_task_state_from_speed(speed) if task_state is None else self._task_state_ids(task_state, n)
+        self._apply_polar_locomotion(env_ids_t, speed, heading, wz, task_state=states)
         if duration_s is not None:
             if not isinstance(duration_s, torch.Tensor):
                 hold_steps = self._duration_s_to_steps(float(duration_s))
@@ -809,6 +997,7 @@ class MotionCommand(CommandTerm):
         self,
         lin_vel: Sequence[float] | torch.Tensor | None = None,
         ang_vel: Sequence[float] | torch.Tensor | None = None,
+        task_state: str | int | torch.Tensor | Sequence[str | int] | None = None,
         env_ids: torch.Tensor | slice | None = None,
     ) -> None:
         """Set manual locomotion command in task frame (+X fwd, +Y lat, +Z up; rad/s for ang)."""
@@ -825,11 +1014,20 @@ class MotionCommand(CommandTerm):
             else:
                 self.locomotion_manual_lin_vel[env_ids] = lin_vel
             xy = self.locomotion_manual_lin_vel[env_ids, :2]
-            self.locomotion_cmd_speed[env_ids] = torch.norm(xy, dim=-1)
-            self.locomotion_cmd_heading[env_ids] = torch.atan2(xy[:, 1], xy[:, 0])
+            speed = torch.norm(xy, dim=-1)
+            heading = torch.atan2(xy[:, 1], xy[:, 0])
+            self.locomotion_cmd_speed[env_ids] = speed
+            # Keep a meaningful ball-control axis when a manual STOP command
+            # has zero XY velocity instead of replacing it with atan2(0, 0).
+            prior_heading = self.locomotion_cmd_heading[env_ids]
+            self.locomotion_cmd_heading[env_ids] = torch.where(speed > 0.05, heading, prior_heading)
             self.locomotion_cmd_target_speed[env_ids] = self.locomotion_cmd_speed[env_ids]
             self.locomotion_cmd_target_heading[env_ids] = self.locomotion_cmd_heading[env_ids]
             self._locomotion_cmd_initialized[env_ids] = True
+            states = self._infer_task_state_from_speed(speed) if task_state is None else self._task_state_ids(
+                task_state, speed.numel()
+            )
+            self.locomotion_task_state[env_ids] = states
 
         if ang_vel is not None:
             if not isinstance(ang_vel, torch.Tensor):
@@ -1349,11 +1547,15 @@ class MotionCommand(CommandTerm):
         if env_ids.numel() == 0:
             return
 
-        # A resampled command is an episode initial condition.  A manual
-        # multi-segment diagnostic, however, deliberately keeps one global
-        # command timeline across episode resets.  Preserve its filter state
-        # so the next segment continues to slew instead of hard-switching.
-        if self._locomotion_command_mode != "manual":
+        # A resampled command is an episode initial condition.  Legacy manual
+        # diagnostics deliberately keep one global timeline across resets, but
+        # a stateful start/dribble/stop task must restart its manual plan at
+        # segment zero (IDLE) after either success or failure.
+        restart_manual_plan = (
+            self._locomotion_command_mode == "manual"
+            and bool(getattr(self.cfg, "locomotion_task_state_restart_manual_sequence_on_reset", False))
+        )
+        if self._locomotion_command_mode != "manual" or restart_manual_plan:
             self._locomotion_cmd_initialized[env_ids] = False
 
         # In style-looping control this method is reached only for a real
@@ -1434,7 +1636,9 @@ class MotionCommand(CommandTerm):
         setattr(self._env, flag_name, resample_flags)
         self._steps_since_resample[env_ids] = 0
         if self._locomotion_command_mode == "resampled":
-            self._sample_locomotion_commands(env_ids)
+            self._sample_locomotion_commands(env_ids, reset_task_sequence=True)
+        elif restart_manual_plan:
+            self._restart_locomotion_segment_plans(env_ids)
 
     # Called every step in the IsaacLab main loop.
     def _update_command(self):
@@ -1563,8 +1767,21 @@ class MotionCommandCfg(CommandTermCfg):
     locomotion_command_mode: str = "reference"
     locomotion_manual_lin_vel: tuple[float, float, float] = (0.55, 0.0, 0.0)
     locomotion_manual_ang_vel: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # High-level task input.  Disabled by default so legacy follow/forward
+    # training remains unchanged.  Stateful control cycles IDLE -> DRIBBLE ->
+    # STOP while using zero velocity for both stationary modes.
+    locomotion_task_state_enabled: bool = False
+    locomotion_task_state_sequence: tuple[str | int, ...] = ("dribble",)
+    locomotion_task_state_stationary_speed: float = 0.05
+    locomotion_task_state_restart_manual_sequence_on_reset: bool = False
+    locomotion_task_idle_duration_range: tuple[float, float] = (1.0, 2.0)
+    locomotion_task_dribble_duration_range: tuple[float, float] = (1.5, 3.0)
+    locomotion_task_stop_duration_range: tuple[float, float] = (1.0, 2.0)
     locomotion_resample_interval_s: float = 2.0  # legacy fallback if duration_range unset
     locomotion_cmd_speed_range: tuple[float, float] = (0.25, 0.65)
+    # Optional moving-only range used by stateful control.  Generic speed range
+    # may include zero so the policy's complete command distribution does too.
+    locomotion_cmd_dribble_speed_range: tuple[float, float] | None = None
     locomotion_cmd_heading_range: tuple[float, float] = (-0.75, 0.75)
     locomotion_cmd_duration_range: tuple[float, float] = (1.5, 3.0)
     locomotion_cmd_wz_range: tuple[float, float] = (0.0, 0.0)

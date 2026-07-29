@@ -16,7 +16,13 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply, quat_error_magnitude
 
-from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
+from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import (
+    TASK_STATE_DRIBBLE,
+    TASK_STATE_IDLE,
+    TASK_STATE_STOP,
+    MotionCommand,
+    locomotion_task_state_mask,
+)
 from soccer.tasks.tracking.mdp.rewards import motion_relative_foot_position_error_exp
 from soccer.tasks.tracking.mdp.task_frame import (
     forward_dominance_gate,
@@ -171,8 +177,15 @@ def _command_direction_xy(command: MotionCommand) -> tuple[torch.Tensor, torch.T
     else:
         command_vel_xy = command.anchor_lin_vel_w[:, :2]
     speed = torch.norm(command_vel_xy, dim=-1)
-    fallback = torch.zeros_like(command_vel_xy)
-    fallback[:, 0] = 1.0
+    # At zero speed (IDLE/STOP), keep the last commanded heading as the ball
+    # corridor.  Falling back unconditionally to +X would make a stopped
+    # turning run suddenly evaluate its ball geometry in the wrong direction.
+    heading = getattr(command, "locomotion_cmd_heading", None)
+    if isinstance(heading, torch.Tensor):
+        fallback = torch.stack((torch.cos(heading), torch.sin(heading)), dim=-1)
+    else:
+        fallback = torch.zeros_like(command_vel_xy)
+        fallback[:, 0] = 1.0
     direction = torch.where(
         (speed > 1.0e-4).unsqueeze(-1),
         command_vel_xy / speed.unsqueeze(-1).clamp(min=1.0e-4),
@@ -238,6 +251,108 @@ def dribbling_stable_coast_state(
     setattr(env, "_dribbling_coast_forward_offset", forward_offset)
     setattr(env, "_dribbling_coast_lateral_offset", lateral_offset)
     return coast
+
+
+def dribbling_idle_stand_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    linear_speed_std: float = 0.10,
+    angular_speed_std: float = 0.35,
+) -> torch.Tensor:
+    """Reward a quiet robot only while the task explicitly waits in IDLE."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    robot = command.robot
+    pelvis_id = robot.body_names.index("pelvis")
+    pelvis_linear_speed = torch.norm(robot.data.body_lin_vel_w[:, pelvis_id, :2], dim=-1)
+    pelvis_angular_speed = torch.norm(robot.data.body_ang_vel_w[:, pelvis_id], dim=-1)
+    reward = torch.exp(
+        -torch.square(pelvis_linear_speed) / max(float(linear_speed_std), 1.0e-6) ** 2
+        -torch.square(pelvis_angular_speed) / max(float(angular_speed_std), 1.0e-6) ** 2
+    )
+    active = locomotion_task_state_mask(command, (TASK_STATE_IDLE,))
+    setattr(env, "_dribbling_idle_active", active)
+    setattr(env, "_dribbling_idle_pelvis_speed", pelvis_linear_speed)
+    setattr(env, "_dribbling_idle_pelvis_angular_speed", pelvis_angular_speed)
+    return reward * active.to(reward.dtype)
+
+
+def dribbling_stop_settle_state(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    settled_pelvis_speed: float = 0.05,
+    settled_pelvis_angular_speed: float = 0.20,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Return the STOP success predicate and its underlying physical measurements.
+
+    The reward and successful-STOP termination call this same helper so an
+    episode cannot reset under criteria different from those it was trained to
+    optimize.  STOP is intentionally robot-only: the ball may continue rolling
+    or leave the control corridor after the final dribble touch.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    robot = command.robot
+    pelvis_id = robot.body_names.index("pelvis")
+    soccer_ball = env.scene["soccer_ball"]
+    direction_xy, _ = _command_direction_xy(command)
+    offset_xy = soccer_ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
+    forward_offset, lateral_offset = _command_frame_components(offset_xy, direction_xy)
+    ball_speed = torch.norm(soccer_ball.data.root_lin_vel_w[:, :2], dim=-1)
+    pelvis_speed = torch.norm(robot.data.body_lin_vel_w[:, pelvis_id, :2], dim=-1)
+    pelvis_angular_speed = torch.norm(robot.data.body_ang_vel_w[:, pelvis_id], dim=-1)
+    active = locomotion_task_state_mask(command, (TASK_STATE_STOP,))
+    settled = (
+        active
+        & (pelvis_speed <= float(settled_pelvis_speed))
+        & (pelvis_angular_speed <= float(settled_pelvis_angular_speed))
+    )
+    return active, pelvis_speed, pelvis_angular_speed, ball_speed, forward_offset, lateral_offset, settled
+
+
+def dribbling_stop_settle_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    pelvis_speed_std: float = 0.10,
+    pelvis_angular_speed_std: float = 0.35,
+    settled_pelvis_speed: float = 0.05,
+    settled_pelvis_angular_speed: float = 0.20,
+) -> torch.Tensor:
+    """Reward a stable robot STOP without constraining the ball's outcome."""
+    (
+        active,
+        pelvis_speed,
+        pelvis_angular_speed,
+        ball_speed,
+        forward_offset,
+        lateral_offset,
+        settled,
+    ) = dribbling_stop_settle_state(
+        env,
+        command_name=command_name,
+        settled_pelvis_speed=settled_pelvis_speed,
+        settled_pelvis_angular_speed=settled_pelvis_angular_speed,
+    )
+    speed_score = torch.exp(
+        -torch.square(pelvis_speed) / max(float(pelvis_speed_std), 1.0e-6) ** 2
+        -torch.square(pelvis_angular_speed) / max(float(pelvis_angular_speed_std), 1.0e-6) ** 2
+    )
+    setattr(env, "_dribbling_stop_active", active)
+    setattr(env, "_dribbling_stop_pelvis_speed", pelvis_speed)
+    setattr(env, "_dribbling_stop_pelvis_angular_speed", pelvis_angular_speed)
+    setattr(env, "_dribbling_stop_ball_speed", ball_speed)
+    setattr(env, "_dribbling_stop_forward_offset", forward_offset)
+    setattr(env, "_dribbling_stop_lateral_offset", lateral_offset)
+    setattr(env, "_dribbling_stop_position_score", torch.full_like(pelvis_speed, float("nan")))
+    setattr(env, "_dribbling_stop_speed_score", speed_score)
+    setattr(env, "_dribbling_stop_settled", settled)
+    return speed_score * active.to(speed_score.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +570,7 @@ def dribbling_stall_no_touch_penalty(
     contact_force_threshold: float = 1.0,
     max_xy_dist: float = 0.52,
     pelvis_speed_max: float = 0.16,
+    active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Penalty in ``[0, 1]`` when the ball is close in XY but pelvis is nearly static and there is no contact.
 
@@ -477,7 +593,8 @@ def dribbling_stall_no_touch_penalty(
 
     near = dist_xy <= max_xy_dist
     slow = pelvis_sp <= pelvis_speed_max
-    return (near & slow & no_touch).to(torch.float32)
+    active = locomotion_task_state_mask(command, active_task_states)
+    return (near & slow & no_touch & active).to(torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -1040,6 +1157,7 @@ def dribbling_support_ankle_roll_tracking_exp(
     error_cap: float = 0.35,
     left_ankle_roll_joint: str = "left_ankle_roll_joint",
     right_ankle_roll_joint: str = "right_ankle_roll_joint",
+    active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Lightly keep the non-touching ankle roll near its style reference.
 
@@ -1059,7 +1177,9 @@ def dribbling_support_ankle_roll_tracking_exp(
 
     ref_contact = command.dribble_cg_contact_ref
     ref_touch_foot = command.dribble_cg_foot_ref
-    active = labeled & ref_contact & (ref_touch_foot >= 0)
+    active = labeled & ref_contact & (ref_touch_foot >= 0) & locomotion_task_state_mask(
+        command, active_task_states
+    )
     if not torch.any(active):
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
@@ -1118,6 +1238,7 @@ def dribbling_cg_contact_consistency(
     coast_min_forward_offset: float = 0.22,
     coast_max_forward_offset: float = 0.75,
     coast_max_lateral_offset: float = 0.22,
+    active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """1.0 when sim contact presence matches the annotated CG contact bit.
 
@@ -1146,7 +1267,8 @@ def dribbling_cg_contact_consistency(
             coast_max_lateral_offset,
         )
         agree = torch.where(coast, torch.ones_like(agree), agree)
-    return agree * labeled.to(torch.float32)
+    active = labeled & locomotion_task_state_mask(command, active_task_states)
+    return agree * active.to(torch.float32)
 
 
 def dribbling_cg_premature_contact_penalty(
@@ -1242,6 +1364,7 @@ def dribbling_cg_foot_consistency(
     all_body_cfg: SceneEntityCfg | None = None,
     left_ankle_body_name: str = "left_ankle_roll_link",
     right_ankle_body_name: str = "right_ankle_roll_link",
+    active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """When the label specifies a foot during contact, reward matching closest ankle."""
     if all_body_cfg is None:
@@ -1254,7 +1377,7 @@ def dribbling_cg_foot_consistency(
 
     ref_c = command.dribble_cg_contact_ref
     ref_f = command.dribble_cg_foot_ref
-    active = labeled & ref_c & (ref_f >= 0)
+    active = labeled & ref_c & (ref_f >= 0) & locomotion_task_state_mask(command, active_task_states)
 
     has_contact, _fm, closest = _identify_contact_body(env, command, ball_sensor_name, all_body_cfg)
     names = list(all_body_cfg.body_names)
@@ -1279,6 +1402,7 @@ def dribbling_cg_foot_ball_distance_exp(
     use_xy_only: bool = False,
     left_ankle_body_name: str = "left_ankle_roll_link",
     right_ankle_body_name: str = "right_ankle_roll_link",
+    active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Match sim foot–ball distance to demo distance from synthesized CG trajectory.
 
@@ -1305,7 +1429,9 @@ def dribbling_cg_foot_ball_distance_exp(
         ref_foot_dist,
         command.dribble_cg_foot_ref,
     )
-    active = labeled & (ref_dist >= 0.0) & (ref_foot >= 0)
+    active = labeled & (ref_dist >= 0.0) & (ref_foot >= 0) & locomotion_task_state_mask(
+        command, active_task_states
+    )
 
     robot = env.scene[command.cfg.asset_name]
     soccer_ball = env.scene["soccer_ball"]
@@ -1340,6 +1466,7 @@ def dribbling_gait_foot_tracking_exp(
     foot_body_names: list[str] | None = None,
     ball_sensor_name: str = "soccer_ball_contact",
     contact_force_threshold: float = 1.0,
+    active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Foot imitation reward active only while the ball is **not** in contact.
 
@@ -1350,7 +1477,9 @@ def dribbling_gait_foot_tracking_exp(
         env, command_name, std, foot_body_names=foot_body_names
     )
     no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
-    return base * no_ball.to(torch.float32)
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    active = no_ball & locomotion_task_state_mask(command, active_task_states)
+    return base * active.to(torch.float32)
 
 
 def dribbling_chase_ball_reward(

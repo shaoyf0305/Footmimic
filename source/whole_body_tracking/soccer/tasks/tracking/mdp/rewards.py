@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import torch
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import Any, TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_error_magnitude, quat_apply, quat_inv, quat_apply_inverse, quat_mul, yaw_quat
 
-from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand
+from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand, locomotion_task_state_mask
 from soccer.tasks.tracking.mdp.observations import get_target_point_world
 from soccer.tasks.tracking.mdp.kick_detection import KickContactTracker
 from soccer.tasks.tracking.mdp.task_frame import (
@@ -27,6 +28,25 @@ if TYPE_CHECKING:
 
 def _get_body_indexes(command: MotionCommand, body_names: list[str] | None) -> list[int]:
     return [i for i, name in enumerate(command.cfg.body_names) if (body_names is None) or (name in body_names)]
+
+
+def task_state_gated_reward(
+    env: ManagerBasedRLEnv,
+    reward_func: Callable[..., torch.Tensor],
+    reward_params: dict[str, Any],
+    command_name: str = "motion",
+    active_task_states: tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    """Evaluate a reward only in selected high-level locomotion states.
+
+    This adapter keeps legacy reward functions unchanged while allowing the
+    control task to fully disable ball/gait shaping in IDLE and STOP.  The
+    wrapped function still receives exactly its original parameter dictionary.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    reward = reward_func(env, **reward_params)
+    active = locomotion_task_state_mask(command, active_task_states)
+    return reward * active.to(reward.dtype)
 
 
 def action_rate_l2_clip(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -420,17 +440,26 @@ def motion_global_anchor_orientation_error_exp(env: ManagerBasedRLEnv, command_n
 
 
 def motion_relative_body_position_error_exp(
-    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    body_names: list[str] | None = None,
+    active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
     body_indexes = _get_body_indexes(command, body_names)
     error = torch.sum(
         torch.square(command.body_pos_relative_w[:, body_indexes] - command.robot_body_pos_w[:, body_indexes]), dim=-1
     )
-    return torch.exp(-error.mean(-1) / std**2)
+    reward = torch.exp(-error.mean(-1) / std**2)
+    return reward * locomotion_task_state_mask(command, active_task_states).to(reward.dtype)
 
 def motion_relative_foot_position_error_exp(
-    env: ManagerBasedRLEnv, command_name: str, std: float, foot_body_names: list[str] | None = None
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    foot_body_names: list[str] | None = None,
+    active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     if foot_body_names is None:
         foot_body_names = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -439,7 +468,8 @@ def motion_relative_foot_position_error_exp(
     error = torch.sum(
         torch.square(command.body_pos_relative_w[:, body_indexes] - command.robot_body_pos_w[:, body_indexes]), dim=-1
     )
-    return torch.exp(-error.mean(-1) / std**2)
+    reward = torch.exp(-error.mean(-1) / std**2)
+    return reward * locomotion_task_state_mask(command, active_task_states).to(reward.dtype)
 
 
 def motion_relative_body_orientation_error_exp(
