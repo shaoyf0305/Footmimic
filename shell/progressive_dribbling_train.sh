@@ -15,7 +15,8 @@
 #   - Default: Tracking-Flat-G1-Dribbling-RNN-v0
 #   - --cg:            Tracking-CG-G1-Dribbling-RNN-forward  (fixed +X velocity)
 #   - --cg-follow:     Tracking-CG-G1-Dribbling-RNN-follow  (demo root vel, per-frame)
-#   - --cg-control:    Tracking-CG-G1-Dribbling-RNN-control  (sampled speed/heading/duration)
+#   - --cg-control:    Tracking-CG-G1-Dribbling-RNN-control  (v4.4 continuous speed/heading/duration)
+#   - --cg-full-control: Tracking-CG-G1-Dribbling-RNN-full-control (stateful IDLE/dribble/STOP)
 #
 # Resume v1.20 forward checkpoint into follow/control (skip Stage 1):
 #   python scripts/rsl_rl/train_multi.py --task Tracking-CG-G1-Dribbling-RNN-follow \
@@ -31,7 +32,7 @@
 # from dribble_label_tool apply (or kick_frame/kick_end/kick_leg fallback).
 #
 # Usage:
-#   DRIBBLE_MOTION_PATH=motions/my_dribble bash shell/progressive_dribbling_train.sh [RUN_NAME] [--ankle-disturb] [--cg] [--cg-follow] [--cg-control]
+#   DRIBBLE_MOTION_PATH=motions/my_dribble bash shell/progressive_dribbling_train.sh [RUN_NAME] [--ankle-disturb] [--cg] [--cg-follow] [--cg-control] [--cg-full-control]
 #
 
 set -euo pipefail
@@ -48,6 +49,7 @@ USE_CG=false
 USE_CG_TASK=false
 USE_CG_FOLLOW=false
 USE_CG_CONTROL=false
+USE_CG_FULL_CONTROL=false
 for arg in "$@"; do
     if [[ "${arg}" == "--ankle-disturb" ]]; then
         ANKLE_DISTURB=true
@@ -62,6 +64,9 @@ for arg in "$@"; do
     elif [[ "${arg}" == "--cg-control" ]]; then
         USE_CG=true
         USE_CG_CONTROL=true
+    elif [[ "${arg}" == "--cg-full-control" ]]; then
+        USE_CG=true
+        USE_CG_FULL_CONTROL=true
     fi
 done
 
@@ -79,9 +84,12 @@ if [[ "${USE_CG}" == "true" ]]; then
     if [[ "${USE_CG_FOLLOW}" == "true" ]]; then
         STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-follow"
         echo ">>> CG Stage 2: follow demo root velocity (per-frame) <<<"
+    elif [[ "${USE_CG_FULL_CONTROL}" == "true" ]]; then
+        STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-full-control"
+        echo ">>> CG Stage 2: full-control (stateful IDLE -> DRIBBLE -> STOP) <<<"
     elif [[ "${USE_CG_CONTROL}" == "true" ]]; then
         STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-control"
-        echo ">>> CG Stage 2: sampled velocity command (time-hold resample) <<<"
+        echo ">>> CG Stage 2: v4.4 continuous sampled velocity command <<<"
     fi
     if [[ "${ANKLE_DISTURB}" == "true" ]]; then
         echo ">>> Warning: --ankle-disturb is ignored under --cg (no CG-compatible ankle-disturb Stage 1 env). <<<"

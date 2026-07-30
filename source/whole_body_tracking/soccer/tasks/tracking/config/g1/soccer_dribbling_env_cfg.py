@@ -27,6 +27,7 @@ from soccer.tasks.tracking.mdp import observations_anchor as obs_anchor
 from soccer.tasks.tracking.mdp.commands_dribble_cg import DribbleCGMotionCommand
 from .soccer_flat_env_cfg import (
     G1FlatMotionPretrainEnvCfg,
+    G1FlatMotionStrictPretrainEnvCfg,
     G1FlatMotionTaskPretrainEnvCfg,
     G1FlatProximityEnvCfg,
 )
@@ -673,6 +674,239 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     """Control: external speed/heading/duration — ref provides pose/gait/CG only, not root vel."""
     _apply_dribbling_locomotion_velocity_terms(cfg)
     cfg.commands.motion.locomotion_command_mode = "resampled"
+    # The control heading is also the intended facing direction (see
+    # ``dribbling_command_face_ball``).  Rotate the style pose into that frame
+    # so the upper-body mimic reward does not hold arms and wrists at world +X
+    # during an oblique turn.
+    cfg.commands.motion.mimic_align_locomotion_heading = True
+    # A control episode owns the task clock.  Demo time is a looping style
+    # phase and must not reset the robot, ball, or locomotion command.
+    cfg.commands.motion.motion_clip_end_resample = False
+    # 1.5 m/s is a normal control target, not an out-of-distribution play-only
+    # command.  Long holds force the policy to keep control across turns.
+    cfg.commands.motion.locomotion_cmd_speed_range = (0.40, 1.50)
+    cfg.commands.motion.locomotion_cmd_heading_range = (-0.75, 0.75)
+    cfg.commands.motion.locomotion_cmd_duration_range = (3.0, 6.0)
+    cfg.commands.motion.locomotion_cmd_wz_range = (0.0, 0.0)
+    # Keep command transitions within the distribution used by the good
+    # control replay: heading slews at 0.85 rad/s while speed brakes into a
+    # turn and recovers afterwards.  The policy observes this effective
+    # command, rather than an instantaneous 0 -> +/-0.65 rad jump.
+    cfg.commands.motion.locomotion_cmd_smoothing_enabled = True
+    cfg.commands.motion.locomotion_cmd_heading_rate_limit = 0.85
+    cfg.commands.motion.locomotion_cmd_accel_limit = 1.4
+    cfg.commands.motion.locomotion_cmd_decel_limit = 2.4
+    cfg.commands.motion.locomotion_cmd_turn_slowdown_angle = 0.55
+    cfg.commands.motion.locomotion_cmd_turn_min_speed_scale = 0.60
+
+    # The legacy task_heading_alignment term faces world +X and therefore
+    # cannot supervise arbitrary-heading control.  Use the smoothed effective
+    # heading instead: it remains feasible during a direction reversal while
+    # giving PPO a direct signal to recover pelvis yaw before the ball drifts
+    # sideways.
+    cfg.rewards.locomotion_heading_tracking = RewTerm(
+        func=mdp.locomotion_heading_tracking_exp,
+        weight=1.0,
+        params={
+            "command_name": "motion",
+            "std": 0.45,
+            "min_command_speed": 0.25,
+        },
+    )
+
+    # A turn or recovery necessarily departs from the instantaneous demo pose.
+    # Keep these references as soft rewards, but never end a control episode
+    # because of a style-tracking height/orientation error.  Real falls and
+    # ball-task failures remain active terminations.
+    for term_name in ("ee_body_pos", "anchor_pos_z", "anchor_ori"):
+        if hasattr(cfg.terminations, term_name):
+            setattr(cfg.terminations, term_name, None)
+
+    # Rotate every forward-geometry dribbling term into the active command
+    # frame.  The legacy functions keep their fixed +X semantics for forward
+    # and follow; only control receives these replacements.
+    cfg.rewards.dribbling_dynamic_proximity.func = mdp.dribbling_command_dynamic_proximity
+    cfg.rewards.dribbling_ball_forward_progress.func = mdp.dribbling_command_ball_progress_reward
+    cfg.rewards.dribbling_ball_trapped_penalty.func = mdp.dribbling_command_ball_trapped_penalty
+    cfg.rewards.dribbling_chase_ball.func = mdp.dribbling_command_chase_ball_reward
+    # Once the ball leaves the stable-coast lateral corridor, forward-only
+    # chasing amplifies the escape.  Stop that signal and reward the velocity
+    # component that genuinely closes the command-frame lateral error instead.
+    cfg.rewards.dribbling_chase_ball.params["max_lateral_offset"] = 0.22
+    cfg.rewards.dribbling_lateral_recovery = RewTerm(
+        func=mdp.dribbling_command_lateral_recovery_reward,
+        weight=1.5,
+        params={
+            "command_name": "motion",
+            "ball_sensor_name": "soccer_ball_contact",
+            "contact_force_threshold": 1.0,
+            "lateral_start": 0.16,
+            "lateral_full": 0.40,
+            "min_forward_offset": 0.10,
+            "max_recovery_xy_dist": 0.90,
+            "min_closing_speed": 0.05,
+            "closing_speed_scale": 0.30,
+            "min_diverging_speed": 0.03,
+            "divergence_penalty_scale": 0.35,
+        },
+    )
+    cfg.rewards.dribbling_face_ball.func = mdp.dribbling_command_face_ball
+    cfg.rewards.dribbling_ball_forward_progress.params.update(
+        {
+            "command_speed_ratio": 0.50,
+            "lateral_ratio_max": 0.70,
+        }
+    )
+    # The legacy legal-touch gate checks pelvis heading against world +X.
+    # Command-frame face-ball shaping above now supplies the heading signal.
+    cfg.rewards.dribbling_legal_foot_touch.params["min_pelvis_heading"] = 0.0
+
+    # CG labels remain a weak cadence/style prior only.  Their per-frame touch
+    # timing must not compete with a command-triggered turn or ball recovery.
+    cfg.rewards.dribbling_legal_foot_touch.params["cg_gated"] = False
+    cfg.rewards.dribbling_rapid_retouch_penalty.params["cg_gated"] = False
+    if hasattr(cfg.rewards, "dribbling_cg_contact_consistency"):
+        cfg.rewards.dribbling_cg_contact_consistency.weight = 1.0
+    if hasattr(cfg.rewards, "dribbling_cg_premature_contact"):
+        cfg.rewards.dribbling_cg_premature_contact.weight = 0.0
+    if hasattr(cfg.rewards, "dribbling_cg_foot_consistency"):
+        cfg.rewards.dribbling_cg_foot_consistency.weight = 0.5
+
+    # A ball that is centred in the command-frame corridor and already matches
+    # the commanded/pelvis forward speed should be allowed to roll.  Previously
+    # its forward-progress reward expired after ten no-contact steps while the
+    # no-contact timeout kept advancing, yet rapid-retouch penalised the very
+    # correction that those terms forced.  Use one shared coast predicate so
+    # contact is required only after the ball slows, drifts, or escapes.
+    stable_coast_params = {
+        "coast_min_command_speed": 0.35,
+        "coast_min_ball_speed_ratio": 0.70,
+        "coast_min_pelvis_speed_ratio": 0.70,
+        "coast_max_forward_speed_error": 0.25,
+        "coast_min_forward_offset": 0.22,
+        "coast_max_forward_offset": 0.75,
+        "coast_max_lateral_offset": 0.22,
+    }
+    cfg.rewards.dribbling_ball_forward_progress.params.update(
+        {"allow_stable_coast_without_contact": True, **stable_coast_params}
+    )
+    cfg.rewards.dribbling_legal_foot_touch.params.update(
+        {"suppress_when_stable_coast": True, **stable_coast_params}
+    )
+    cfg.rewards.dribbling_rapid_retouch_penalty.params.update(
+        {"penalize_only_when_stable_coast": True, **stable_coast_params}
+    )
+    if hasattr(cfg.rewards, "dribbling_cg_contact_consistency"):
+        cfg.rewards.dribbling_cg_contact_consistency.params.update(
+            {"ignore_stable_coast": True, **stable_coast_params}
+        )
+
+    # During a labeled touch, retain only the opposite (support) ankle's roll
+    # style.  The touching ankle remains unrestricted, so this small cosmetic
+    # correction cannot trade away reachability or ball-control recovery.
+    cfg.rewards.dribbling_support_ankle_roll = RewTerm(
+        func=mdp.dribbling_support_ankle_roll_tracking_exp,
+        weight=0.25,
+        params={
+            "command_name": "motion",
+            "std": 0.24,
+            "deadzone": 0.10,
+            "error_cap": 0.35,
+        },
+    )
+
+    # Keep the no-contact termination, but give an actual command-change
+    # recovery attempt a bounded extra window.  The counter only slows while
+    # the ball is recoverable and the pelvis is closing distance.
+    cfg.terminations.dribbling_no_contact.params.update(
+        {
+            "recovery_window_steps": 75,
+            "recovery_max_distance": 0.85,
+            "recovery_min_closing_speed": 0.05,
+            "recovery_counter_increment": 0.25,
+            "allow_stable_coast": True,
+            "stable_coast_counter_decrement": 1.0,
+            **stable_coast_params,
+        }
+    )
+
+    # Do not pull linear/angular vel from demo bodies — velocity comes from the command only.
+    if hasattr(cfg.rewards, "motion_body_lin_vel"):
+        cfg.rewards.motion_body_lin_vel.weight = 0.0
+    if hasattr(cfg.rewards, "motion_body_ang_vel"):
+        cfg.rewards.motion_body_ang_vel.weight = 0.0
+
+    # The reference is a style phase, not a task tape.  Keep a gentle whole
+    # body posture prior, but soften it in control so a phase wrap and an
+    # actual turn cannot produce large wrist/arm corrections.  This does not
+    # touch the CG foot/contact rewards (which are independent of the arms).
+    if hasattr(cfg.rewards, "motion_body_pos"):
+        cfg.rewards.motion_body_pos.weight = 0.45
+    if hasattr(cfg.rewards, "motion_body_ori"):
+        cfg.rewards.motion_body_ori.weight = 0.35
+
+    # The policy retains the v3.9 29-D joint-action interface.  Upper-body
+    # targets are constrained and then projected onto the motion-bank PCA
+    # manifold; lower-body actions pass through unchanged.
+    old_action_cfg = cfg.actions.joint_pos
+    cfg.actions.joint_pos = mdp.UpperBodyManifoldJointPositionActionCfg(
+        asset_name=old_action_cfg.asset_name,
+        joint_names=old_action_cfg.joint_names,
+        use_default_offset=old_action_cfg.use_default_offset,
+        upper_body_joint_names=_CONTROL_UPPER_BODY_JOINT_NAMES,
+        command_name="motion",
+        manifold_rank=6,
+        latent_std_limit=3.0,
+        min_latent_limit=0.03,
+        orthogonal_residual_limit=0.10,
+        cutoff_frequency_hz=1.8,
+        # Keep the control policy inside the current style pose's local arm
+        # envelope.  This is control-only: the base config defaults to None.
+        # It prevents saturated PCA latents from locking an arm in a raised pose.
+        reference_target_margin=0.25,
+    )
+    cfg.actions.joint_pos.scale = old_action_cfg.scale
+    cfg.actions.joint_pos.offset = old_action_cfg.offset
+    cfg.actions.joint_pos.preserve_order = getattr(old_action_cfg, "preserve_order", False)
+    if hasattr(old_action_cfg, "clip"):
+        cfg.actions.joint_pos.clip = old_action_cfg.clip
+
+    # Feed back the effective joint command after manifold projection.
+    cfg.observations.policy.actions.func = mdp.effective_joint_action
+    cfg.observations.policy.actions.params = {"action_name": "joint_pos"}
+    cfg.observations.critic.actions.func = mdp.effective_joint_action
+    cfg.observations.critic.actions.params = {"action_name": "joint_pos"}
+    cfg.rewards.action_rate_l2.func = mdp.effective_action_rate_l2_clip
+    cfg.rewards.action_rate_l2.params = {"action_name": "joint_pos"}
+    # Keep the light v3.9 pre-constraint overflow signal.  It is diagnostic and
+    # trainable, but does not add another action transform.
+    cfg.rewards.upper_body_reference_overflow = RewTerm(
+        func=mdp.upper_body_reference_overflow_penalty,
+        weight=-0.05,
+        params={"action_name": "joint_pos"},
+    )
+    # The sole post-v3.9 intervention: make PCA null-space effort visible to
+    # PPO without adding another action transform or reducing ball reach.
+    cfg.rewards.upper_body_manifold_nullspace = RewTerm(
+        func=mdp.upper_body_manifold_nullspace_penalty,
+        weight=-0.02,
+        params={"action_name": "joint_pos", "scale": 0.10},
+    )
+
+    cfg.observations.policy.motion_locomotion_polar_cmd = ObsTerm(
+        func=mdp.motion_locomotion_polar_command,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.critic.motion_locomotion_polar_cmd = ObsTerm(
+        func=mdp.motion_locomotion_polar_command,
+        params={"command_name": "motion"},
+    )
+
+
+def _apply_dribbling_full_control_velocity_terms(cfg) -> None:
+    """Current full Control: stateful external command + start/dribble/stop task."""
+    _apply_dribbling_locomotion_velocity_terms(cfg)
+    cfg.commands.motion.locomotion_command_mode = "resampled"
     # The task input is distinct from speed: both IDLE and STOP command zero
     # velocity, but only STOP asks the policy to settle the ball after a run.
     # Each episode begins with a genuine stationary wait, then trains the
@@ -1077,7 +1311,7 @@ class G1FlatCGDribblingFollowEnvCfg(G1FlatCGDribblingEnvCfg):
 
 @configclass
 class G1FlatCGDribblingControlEnvCfg(G1FlatCGDribblingEnvCfg):
-    """CG Stage-2 **control**: external speed + direction + duration (independent of demo root vel).
+    """CG Stage-2 **control**: preserved v4.4 continuous external-command recipe.
 
     Reference motion teaches **pose / gait / CG touch timing** only. Locomotion is driven by
     a sampled ``(speed, heading, duration)`` command — not ``anchor_lin_vel_w`` from the clip.
@@ -1090,6 +1324,24 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatCGDribblingEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         _apply_dribbling_control_velocity_terms(self)
+
+
+@configclass
+class G1FlatCGDribblingFullControlEnvCfg(G1FlatCGDribblingEnvCfg):
+    """CG Stage-2 full-control: current stateful start/dribble/stop recipe.
+
+    This freezes the pre-split Control behavior behind its own ID.  It adds an
+    IDLE/DRIBBLE/STOP input, zero-speed state handling, state-gated rewards and
+    terminations, and a STOP success condition.  Its policy and critic inputs
+    grow by 12 dimensions from CG Stage-1: lin/ang velocity, polar command,
+    and one-hot task state.
+
+    Gym id: ``Tracking-CG-G1-Dribbling-RNN-full-control``.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dribbling_full_control_velocity_terms(self)
 
 
 def _apply_cg_pretrain_obs(cfg) -> None:
@@ -1105,12 +1357,28 @@ def _apply_cg_pretrain_obs(cfg) -> None:
 
 
 @configclass
+class G1FlatMotionCGPretrainStrictEnvCfg(G1FlatMotionStrictPretrainEnvCfg):
+    """Strict CG Stage-1 (``Tracking-CG-G1-Motion-RNN-strict``).
+
+    Tracks the raw demonstration root path, yaw, pose and velocity without the
+    task-frame transform or reset/domain perturbations used by the other Stage-1
+    recipes.  ``anchor_ball_polar`` is retained on both observation groups so its
+    policy layout matches the other CG Stage-1 environments.  Stage-2 adds command
+    inputs on resume; only full-control additionally adds the task-state input.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_cg_pretrain_obs(self)
+
+
+@configclass
 class G1FlatMotionCGPretrainMimicEnvCfg(G1FlatMotionPretrainEnvCfg):
     """Stage-1 CG mimic pretrain (``Tracking-CG-G1-Motion-RNN-mimic`` / ``...-v1``).
 
     Later split: layered mimic only (no forward/lateral/heading task terms).
     Obs-compatible with :class:`G1FlatCGDribblingForwardEnvCfg` for rsl_rl ``--resume``
-    (follow/control Stage-2 add ``motion_anchor_*_vel_cmd`` obs on top).
+    (follow/control/full-control Stage-2 add command observations on top).
     """
 
     def __post_init__(self):

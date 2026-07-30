@@ -229,6 +229,16 @@ gym.register(
     },
 )
 
+gym.register(
+    id="Tracking-CG-G1-Dribbling-RNN-full-control",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatCGDribblingFullControlEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
+    },
+)
+
 # Alias for older scripts / checkpoints (same env as -forward).
 gym.register(
     id="Tracking-CG-G1-Dribbling-RNN-v0",
@@ -241,8 +251,19 @@ gym.register(
 )
 
 # CG progressive Stage 1: obs-compatible with G1FlatCGDribblingEnvCfg (anchor_ball_polar).
+#   -strict: raw-reference full-body replay, without task-frame/reset perturbations
 #   -task:  original Stage-1 (gym id ``...-v0``): forward/lateral/heading task terms
 #   -mimic: later split (gym id ``...-v1``): layered mimic-only pretrain
+gym.register(
+    id="Tracking-CG-G1-Motion-RNN-strict",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_dribbling_env_cfg.G1FlatMotionCGPretrainStrictEnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1DribblingRecurrentPPORunnerCfg",
+    },
+)
+
 gym.register(
     id="Tracking-CG-G1-Motion-RNN-mimic",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",

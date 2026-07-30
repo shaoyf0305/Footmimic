@@ -194,6 +194,77 @@ _STAGE1_LEG_VEL_BODY_NAMES = [
 ]
 
 
+def _apply_stage1_strict_mimic_pretrain(cfg) -> None:
+    """Stage-1 raw-reference motion tracking with no task-frame or reset perturbations.
+
+    This is the strict replay recipe: reward all of the original global anchor,
+    relative-body pose, and global-body velocity terms in the demonstration frame.
+    In particular, a clip's root path and yaw evolution are preserved; this helper
+    deliberately does *not* strip yaw into the task +X frame.
+
+    The standard action/limit/contact regularizers remain so the reference is
+    reproduced by a physically feasible robot rather than by an unconstrained pose
+    player.  Domain randomization and reset noise are disabled here because they
+    would make the initial robot state differ from the reference being imitated.
+    """
+    cfg.commands.motion.anchor_body_name = "pelvis"
+    cfg.commands.motion.mimic_align_task_frame = False
+    cfg.commands.motion.mimic_align_locomotion_heading = False
+
+    # Restore the full tracking objective from TrackingEnvCfg explicitly.  Keeping
+    # these assignments here makes strict independent of changes to sibling recipes.
+    if hasattr(cfg.rewards, "motion_global_anchor_pos"):
+        cfg.rewards.motion_global_anchor_pos.weight = 1.0
+    if hasattr(cfg.rewards, "motion_global_anchor_ori"):
+        cfg.rewards.motion_global_anchor_ori.weight = 1.0
+    if hasattr(cfg.rewards, "motion_body_pos"):
+        cfg.rewards.motion_body_pos.weight = 1.0
+        cfg.rewards.motion_body_pos.params.pop("body_names", None)
+    if hasattr(cfg.rewards, "motion_body_ori"):
+        cfg.rewards.motion_body_ori.weight = 1.0
+        cfg.rewards.motion_body_ori.params.pop("body_names", None)
+    if hasattr(cfg.rewards, "motion_body_lin_vel"):
+        cfg.rewards.motion_body_lin_vel.weight = 1.0
+    if hasattr(cfg.rewards, "motion_body_ang_vel"):
+        cfg.rewards.motion_body_ang_vel.weight = 1.0
+
+    # Reset to the exact reference state.  G1FlatMotionEnvCfg enables these
+    # robustness-oriented settings for its task-oriented children, so strict must
+    # override every one of them after ``super().__post_init__``.
+    cfg.commands.motion.reset_face_task_forward = False
+    cfg.commands.motion.reset_zero_velocity = False
+    cfg.commands.motion.pose_range = {
+        "x": (0.0, 0.0),
+        "y": (0.0, 0.0),
+        "z": (0.0, 0.0),
+        "roll": (0.0, 0.0),
+        "pitch": (0.0, 0.0),
+        "yaw": (0.0, 0.0),
+    }
+    cfg.commands.motion.velocity_range = {
+        "x": (0.0, 0.0),
+        "y": (0.0, 0.0),
+        "z": (0.0, 0.0),
+        "roll": (0.0, 0.0),
+        "pitch": (0.0, 0.0),
+        "yaw": (0.0, 0.0),
+    }
+    cfg.commands.motion.joint_position_range = (0.0, 0.0)
+    cfg.commands.motion.curve_offset_range = {
+        "radius": (0.0, 0.0),
+        "lateral_spawn_jitter": 0.0,
+        "height": SOCCER_BALL_RADIUS,
+    }
+
+    # No random material/COM/default-joint offsets or interval pushes in strict
+    # Stage-1.  The ball remains in the scene solely to preserve the CG observation
+    # layout; no ball/task reward is introduced by this configuration.
+    cfg.events.physics_material = None
+    cfg.events.add_joint_default_pos = None
+    cfg.events.base_com = None
+    cfg.events.push_robot = None
+
+
 def _apply_stage1_mimic_pretrain(cfg) -> None:
     """Stage-1 dribble pretrain: layered mimic + demo-root velocity (no lateral/heading task terms).
 
@@ -377,6 +448,19 @@ class G1FlatMotionPretrainEnvCfg(G1FlatMotionEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         _apply_stage1_mimic_pretrain(self)
+
+
+@configclass
+class G1FlatMotionStrictPretrainEnvCfg(G1FlatMotionEnvCfg):
+    """Stage-1 raw-reference tracking for ``*-Motion-RNN-strict``.
+
+    This sibling of ``G1FlatMotionPretrainEnvCfg`` intentionally does not inherit its
+    task-frame layered-mimic changes.  It is the dedicated strict Stage-1 recipe.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_stage1_strict_mimic_pretrain(self)
 
 
 @configclass

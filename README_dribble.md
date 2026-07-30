@@ -4,15 +4,17 @@ Read this before changing control-related code. Follow the constraints below.
 
 ## Task IDs
 
+- Tracking-CG-G1-Motion-RNN-strict: Stage-1 raw-reference full-body tracking. It preserves the demo root path/yaw and has no reset or domain randomization.
 - Tracking-CG-G1-Motion-RNN-mimic: Stage-1 motion style from demo. Preferred warm-start for control.
 - Tracking-CG-G1-Motion-RNN-task: Stage-1 with fixed +X / anti-lateral terms. Do not use as control warm-start.
 - Tracking-CG-G1-Dribbling-RNN-forward: Stage-2 fixed task +X dribbling.
 - Tracking-CG-G1-Dribbling-RNN-follow: Stage-2 root velocity from demo anchor vel.
-- Tracking-CG-G1-Dribbling-RNN-control: Stage-2 external locomotion command (speed, heading, duration).
+- Tracking-CG-G1-Dribbling-RNN-control: preserved v4.4 continuous Stage-2 command control (speed 0.40–1.50, heading, duration; +9 resume inputs).
+- Tracking-CG-G1-Dribbling-RNN-full-control: current stateful Stage-2 control (IDLE/DRIBBLE/STOP; +12 resume inputs).
 
 Play entry: scripts/rsl_rl/play_multi.py with dual_view and locomotion_cmd_speed / heading / duration.
-Train helper: shell/progressive_dribbling_train.sh with --cg --cg-control.
-Stage-1 to control obs expansion (+9) is handled by load_checkpoint_with_obs_expand via MotionOnPolicyRunner.load.
+Train helper: shell/progressive_dribbling_train.sh with --cg --cg-control (v4.4) or --cg --cg-full-control (current).
+Stage-1 warm-start expands trailing observations automatically: +9 for control, +12 for full-control.
 
 ## Goals you must respect
 
@@ -68,7 +70,8 @@ Phase D acceptance: speed test shows pelvis speed follow stop and go. Heading te
 
 Run these after training with `--video --dual_view --diagnostic`.  They are
 manual cases, deliberately not an automated script: simulator versions and
-available hardware vary between environments.  Use the control task and append
+available hardware vary between environments.  Use the control task for the v4.4
+cases, or full-control for the stateful cases, and append
 the shown command arguments to the normal `play_multi.py` invocation.
 
 **A. Steady maximum speed**
@@ -155,8 +158,8 @@ stiffness, and scales only roll damping by `sqrt(2)`. Do not combine this first
 A/B test with `--waist_reference_margin`; compare it against the same command
 with only `--diagnostic`.
 
-The same roll PD setting is now built into the control training environment.
-For the control task, do not also pass `--waist_roll_stiffness_scale`: playback
+The same roll PD setting is now built into both control training environments.
+For either control task, do not also pass `--waist_roll_stiffness_scale`: playback
 reports the built-in `x2.0` scale automatically.  The control action layer also
 keeps the reference clip's natural forward lean, while applying an asymmetric,
 smooth waist-pitch deviation envelope (`-0.45` / `+0.12` rad) and a 1.8 Hz
@@ -179,9 +182,9 @@ locomotion_cmd_duration 4.0 6.0 6.0
 
 Compare Loco cmd to Robot actual, hdg_err, and Pelvis v_xy. The track percent field is velocity-direction cosine only. It does not prove heading tracking.
 
-### Stateful start / stop control
+### Stateful start / stop full-control
 
-The control task now observes a one-hot task state in addition to the robot
+The full-control task observes a one-hot task state in addition to the robot
 velocity command: `IDLE`, `DRIBBLE`, or `STOP`.  IDLE and STOP both request
 zero velocity, but their goals differ: IDLE rewards a quiet robot waiting for a
 start request; STOP rewards a quiet, stable robot only. The ball is no longer
