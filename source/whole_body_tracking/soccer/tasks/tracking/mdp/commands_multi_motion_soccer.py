@@ -504,6 +504,8 @@ class MotionCommand(CommandTerm):
         ]
         self._locomotion_segment_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._locomotion_segment_hold_last = True
+        self._locomotion_segment_reset_on_end = False
+        self._locomotion_sequence_finished = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         if self._locomotion_command_mode == "resampled":
             all_env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
             self._sample_locomotion_commands(all_env_ids, reset_task_sequence=True)
@@ -862,6 +864,13 @@ class MotionCommand(CommandTerm):
             cur = int(self._locomotion_segment_idx[env_id].item())
             next_idx = cur + 1
             if next_idx >= len(plan):
+                if self._locomotion_segment_reset_on_end:
+                    # The termination manager observes this flag in the same
+                    # environment step, then resets robot, ball, and command
+                    # back to segment zero.
+                    self._locomotion_sequence_finished[env_id] = True
+                    self._locomotion_cmd_hold_steps_remaining[env_id] = 1
+                    continue
                 if self._locomotion_segment_hold_last:
                     next_idx = len(plan) - 1
                 else:
@@ -898,11 +907,14 @@ class MotionCommand(CommandTerm):
         ],
         env_ids: torch.Tensor | Sequence[int] | None = None,
         hold_last: bool = True,
+        reset_on_end: bool = False,
     ) -> None:
         """Queue polar commands as ``(speed, heading, duration_s[, wz, task_state])``.
 
         Omitted state is inferred from speed (positive=DRIBBLE, zero=STOP).
-        Segments run in order; when ``hold_last=True`` the final segment repeats after the queue ends.
+        Segments run in order. ``reset_on_end`` takes precedence at the final
+        segment and requests an environment reset; otherwise ``hold_last``
+        chooses whether the final segment repeats or the sequence loops.
         """
         if env_ids is None:
             env_id_list = list(range(self.num_envs))
@@ -938,6 +950,8 @@ class MotionCommand(CommandTerm):
 
         env_ids_t = self._to_env_id_tensor(env_id_list)
         self._locomotion_segment_hold_last = hold_last
+        self._locomotion_segment_reset_on_end = bool(reset_on_end)
+        self._locomotion_sequence_finished[env_ids_t] = False
         self._locomotion_cmd_initialized[env_ids_t] = False
         for env_id in env_ids_t.tolist():
             self._locomotion_segment_plans[env_id] = normalized
@@ -992,6 +1006,8 @@ class MotionCommand(CommandTerm):
                 self._locomotion_cmd_hold_steps_remaining[env_ids_t] = self._duration_s_to_steps(duration_s)
         for env_id in env_ids_t.tolist():
             self._locomotion_segment_plans[env_id] = []
+        self._locomotion_segment_reset_on_end = False
+        self._locomotion_sequence_finished[env_ids_t] = False
 
     def set_locomotion_manual_command(
         self,
@@ -1557,6 +1573,7 @@ class MotionCommand(CommandTerm):
         )
         if self._locomotion_command_mode != "manual" or restart_manual_plan:
             self._locomotion_cmd_initialized[env_ids] = False
+        self._locomotion_sequence_finished[env_ids] = False
 
         # In style-looping control this method is reached only for a real
         # episode reset, so restart the per-episode diagnostic counter.

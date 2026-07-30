@@ -857,6 +857,14 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         cfg.rewards.dribbling_cg_contact_consistency.params.update(
             {"ignore_stable_coast": True, **stable_coast_params}
         )
+    # The CG foot--ball distance target is useful while recovering or
+    # re-touching, but it otherwise pulls a foot toward a ball that is already
+    # rolling safely.  Suppress just this proximity imitation during coast;
+    # no new hover penalty is introduced.
+    if hasattr(cfg.rewards, "dribbling_cg_foot_ball_distance"):
+        cfg.rewards.dribbling_cg_foot_ball_distance.params.update(
+            {"suppress_when_stable_coast": True, **stable_coast_params}
+        )
 
     # During a labeled touch, retain only the opposite (support) ankle's roll
     # style.  The touching ankle remains unrestricted, so this small cosmetic
@@ -905,6 +913,13 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
             "settled_pelvis_speed": 0.05,
             "settled_pelvis_angular_speed": 0.20,
         },
+    )
+    # Playback-only opt-in: a manual command sequence can end its final STOP
+    # segment with a full scene reset instead of looping or holding it. The
+    # command flag is false during resampled training, so this term is inert.
+    cfg.terminations.locomotion_manual_sequence_end = DoneTerm(
+        func=mdp.locomotion_manual_sequence_finished,
+        params={"command_name": "motion"},
     )
 
     # STOP is a robot-stability endpoint, not a ball-control objective.  Gate

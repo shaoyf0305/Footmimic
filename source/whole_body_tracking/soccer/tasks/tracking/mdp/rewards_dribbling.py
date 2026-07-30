@@ -1403,13 +1403,24 @@ def dribbling_cg_foot_ball_distance_exp(
     left_ankle_body_name: str = "left_ankle_roll_link",
     right_ankle_body_name: str = "right_ankle_roll_link",
     active_task_states: tuple[int, ...] | None = None,
+    suppress_when_stable_coast: bool = False,
+    coast_min_command_speed: float = 0.35,
+    coast_min_ball_speed_ratio: float = 0.70,
+    coast_min_pelvis_speed_ratio: float = 0.70,
+    coast_max_forward_speed_error: float = 0.25,
+    coast_min_forward_offset: float = 0.22,
+    coast_max_forward_offset: float = 0.75,
+    coast_max_lateral_offset: float = 0.22,
 ) -> torch.Tensor:
     """Match sim foot–ball distance to demo distance from synthesized CG trajectory.
 
     Requires ``dribble_cg_foot_ball_dist`` in motion ``.npz`` (see
     ``scripts/dribble/synthesize_dribble_ball_traj.py``). Active on every frame
     with a stitched demo ball trajectory (contact **and** non-contact approach
-    gaps), not only during annotated contact segments.
+    gaps), not only during annotated contact segments. When
+    ``suppress_when_stable_coast`` is enabled, this proximity imitation is
+    disabled while the ball is already coasting safely with the robot. This
+    avoids pulling a foot back toward a ball that does not need a re-touch.
 
     - ``ref_dist`` = demo XY distance from the reference foot to synthesized ball.
     - Reference foot comes from ``dribble_cg_dist_foot`` when present, else
@@ -1456,6 +1467,19 @@ def dribbling_cg_foot_ball_distance_exp(
 
     err = (sim_dist - ref_dist) ** 2
     rew = torch.exp(-err / max(std, 1e-6) ** 2)
+    if suppress_when_stable_coast:
+        stable_coast = dribbling_stable_coast_state(
+            env,
+            command_name=command_name,
+            min_command_speed=coast_min_command_speed,
+            min_ball_speed_ratio=coast_min_ball_speed_ratio,
+            min_pelvis_speed_ratio=coast_min_pelvis_speed_ratio,
+            max_forward_speed_error=coast_max_forward_speed_error,
+            min_forward_offset=coast_min_forward_offset,
+            max_forward_offset=coast_max_forward_offset,
+            max_lateral_offset=coast_max_lateral_offset,
+        )
+        rew = rew * (~stable_coast).to(rew.dtype)
     return rew * active.to(torch.float32)
 
 

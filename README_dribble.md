@@ -201,6 +201,10 @@ Use the explicit state argument for a manual regression run:
 --locomotion_cmd_hold_last --diagnostic
 ```
 
+For a bounded regression episode, replace `--locomotion_cmd_hold_last` with
+`--locomotion_cmd_reset_on_end`.  When the final segment duration expires, it
+resets the robot, ball, and command plan to segment one (IDLE).
+
 The diagnostic records the requested and effective speed, task state, active
 no-contact gate, and IDLE/STOP metrics.  For STOP, require a sustained
 `stop_settled` interval and a `stop_success` event; ball values are recorded

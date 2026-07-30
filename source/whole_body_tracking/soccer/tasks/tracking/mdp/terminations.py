@@ -79,6 +79,23 @@ def motion_finished(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     return command.time_steps >= last_step
 
 
+def locomotion_manual_sequence_finished(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+) -> torch.Tensor:
+    """End playback when a manual locomotion sequence reaches its final segment.
+
+    This is inactive for normal resampled training commands.  A manual play
+    command opts in through ``reset_on_end`` and the subsequent environment
+    reset restores both the robot/ball scene and segment zero of its plan.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    finished = getattr(command, "_locomotion_sequence_finished", None)
+    if not isinstance(finished, torch.Tensor) or finished.shape[0] != env.num_envs:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    return finished
+
+
 def ball_lost_dribbling(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",

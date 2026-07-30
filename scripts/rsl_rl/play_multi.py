@@ -138,6 +138,15 @@ parser.add_argument(
     help="Keep the final multi-segment polar command active instead of looping.",
 )
 parser.add_argument(
+    "--locomotion_cmd_reset_on_end",
+    action="store_true",
+    default=False,
+    help=(
+        "Reset robot, ball, and manual command sequence after the final polar segment duration. "
+        "Takes precedence over --locomotion_cmd_loop/--locomotion_cmd_hold_last."
+    ),
+)
+parser.add_argument(
     "--diagnostic",
     action="store_true",
     default=False,
@@ -1350,15 +1359,23 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
 
         if n > 1 and hasattr(cmd, "set_locomotion_polar_sequence"):
             segments = [(speeds[i], headings[i], durations[i], wz_list[i], task_states[i]) for i in range(n)]
-            cmd.set_locomotion_polar_sequence(segments, hold_last=not args_cli.locomotion_cmd_loop)
+            cmd.set_locomotion_polar_sequence(
+                segments,
+                hold_last=not args_cli.locomotion_cmd_loop,
+                reset_on_end=args_cli.locomotion_cmd_reset_on_end,
+            )
             print(f"[INFO] Locomotion sequence ({n} segments):")
             for i, (sp, hd, dur, wz, state) in enumerate(segments):
                 print(
                     f"  [{i + 1}] state={state.upper():7s}  speed={sp:.3f} m/s  "
                     f"heading={hd:.3f} rad  duration={dur:.2f} s  wz={wz:.3f}"
                 )
-            if args_cli.locomotion_cmd_loop:
+            if args_cli.locomotion_cmd_reset_on_end:
+                print("  final segment -> environment reset -> segment 1")
+            elif args_cli.locomotion_cmd_loop:
                 print("  looping: final segment -> first segment")
+            else:
+                print("  holding: final segment remains active")
             return True
 
         cmd.set_locomotion_command_mode("manual")
