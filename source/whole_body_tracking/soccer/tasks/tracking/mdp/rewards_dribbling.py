@@ -202,57 +202,6 @@ def _command_frame_components(vector_xy: torch.Tensor, direction_xy: torch.Tenso
     return forward, lateral
 
 
-def dribbling_stable_coast_state(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    min_command_speed: float = 0.35,
-    min_ball_speed_ratio: float = 0.70,
-    min_pelvis_speed_ratio: float = 0.70,
-    max_forward_speed_error: float = 0.25,
-    min_forward_offset: float = 0.22,
-    max_forward_offset: float = 0.75,
-    max_lateral_offset: float = 0.22,
-) -> torch.Tensor:
-    """Return whether the ball is safely coasting with the robot.
-
-    A dribbling policy should not need to tap a ball that is already moving at
-    the commanded speed, remains in front of the pelvis, and has no meaningful
-    fore/aft speed error.  This deliberately requires *all* of those signals;
-    a ball that is slow, escaping sideways, or merely parked in the corridor
-    is never classified as stable coast.
-
-    The compact telemetry attributes are consumed by playback diagnostics and
-    make the reward/termination decision observable in saved ``.npz`` traces.
-    """
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-    direction_xy, command_speed = _command_direction_xy(command)
-
-    offset_xy = soccer_ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
-    forward_offset, lateral_offset = _command_frame_components(offset_xy, direction_xy)
-    ball_forward_speed, _ = _command_frame_components(soccer_ball.data.root_lin_vel_w[:, :2], direction_xy)
-    pelvis_forward_speed, _ = _command_frame_components(command.robot_anchor_lin_vel_w[:, :2], direction_xy)
-    forward_speed_error = torch.abs(ball_forward_speed - pelvis_forward_speed)
-
-    coast = (
-        (command_speed >= float(min_command_speed))
-        & (ball_forward_speed >= command_speed * float(min_ball_speed_ratio))
-        & (pelvis_forward_speed >= command_speed * float(min_pelvis_speed_ratio))
-        & (forward_speed_error <= float(max_forward_speed_error))
-        & (forward_offset >= float(min_forward_offset))
-        & (forward_offset <= float(max_forward_offset))
-        & (torch.abs(lateral_offset) <= float(max_lateral_offset))
-    )
-
-    setattr(env, "_dribbling_stable_coast_active", coast)
-    setattr(env, "_dribbling_coast_ball_forward_speed", ball_forward_speed)
-    setattr(env, "_dribbling_coast_pelvis_forward_speed", pelvis_forward_speed)
-    setattr(env, "_dribbling_coast_forward_speed_error", forward_speed_error)
-    setattr(env, "_dribbling_coast_forward_offset", forward_offset)
-    setattr(env, "_dribbling_coast_lateral_offset", lateral_offset)
-    return coast
-
-
 def dribbling_idle_stand_reward(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
@@ -848,16 +797,8 @@ def dribbling_command_ball_progress_reward(
     require_recent_contact: bool = True,
     recent_contact_window: int = 10,
     cg_gated_contact: bool = False,
-    allow_stable_coast_without_contact: bool = False,
-    coast_min_command_speed: float = 0.35,
-    coast_min_ball_speed_ratio: float = 0.70,
-    coast_min_pelvis_speed_ratio: float = 0.70,
-    coast_max_forward_speed_error: float = 0.25,
-    coast_min_forward_offset: float = 0.22,
-    coast_max_forward_offset: float = 0.75,
-    coast_max_lateral_offset: float = 0.22,
 ) -> torch.Tensor:
-    """Reward ball progress along the active command direction.
+    """Reward recent-contact ball progress along the active command direction.
 
     ``command_speed_ratio`` makes high-speed commands demand proportionally
     faster ball progress without asking the ball to exactly match pelvis speed.
@@ -883,7 +824,7 @@ def dribbling_command_ball_progress_reward(
     pelvis_speed = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
     gate = torch.clamp(pelvis_speed / max(pelvis_speed_min, 1.0e-6), max=1.0)
     if require_recent_contact:
-        contact_gate = _dribbling_recent_contact_gate(
+        gate = gate * _dribbling_recent_contact_gate(
             env,
             ball_sensor_name,
             contact_force_threshold,
@@ -891,23 +832,6 @@ def dribbling_command_ball_progress_reward(
             command=command,
             cg_gated=cg_gated_contact,
         )
-        if allow_stable_coast_without_contact:
-            coast = dribbling_stable_coast_state(
-                env,
-                command_name,
-                coast_min_command_speed,
-                coast_min_ball_speed_ratio,
-                coast_min_pelvis_speed_ratio,
-                coast_max_forward_speed_error,
-                coast_min_forward_offset,
-                coast_max_forward_offset,
-                coast_max_lateral_offset,
-            )
-            # Either a recent kick or a verified, synchronized coast proves
-            # that forward progress is under control.  ``max`` preserves the
-            # existing recent-contact behaviour whenever coast is unsafe.
-            contact_gate = torch.maximum(contact_gate, coast.to(contact_gate.dtype))
-        gate = gate * contact_gate
     return progress * direction_gate * gate
 
 
@@ -1015,16 +939,8 @@ def dribbling_legal_foot_touch(
     num_ankle_links: int = 2,
     cg_gated: bool = False,
     min_pelvis_heading: float = 0.0,
-    suppress_when_stable_coast: bool = False,
-    coast_min_command_speed: float = 0.35,
-    coast_min_ball_speed_ratio: float = 0.70,
-    coast_min_pelvis_speed_ratio: float = 0.70,
-    coast_max_forward_speed_error: float = 0.25,
-    coast_min_forward_offset: float = 0.22,
-    coast_max_forward_offset: float = 0.75,
-    coast_max_lateral_offset: float = 0.22,
 ) -> torch.Tensor:
-    """Reward a corrective new gentle ankle touch, not sustained trapping."""
+    """Reward a **new** gentle ankle touch (rising edge), not sustained trapping."""
     command: MotionCommand = env.command_manager.get_term(command_name)
     has_contact, force_mag, closest_idx = _identify_contact_body(
         env, command, ball_sensor_name, all_body_cfg,
@@ -1044,21 +960,6 @@ def dribbling_legal_foot_touch(
     setattr(env, prev_name, touch.detach().clone())
 
     reward = new_touch.to(torch.float32)
-    if suppress_when_stable_coast:
-        coast = dribbling_stable_coast_state(
-            env,
-            command_name,
-            coast_min_command_speed,
-            coast_min_ball_speed_ratio,
-            coast_min_pelvis_speed_ratio,
-            coast_max_forward_speed_error,
-            coast_min_forward_offset,
-            coast_max_forward_offset,
-            coast_max_lateral_offset,
-        )
-        # A touch while the ball already coasts safely is not corrective and
-        # must not become a free cadence reward.
-        reward = reward * (~coast).to(reward.dtype)
     if min_pelvis_heading > 0.0:
         heading = task_pelvis_heading_cos_world_x(command.robot_pelvis_quat_w).clamp(min=0.0, max=1.0)
         reward = reward * forward_dominance_gate(heading, min_pelvis_heading)
@@ -1230,22 +1131,9 @@ def dribbling_cg_contact_consistency(
     command_name: str = "motion",
     ball_sensor_name: str = "soccer_ball_contact",
     contact_force_threshold: float = 1.0,
-    ignore_stable_coast: bool = False,
-    coast_min_command_speed: float = 0.35,
-    coast_min_ball_speed_ratio: float = 0.70,
-    coast_min_pelvis_speed_ratio: float = 0.70,
-    coast_max_forward_speed_error: float = 0.25,
-    coast_min_forward_offset: float = 0.22,
-    coast_max_forward_offset: float = 0.75,
-    coast_max_lateral_offset: float = 0.22,
     active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
-    """1.0 when sim contact presence matches the annotated CG contact bit.
-
-    In control mode, a safe matched-speed coast is a valid alternative to the
-    demonstration's contact cadence.  It receives neutral full credit so a
-    stale label cannot force an unnecessary touch.
-    """
+    """1.0 when sim contact presence matches the annotated CG contact bit."""
     command: MotionCommand = env.command_manager.get_term(command_name)
     labeled = command.motion_has_dribble_cg_label
     if not torch.any(labeled):
@@ -1254,19 +1142,6 @@ def dribbling_cg_contact_consistency(
     ref = command.dribble_cg_contact_ref
     sim_c = _dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
     agree = (ref == sim_c).to(torch.float32)
-    if ignore_stable_coast:
-        coast = dribbling_stable_coast_state(
-            env,
-            command_name,
-            coast_min_command_speed,
-            coast_min_ball_speed_ratio,
-            coast_min_pelvis_speed_ratio,
-            coast_max_forward_speed_error,
-            coast_min_forward_offset,
-            coast_max_forward_offset,
-            coast_max_lateral_offset,
-        )
-        agree = torch.where(coast, torch.ones_like(agree), agree)
     active = labeled & locomotion_task_state_mask(command, active_task_states)
     return agree * active.to(torch.float32)
 
@@ -1403,24 +1278,13 @@ def dribbling_cg_foot_ball_distance_exp(
     left_ankle_body_name: str = "left_ankle_roll_link",
     right_ankle_body_name: str = "right_ankle_roll_link",
     active_task_states: tuple[int, ...] | None = None,
-    suppress_when_stable_coast: bool = False,
-    coast_min_command_speed: float = 0.35,
-    coast_min_ball_speed_ratio: float = 0.70,
-    coast_min_pelvis_speed_ratio: float = 0.70,
-    coast_max_forward_speed_error: float = 0.25,
-    coast_min_forward_offset: float = 0.22,
-    coast_max_forward_offset: float = 0.75,
-    coast_max_lateral_offset: float = 0.22,
 ) -> torch.Tensor:
     """Match sim foot–ball distance to demo distance from synthesized CG trajectory.
 
     Requires ``dribble_cg_foot_ball_dist`` in motion ``.npz`` (see
     ``scripts/dribble/synthesize_dribble_ball_traj.py``). Active on every frame
     with a stitched demo ball trajectory (contact **and** non-contact approach
-    gaps), not only during annotated contact segments. When
-    ``suppress_when_stable_coast`` is enabled, this proximity imitation is
-    disabled while the ball is already coasting safely with the robot. This
-    avoids pulling a foot back toward a ball that does not need a re-touch.
+    gaps), not only during annotated contact segments.
 
     - ``ref_dist`` = demo XY distance from the reference foot to synthesized ball.
     - Reference foot comes from ``dribble_cg_dist_foot`` when present, else
@@ -1467,19 +1331,6 @@ def dribbling_cg_foot_ball_distance_exp(
 
     err = (sim_dist - ref_dist) ** 2
     rew = torch.exp(-err / max(std, 1e-6) ** 2)
-    if suppress_when_stable_coast:
-        stable_coast = dribbling_stable_coast_state(
-            env,
-            command_name=command_name,
-            min_command_speed=coast_min_command_speed,
-            min_ball_speed_ratio=coast_min_ball_speed_ratio,
-            min_pelvis_speed_ratio=coast_min_pelvis_speed_ratio,
-            max_forward_speed_error=coast_max_forward_speed_error,
-            min_forward_offset=coast_min_forward_offset,
-            max_forward_offset=coast_max_forward_offset,
-            max_lateral_offset=coast_max_lateral_offset,
-        )
-        rew = rew * (~stable_coast).to(rew.dtype)
     return rew * active.to(torch.float32)
 
 
@@ -1558,14 +1409,13 @@ def dribbling_command_chase_ball_reward(
     max_chase_xy_dist: float = 1.1,
     pelvis_forward_speed_min: float = 0.22,
     forward_speed_scale: float = 0.45,
-    max_lateral_offset: float | None = None,
 ) -> torch.Tensor:
-    """Reward closing on a nearby, command-frame-centred ball ahead."""
+    """Reward closing on a nearby ball ahead along the active command direction."""
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
     direction_xy, _ = _command_direction_xy(command)
     offset_xy = soccer_ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
-    ball_ahead, lateral_offset = _command_frame_components(offset_xy, direction_xy)
+    ball_ahead, _ = _command_frame_components(offset_xy, direction_xy)
     dist_xy = torch.norm(offset_xy, dim=-1)
     pelvis_forward, _ = _command_frame_components(command.robot_anchor_lin_vel_w[:, :2], direction_xy)
 
@@ -1575,77 +1425,8 @@ def dribbling_command_chase_ball_reward(
         max=1.0,
     )
     no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
-    in_lateral_corridor = torch.ones_like(no_ball)
-    if max_lateral_offset is not None:
-        if max_lateral_offset < 0.0:
-            raise ValueError("max_lateral_offset must be non-negative when provided")
-        in_lateral_corridor = torch.abs(lateral_offset) <= max_lateral_offset
-    active = no_ball & (ball_ahead >= min_ball_ahead) & (dist_xy <= max_chase_xy_dist) & in_lateral_corridor
+    active = no_ball & (ball_ahead >= min_ball_ahead) & (dist_xy <= max_chase_xy_dist)
     return speed_reward * active.to(torch.float32)
-
-
-def dribbling_command_lateral_recovery_reward(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    ball_sensor_name: str = "soccer_ball_contact",
-    contact_force_threshold: float = 1.0,
-    lateral_start: float = 0.20,
-    lateral_full: float = 0.45,
-    min_forward_offset: float = 0.10,
-    max_recovery_xy_dist: float = 0.90,
-    min_closing_speed: float = 0.05,
-    closing_speed_scale: float = 0.30,
-    min_diverging_speed: float = 0.03,
-    divergence_penalty_scale: float = 0.35,
-) -> torch.Tensor:
-    """Reward closing command-frame lateral ball error after a sideways escape.
-
-    The reward is active only without ball contact.  It measures relative lateral
-    velocity, so moving sideways is rewarded only when it actually reduces the
-    ball-pelvis lateral separation.  Conversely, a small signed penalty applies
-    when the relative velocity makes an already-lateral ball escape further.
-    """
-    if lateral_start < 0.0 or lateral_full <= lateral_start:
-        raise ValueError("lateral_full must be greater than non-negative lateral_start")
-    if min_forward_offset < 0.0 or max_recovery_xy_dist <= 0.0:
-        raise ValueError("recovery offsets and distance must be positive")
-    if min_closing_speed < 0.0 or min_diverging_speed < 0.0:
-        raise ValueError("lateral speed thresholds must be non-negative")
-    if closing_speed_scale <= 0.0 or divergence_penalty_scale < 0.0:
-        raise ValueError("closing_speed_scale must be positive")
-
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-    direction_xy, _ = _command_direction_xy(command)
-    lateral_axis = torch.stack((-direction_xy[:, 1], direction_xy[:, 0]), dim=-1)
-    offset_xy = soccer_ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
-    forward_offset, lateral_offset = _command_frame_components(offset_xy, direction_xy)
-    dist_xy = torch.norm(offset_xy, dim=-1)
-
-    ball_lateral_speed = torch.sum(soccer_ball.data.root_lin_vel_w[:, :2] * lateral_axis, dim=-1)
-    pelvis_lateral_speed = torch.sum(command.robot_anchor_lin_vel_w[:, :2] * lateral_axis, dim=-1)
-    relative_lateral_speed = ball_lateral_speed - pelvis_lateral_speed
-    closing_lateral_speed = -torch.sign(lateral_offset) * relative_lateral_speed
-    closing_reward = torch.clamp(
-        (closing_lateral_speed - min_closing_speed) / closing_speed_scale,
-        min=0.0,
-        max=1.0,
-    )
-    diverging_penalty = torch.clamp(
-        (-closing_lateral_speed - min_diverging_speed) / closing_speed_scale,
-        min=0.0,
-        max=1.0,
-    )
-    lateral_activation = torch.clamp(
-        (torch.abs(lateral_offset) - lateral_start) / (lateral_full - lateral_start),
-        min=0.0,
-        max=1.0,
-    )
-
-    no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
-    active = no_ball & (forward_offset >= min_forward_offset) & (dist_xy <= max_recovery_xy_dist)
-    lateral_score = closing_reward - divergence_penalty_scale * diverging_penalty
-    return lateral_activation * lateral_score * active.to(torch.float32)
 
 
 def dribbling_rapid_retouch_penalty(
@@ -1657,14 +1438,6 @@ def dribbling_rapid_retouch_penalty(
     all_body_cfg: SceneEntityCfg | None = None,
     num_ankle_links: int = 2,
     cg_gated: bool = False,
-    penalize_only_when_stable_coast: bool = False,
-    coast_min_command_speed: float = 0.35,
-    coast_min_ball_speed_ratio: float = 0.70,
-    coast_min_pelvis_speed_ratio: float = 0.70,
-    coast_max_forward_speed_error: float = 0.25,
-    coast_min_forward_offset: float = 0.22,
-    coast_max_forward_offset: float = 0.75,
-    coast_max_lateral_offset: float = 0.22,
 ) -> torch.Tensor:
     """Penalty for a **new** legal gentle touch sooner than ``min_steps_between_touches``.
 
@@ -1703,21 +1476,6 @@ def dribbling_rapid_retouch_penalty(
 
     new_touch = touch & ~prev_touch
     too_soon = new_touch & (steps_since < int(min_steps_between_touches))
-    if penalize_only_when_stable_coast:
-        coast = dribbling_stable_coast_state(
-            env,
-            command_name=command_name,
-            min_command_speed=coast_min_command_speed,
-            min_ball_speed_ratio=coast_min_ball_speed_ratio,
-            min_pelvis_speed_ratio=coast_min_pelvis_speed_ratio,
-            max_forward_speed_error=coast_max_forward_speed_error,
-            min_forward_offset=coast_min_forward_offset,
-            max_forward_offset=coast_max_forward_offset,
-            max_lateral_offset=coast_max_lateral_offset,
-        )
-        # During recovery, a sequence of small corrective touches is valid.
-        # The cadence penalty remains only for needless taps during a coast.
-        too_soon = too_soon & coast
     steps_since = torch.where(new_touch, torch.zeros_like(steps_since), steps_since)
 
     setattr(env, prev_touch_name, touch.detach().clone())

@@ -1615,16 +1615,26 @@ class MotionCommand(CommandTerm):
         if env_ids.numel() == 0:
             return
 
-        # A resampled command is an episode initial condition.  Legacy manual
-        # diagnostics deliberately keep one global timeline across resets, but
-        # a stateful start/dribble/stop task must restart its manual plan at
-        # segment zero (IDLE) after either success or failure.
-        restart_manual_plan = (
-            self._locomotion_command_mode == "manual"
-            and bool(getattr(self.cfg, "locomotion_task_state_restart_manual_sequence_on_reset", False))
-        )
-        if self._locomotion_command_mode != "manual" or restart_manual_plan:
+        # Legacy manual diagnostics deliberately keep one global timeline
+        # across ordinary failure resets.  There are two explicit exceptions:
+        # stateful start/dribble/stop control restarts every reset, while a
+        # manual sequence with ``reset_on_end`` restarts only after its final
+        # segment deliberately requested this reset.
+        manual_restart_env_ids = env_ids.new_empty((0,), dtype=torch.long)
+        if self._locomotion_command_mode == "manual":
+            restart_every_manual_reset = bool(
+                getattr(self.cfg, "locomotion_task_state_restart_manual_sequence_on_reset", False)
+            )
+            sequence_finished = self._locomotion_sequence_finished[env_ids].clone()
+            if restart_every_manual_reset:
+                manual_restart_env_ids = env_ids
+            elif self._locomotion_segment_reset_on_end:
+                manual_restart_env_ids = env_ids[sequence_finished]
+
+        if self._locomotion_command_mode != "manual":
             self._locomotion_cmd_initialized[env_ids] = False
+        elif manual_restart_env_ids.numel() > 0:
+            self._locomotion_cmd_initialized[manual_restart_env_ids] = False
         self._locomotion_sequence_finished[env_ids] = False
 
         # In style-looping control this method is reached only for a real
@@ -1706,8 +1716,8 @@ class MotionCommand(CommandTerm):
         self._steps_since_resample[env_ids] = 0
         if self._locomotion_command_mode == "resampled":
             self._sample_locomotion_commands(env_ids, reset_task_sequence=True)
-        elif restart_manual_plan:
-            self._restart_locomotion_segment_plans(env_ids)
+        elif manual_restart_env_ids.numel() > 0:
+            self._restart_locomotion_segment_plans(manual_restart_env_ids)
 
     # Called every step in the IsaacLab main loop.
     def _update_command(self):

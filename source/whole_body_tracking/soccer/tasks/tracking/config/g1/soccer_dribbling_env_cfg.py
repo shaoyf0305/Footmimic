@@ -729,27 +729,6 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     cfg.rewards.dribbling_ball_forward_progress.func = mdp.dribbling_command_ball_progress_reward
     cfg.rewards.dribbling_ball_trapped_penalty.func = mdp.dribbling_command_ball_trapped_penalty
     cfg.rewards.dribbling_chase_ball.func = mdp.dribbling_command_chase_ball_reward
-    # Once the ball leaves the stable-coast lateral corridor, forward-only
-    # chasing amplifies the escape.  Stop that signal and reward the velocity
-    # component that genuinely closes the command-frame lateral error instead.
-    cfg.rewards.dribbling_chase_ball.params["max_lateral_offset"] = 0.22
-    cfg.rewards.dribbling_lateral_recovery = RewTerm(
-        func=mdp.dribbling_command_lateral_recovery_reward,
-        weight=1.5,
-        params={
-            "command_name": "motion",
-            "ball_sensor_name": "soccer_ball_contact",
-            "contact_force_threshold": 1.0,
-            "lateral_start": 0.16,
-            "lateral_full": 0.40,
-            "min_forward_offset": 0.10,
-            "max_recovery_xy_dist": 0.90,
-            "min_closing_speed": 0.05,
-            "closing_speed_scale": 0.30,
-            "min_diverging_speed": 0.03,
-            "divergence_penalty_scale": 0.35,
-        },
-    )
     cfg.rewards.dribbling_face_ball.func = mdp.dribbling_command_face_ball
     cfg.rewards.dribbling_ball_forward_progress.params.update(
         {
@@ -771,35 +750,6 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
         cfg.rewards.dribbling_cg_premature_contact.weight = 0.0
     if hasattr(cfg.rewards, "dribbling_cg_foot_consistency"):
         cfg.rewards.dribbling_cg_foot_consistency.weight = 0.5
-
-    # A ball that is centred in the command-frame corridor and already matches
-    # the commanded/pelvis forward speed should be allowed to roll.  Previously
-    # its forward-progress reward expired after ten no-contact steps while the
-    # no-contact timeout kept advancing, yet rapid-retouch penalised the very
-    # correction that those terms forced.  Use one shared coast predicate so
-    # contact is required only after the ball slows, drifts, or escapes.
-    stable_coast_params = {
-        "coast_min_command_speed": 0.35,
-        "coast_min_ball_speed_ratio": 0.70,
-        "coast_min_pelvis_speed_ratio": 0.70,
-        "coast_max_forward_speed_error": 0.25,
-        "coast_min_forward_offset": 0.22,
-        "coast_max_forward_offset": 0.75,
-        "coast_max_lateral_offset": 0.22,
-    }
-    cfg.rewards.dribbling_ball_forward_progress.params.update(
-        {"allow_stable_coast_without_contact": True, **stable_coast_params}
-    )
-    cfg.rewards.dribbling_legal_foot_touch.params.update(
-        {"suppress_when_stable_coast": True, **stable_coast_params}
-    )
-    cfg.rewards.dribbling_rapid_retouch_penalty.params.update(
-        {"penalize_only_when_stable_coast": True, **stable_coast_params}
-    )
-    if hasattr(cfg.rewards, "dribbling_cg_contact_consistency"):
-        cfg.rewards.dribbling_cg_contact_consistency.params.update(
-            {"ignore_stable_coast": True, **stable_coast_params}
-        )
 
     # During a labeled touch, retain only the opposite (support) ankle's roll
     # style.  The touching ankle remains unrestricted, so this small cosmetic
@@ -824,10 +774,16 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
             "recovery_max_distance": 0.85,
             "recovery_min_closing_speed": 0.05,
             "recovery_counter_increment": 0.25,
-            "allow_stable_coast": True,
-            "stable_coast_counter_decrement": 1.0,
-            **stable_coast_params,
         }
+    )
+
+    # Playback-only opt-in: ``--locomotion_cmd_reset_on_end`` sets a flag on a
+    # manual polar sequence.  Consume it in ordinary control too, so the final
+    # segment resets the robot, ball, and sequence back to segment zero.
+    # Resampled training commands never set this flag, so training is inert.
+    cfg.terminations.locomotion_manual_sequence_end = DoneTerm(
+        func=mdp.locomotion_manual_sequence_finished,
+        params={"command_name": "motion"},
     )
 
     # Do not pull linear/angular vel from demo bodies — velocity comes from the command only.
@@ -982,27 +938,6 @@ def _apply_dribbling_full_control_velocity_terms(cfg) -> None:
     cfg.rewards.dribbling_ball_forward_progress.func = mdp.dribbling_command_ball_progress_reward
     cfg.rewards.dribbling_ball_trapped_penalty.func = mdp.dribbling_command_ball_trapped_penalty
     cfg.rewards.dribbling_chase_ball.func = mdp.dribbling_command_chase_ball_reward
-    # Once the ball leaves the stable-coast lateral corridor, forward-only
-    # chasing amplifies the escape.  Stop that signal and reward the velocity
-    # component that genuinely closes the command-frame lateral error instead.
-    cfg.rewards.dribbling_chase_ball.params["max_lateral_offset"] = 0.22
-    cfg.rewards.dribbling_lateral_recovery = RewTerm(
-        func=mdp.dribbling_command_lateral_recovery_reward,
-        weight=1.5,
-        params={
-            "command_name": "motion",
-            "ball_sensor_name": "soccer_ball_contact",
-            "contact_force_threshold": 1.0,
-            "lateral_start": 0.16,
-            "lateral_full": 0.40,
-            "min_forward_offset": 0.10,
-            "max_recovery_xy_dist": 0.90,
-            "min_closing_speed": 0.05,
-            "closing_speed_scale": 0.30,
-            "min_diverging_speed": 0.03,
-            "divergence_penalty_scale": 0.35,
-        },
-    )
     cfg.rewards.dribbling_idle_stand = RewTerm(
         func=mdp.dribbling_idle_stand_reward,
         weight=2.5,
@@ -1063,43 +998,6 @@ def _apply_dribbling_full_control_velocity_terms(cfg) -> None:
     if hasattr(cfg.rewards, "dribbling_cg_foot_consistency"):
         cfg.rewards.dribbling_cg_foot_consistency.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
 
-    # A ball that is centred in the command-frame corridor and already matches
-    # the commanded/pelvis forward speed should be allowed to roll.  Previously
-    # its forward-progress reward expired after ten no-contact steps while the
-    # no-contact timeout kept advancing, yet rapid-retouch penalised the very
-    # correction that those terms forced.  Use one shared coast predicate so
-    # contact is required only after the ball slows, drifts, or escapes.
-    stable_coast_params = {
-        "coast_min_command_speed": 0.35,
-        "coast_min_ball_speed_ratio": 0.70,
-        "coast_min_pelvis_speed_ratio": 0.70,
-        "coast_max_forward_speed_error": 0.25,
-        "coast_min_forward_offset": 0.22,
-        "coast_max_forward_offset": 0.75,
-        "coast_max_lateral_offset": 0.22,
-    }
-    cfg.rewards.dribbling_ball_forward_progress.params.update(
-        {"allow_stable_coast_without_contact": True, **stable_coast_params}
-    )
-    cfg.rewards.dribbling_legal_foot_touch.params.update(
-        {"suppress_when_stable_coast": True, **stable_coast_params}
-    )
-    cfg.rewards.dribbling_rapid_retouch_penalty.params.update(
-        {"penalize_only_when_stable_coast": True, **stable_coast_params}
-    )
-    if hasattr(cfg.rewards, "dribbling_cg_contact_consistency"):
-        cfg.rewards.dribbling_cg_contact_consistency.params.update(
-            {"ignore_stable_coast": True, **stable_coast_params}
-        )
-    # The CG foot--ball distance target is useful while recovering or
-    # re-touching, but it otherwise pulls a foot toward a ball that is already
-    # rolling safely.  Suppress just this proximity imitation during coast;
-    # no new hover penalty is introduced.
-    if hasattr(cfg.rewards, "dribbling_cg_foot_ball_distance"):
-        cfg.rewards.dribbling_cg_foot_ball_distance.params.update(
-            {"suppress_when_stable_coast": True, **stable_coast_params}
-        )
-
     # During a labeled touch, retain only the opposite (support) ankle's roll
     # style.  The touching ankle remains unrestricted, so this small cosmetic
     # correction cannot trade away reachability or ball-control recovery.
@@ -1129,12 +1027,9 @@ def _apply_dribbling_full_control_velocity_terms(cfg) -> None:
             "recovery_max_distance": 0.85,
             "recovery_min_closing_speed": 0.05,
             "recovery_counter_increment": 0.25,
-            "allow_stable_coast": True,
-            "stable_coast_counter_decrement": 1.0,
             # A stationary wait or a deliberate settle must not accrue the
             # running-only no-contact failure counter.
             "active_task_states": (mdp.TASK_STATE_DRIBBLE,),
-            **stable_coast_params,
         }
     )
     # Completing a stable STOP is a success terminal, not an indefinitely
@@ -1185,7 +1080,6 @@ def _apply_dribbling_full_control_velocity_terms(cfg) -> None:
         "dribbling_cg_contact_consistency",
         "dribbling_cg_premature_contact",
         "dribbling_cg_foot_consistency",
-        "dribbling_lateral_recovery",
         "dribbling_support_ankle_roll",
     )
     for reward_name in dribble_only_reward_names:
