@@ -4,6 +4,7 @@ Read this before changing control-related code. Follow the constraints below.
 
 ## Task IDs
 
+- Tracking-CG-G1-Motion-RNN-original: exact released PAiD Stage-1 recipe (rough terrain, adaptive motion-phase sampling, torso anchor, original 160-D Cartesian observation layout; logs under `g1_flat`).
 - Tracking-CG-G1-Motion-RNN-strict: Stage-1 raw-reference full-body tracking. It preserves the demo root path/yaw and has no reset or domain randomization.
 - Tracking-CG-G1-Motion-RNN-mimic: Stage-1 motion style from demo. Preferred warm-start for control.
 - Tracking-CG-G1-Motion-RNN-task: Stage-1 with fixed +X / anti-lateral terms. Do not use as control warm-start.

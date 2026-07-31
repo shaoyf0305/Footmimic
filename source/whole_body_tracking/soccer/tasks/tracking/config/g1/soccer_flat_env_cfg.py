@@ -167,6 +167,32 @@ class G1TerrainMotionEnvCfg(G1TerrainEnvCfg):
         _apply_soccer_scene(self)
 
 
+@configclass
+class G1PAiDOriginalStage1EnvCfg(G1TerrainMotionEnvCfg):
+    """Released PAiD Stage-I motion-skill acquisition environment.
+
+    This deliberately retains the original 160-D actor / 292-D critic layout:
+    Cartesian ball and goal observations are present, but no later CG polar
+    observation is appended.  It also keeps torso anchoring, yaw-only reference
+    alignment, motion-phase adaptive sampling, rough terrain, reset noise, and
+    the original domain randomization and full-body tracking objective.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Freeze the PAiD Stage-I command semantics instead of inheriting newer
+        # flat/task-frame pretrain defaults.
+        self.commands.motion.anchor_body_name = "torso_link"
+        self.commands.motion.mimic_align_task_frame = False
+        self.commands.motion.mimic_align_locomotion_heading = False
+        self.commands.motion.motion_clip_end_resample = True
+        self.commands.motion.sampling_strategy = "adaptive"
+        self.commands.motion.soccer_ball_spawn_mode = "paid_original"
+        self.commands.motion.reset_face_task_forward = False
+        self.commands.motion.reset_zero_velocity = False
+
+
 # Stage-1 body groups: legs/torso vs arms (upper-body ori is de-emphasised under task-frame slalom).
 _STAGE1_LOCOMOTION_BODY_NAMES = [
     "pelvis",

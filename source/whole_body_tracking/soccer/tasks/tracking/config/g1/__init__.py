@@ -74,6 +74,20 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatRecurrentPPORunnerCfg",
     },
 )
+
+# Exact PAiD paper/released-code Stage I.  Despite living beside the newer CG
+# pretrains, it intentionally keeps the original Cartesian 160-D observation
+# layout and logs under g1_flat through G1FlatRecurrentPPORunnerCfg.
+gym.register(
+    id="Tracking-CG-G1-Motion-RNN-original",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": soccer_flat_env_cfg.G1PAiDOriginalStage1EnvCfg,
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1FlatRecurrentPPORunnerCfg",
+    },
+)
+
 # Flat
 gym.register(
     id="Tracking-Flat-G1-Motion-RNN-v0",

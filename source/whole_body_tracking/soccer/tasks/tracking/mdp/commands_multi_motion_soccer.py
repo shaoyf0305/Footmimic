@@ -523,6 +523,11 @@ class MotionCommand(CommandTerm):
         self._target_lateral_spawn_jitter = float(
             curve_cfg.get("lateral_spawn_jitter", curve_cfg.get("lateral_spawn_max", 0.12))
         )
+        # PAiD Stage I perturbs the motion-consistent terminal ball direction
+        # by a small arc.  Newer +X spawn modes do not consume this value, but
+        # initialize it unconditionally before the constructor's first ball
+        # placement so the original path is safe during environment creation.
+        self._target_arc_angle = float(curve_cfg.get("arc_angle", math.pi / 18.0))
         self._target_height = float(curve_cfg.get("height", 0.11))
         marker_cfg = cfg.target_point_marker_cfg
         self.target_point_marker = VisualizationMarkers(marker_cfg) if marker_cfg is not None else None
@@ -1418,6 +1423,50 @@ class MotionCommand(CommandTerm):
                 ball_pos[1] = ball_pos[1] + y_off
             self.soccer_ball_pos[env_id] = ball_pos
 
+    def _spawn_ball_at_paid_original_location(self, env_ids: torch.Tensor) -> None:
+        """Reproduce PAiD Stage-I's motion-consistent fixed ball placement.
+
+        The released PAiD command placed the ball at the frame-0 anchor plus
+        the clip's complete planar anchor displacement.  Its direction was
+        optionally perturbed by ``arc_angle``; ``radius`` supplied the radial
+        offset.  Keep this path isolated from the newer task-+X spawn recipes
+        so ``Tracking-CG-G1-Motion-RNN-original`` remains reproducible.
+        """
+        arc_limit = float(self._target_arc_angle)
+        base_height = float(self._target_height)
+
+        for env_id in env_ids:
+            motion_idx = int(self.motion_idx[env_id].item())
+            motion_len = max(1, int(self.motion_length[env_id].item()))
+
+            first_anchor = self.motion.get_first_frame_anchor_pos(motion_idx, self.motion_anchor_body_index)
+            last_anchor = self.motion.get_last_frame_anchor_pos(
+                motion_idx, self.motion_anchor_body_index, motion_len
+            )
+
+            radius_vec = last_anchor[:2] - first_anchor[:2]
+            radius_sq = torch.dot(radius_vec, radius_vec)
+            if float(radius_sq) > 1e-12:
+                radius = torch.sqrt(radius_sq)
+                base_direction = radius_vec / radius
+            else:
+                radius = torch.tensor(0.0, device=self.device)
+                base_direction = torch.tensor([1.0, 0.0], device=self.device)
+
+            if arc_limit > 0.0 and float(radius_sq) > 1e-12:
+                base_angle = torch.atan2(radius_vec[1], radius_vec[0])
+                angle_offset = sample_uniform(-arc_limit, arc_limit, (1,), device=self.device).squeeze(0)
+                new_angle = base_angle + angle_offset
+                direction = torch.stack((torch.cos(new_angle), torch.sin(new_angle)))
+            else:
+                direction = base_direction
+
+            radius = torch.clamp(radius + self.curve_radius_offset[env_id], min=0.0)
+            ball_pos = self.soccer_ball_pos.new_empty(3)
+            ball_pos[:2] = first_anchor[:2] + radius * direction
+            ball_pos[2] = base_height
+            self.soccer_ball_pos[env_id] = ball_pos
+
     def _compute_soccer_ball_positions(self, env_ids: Sequence[int] | torch.Tensor):
         if isinstance(env_ids, torch.Tensor):
             ids = env_ids.to(self.device, dtype=torch.long)
@@ -1430,6 +1479,9 @@ class MotionCommand(CommandTerm):
         spawn_mode = str(getattr(self.cfg, "soccer_ball_spawn_mode", "clip_displacement")).lower().strip()
         if spawn_mode in {"start", "start_ahead", "motion_start"}:
             self._spawn_ball_at_motion_start(ids)
+            return
+        if spawn_mode in {"paid_original", "original"}:
+            self._spawn_ball_at_paid_original_location(ids)
             return
 
         lateral_jitter = float(self._target_lateral_spawn_jitter)
@@ -1823,7 +1875,8 @@ class MotionCommandCfg(CommandTermCfg):
     }
 
     # Soccer ball spawn on motion resample (Stage-1 motion pretrain).
-    # ``clip_displacement`` (legacy): frame-0 anchor + ||last-first|| along +X (often ≈ clip end).
+    # ``paid_original``: released PAiD Stage-I placement along the clip's planar displacement.
+    # ``clip_displacement`` (legacy dribble): frame-0 anchor + ||last-first|| along +X.
     # ``start_ahead``: fixed distance along +X from frame-0 anchor.
     soccer_ball_spawn_mode: str = "clip_displacement"
     soccer_ball_start_ahead_distance: float = 0.45
