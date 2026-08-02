@@ -6,7 +6,7 @@ into a filtered directory for re-training.
 
 Example (dribbling stage-2, dribble-distance references):
   python scripts/rsl_rl/eval_references.py \\
-    --task Tracking-CG-G1-Dribbling-RNN-v0 \\
+    --task Tracking-CG-G1-Dribbling-RNN-unified-control \\
     --experiment_name g1_dribbling \\
     --motion_path motions/dribble-distance \\
     --load_run 2026-06-09_03-45-57_resumed_dribble \\
@@ -40,7 +40,12 @@ from isaaclab.app import AppLauncher
 import cli_args  # isort: skip
 
 parser = argparse.ArgumentParser(description="Evaluate per-reference motion learning quality.")
-parser.add_argument("--task", type=str, required=True, help="Gym task id, e.g. Tracking-CG-G1-Dribbling-RNN-v0.")
+parser.add_argument(
+    "--task",
+    type=str,
+    required=True,
+    help="Gym task id, e.g. Tracking-CG-G1-Dribbling-RNN-unified-control.",
+)
 parser.add_argument(
     "--motion_path",
     type=str,

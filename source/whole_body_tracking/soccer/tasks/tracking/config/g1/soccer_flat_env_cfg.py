@@ -16,14 +16,6 @@ from soccer.tasks.tracking import mdp
 from soccer.tasks.tracking.tracking_env_cfg import TrackingEnvCfg, MySceneCfg, CurriculumCfg
 from .flat_env_cfg import G1FlatEnvCfg
 
-from isaaclab.terrains import TerrainImporterCfg
-from isaaclab.terrains import TerrainGeneratorCfg
-
-import isaaclab.terrains as terrain_gen
-from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
-
-from isaaclab.managers import TerminationTermCfg as DoneTerm
-
 SOCCER_BALL_RADIUS = 0.11
 
 SOCCER_ASSET_PATH = f"{ASSET_DIR}/soccer/soccer.usda"
@@ -103,95 +95,6 @@ class G1FlatSoccerSceneCfg(MySceneCfg):
     
 
 ## Environment configuration
-
-@configclass
-class G1TerrainEnvCfg(G1FlatEnvCfg):
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.commands.motion.class_type = mdp.commands_multi_motion_soccer.MotionCommand
-        self.terminations.anchor_pos_z = DoneTerm(
-            func=mdp.bad_anchor_pos_z_only,
-            params={"command_name": "motion", "threshold": 0.25},  # Slightly larger threshold for robustness.
-        )
-        self.terminations.anchor_ori = DoneTerm(
-            func=mdp.bad_anchor_ori,
-            params={"asset_cfg": SceneEntityCfg("robot"), "command_name": "motion", "threshold": 0.8},
-        )
-        self.terminations.ee_body_pos = DoneTerm(
-            func=mdp.bad_motion_body_pos_z_only,
-            params={
-                "command_name": "motion",
-                "threshold": 0.25, # 0.75, # 0.25,
-                "body_names": [
-                    "left_ankle_roll_link",
-                    "right_ankle_roll_link",
-                    "left_wrist_yaw_link",
-                    "right_wrist_yaw_link",
-                ],
-            },
-        )
-
-        GRAVEL_TERRAINS_CFG = TerrainGeneratorCfg(
-            curriculum=False,
-            size=(8.0, 8.0),
-            border_width=20.0,
-            num_rows=10,
-            num_cols=20,
-            horizontal_scale=0.1,
-            vertical_scale=0.005,
-            slope_threshold=0.75,
-            use_cache=False,
-            sub_terrains={
-                "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
-                    proportion=1., noise_range=(-0.02, 0.02), noise_step=0.02, border_width=0.0
-                )
-            },
-        )
-
-        # ground terrain
-        self.scene.terrain = TerrainImporterCfg(
-            prim_path="/World/ground",
-            terrain_type="generator",
-            terrain_generator=GRAVEL_TERRAINS_CFG
-        )
-
-
-@configclass
-class G1TerrainMotionEnvCfg(G1TerrainEnvCfg):
-    scene: G1FlatSoccerSceneCfg = G1FlatSoccerSceneCfg(num_envs=4096, env_spacing=2.5)
-    def __post_init__(self):
-        super().__post_init__()
-        self.commands.motion.sampling_strategy = "adaptive"
-        _apply_soccer_obs(self)
-        _apply_soccer_scene(self)
-
-
-@configclass
-class G1PAiDOriginalStage1EnvCfg(G1TerrainMotionEnvCfg):
-    """Released PAiD Stage-I motion-skill acquisition environment.
-
-    This deliberately retains the original 160-D actor / 292-D critic layout:
-    Cartesian ball and goal observations are present, but no later CG polar
-    observation is appended.  It also keeps torso anchoring, yaw-only reference
-    alignment, motion-phase adaptive sampling, rough terrain, reset noise, and
-    the original domain randomization and full-body tracking objective.
-    """
-
-    def __post_init__(self):
-        super().__post_init__()
-
-        # Freeze the PAiD Stage-I command semantics instead of inheriting newer
-        # flat/task-frame pretrain defaults.
-        self.commands.motion.anchor_body_name = "torso_link"
-        self.commands.motion.mimic_align_task_frame = False
-        self.commands.motion.mimic_align_locomotion_heading = False
-        self.commands.motion.motion_clip_end_resample = True
-        self.commands.motion.sampling_strategy = "adaptive"
-        self.commands.motion.soccer_ball_spawn_mode = "paid_original"
-        self.commands.motion.reset_face_task_forward = False
-        self.commands.motion.reset_zero_velocity = False
-
 
 # Stage-1 body groups: legs/torso vs arms (upper-body ori is de-emphasised under task-frame slalom).
 _STAGE1_LOCOMOTION_BODY_NAMES = [
@@ -363,84 +266,6 @@ def _apply_stage1_mimic_pretrain(cfg) -> None:
         cfg.terminations.anchor_pos_z.params["threshold"] = 0.32
 
 
-# Upper-body mimic set used by the task-frame Stage-1 variant (v2 CG pretrain style).
-_STAGE1_TASK_UPPER_BODY_NAMES = [
-    "pelvis",
-    "torso_link",
-    "left_shoulder_roll_link",
-    "left_elbow_link",
-    "left_wrist_yaw_link",
-    "right_shoulder_roll_link",
-    "right_elbow_link",
-    "right_wrist_yaw_link",
-]
-
-
-def _apply_stage1_task_pretrain(cfg) -> None:
-    """Stage-1 pretrain with task +X velocity / heading (legacy v2 CG style).
-
-    Keeps default full-body ``motion_body_pos`` from :class:`TrackingEnvCfg`, restricts
-    orientation mimic to the upper body, and adds forward-speed / anti-lateral task terms
-    instead of layered leg-vs-arm mimic splits.
-    """
-    cfg.commands.motion.anchor_body_name = "pelvis"
-    cfg.commands.motion.mimic_align_task_frame = True
-
-    if hasattr(cfg.rewards, "motion_global_anchor_pos"):
-        cfg.rewards.motion_global_anchor_pos.weight = 0.0
-    if hasattr(cfg.rewards, "motion_global_anchor_ori"):
-        cfg.rewards.motion_global_anchor_ori.weight = 0.0
-
-    if hasattr(cfg.rewards, "motion_body_ori"):
-        cfg.rewards.motion_body_ori.params["body_names"] = _STAGE1_TASK_UPPER_BODY_NAMES
-
-    cfg.rewards.motion_body_lin_vel = RewTerm(
-        func=mdp.motion_relative_body_linear_velocity_error_exp,
-        weight=0.3,
-        params={
-            "command_name": "motion",
-            "std": 1.0,
-            "body_names": _STAGE1_TASK_UPPER_BODY_NAMES,
-        },
-    )
-    cfg.rewards.motion_body_ang_vel = RewTerm(
-        func=mdp.motion_relative_body_angular_velocity_error_exp,
-        weight=0.3,
-        params={
-            "command_name": "motion",
-            "std": 3.14,
-            "body_names": _STAGE1_TASK_UPPER_BODY_NAMES,
-        },
-    )
-
-    cfg.rewards.forward_velocity = RewTerm(
-        func=mdp.forward_velocity_reward,
-        weight=3.0,
-        params={
-            "command_name": "motion",
-            "target_speed": 0.8,
-            "std": 0.4,
-            "velocity_frame": "world",
-            "min_forward_dominance": 0.55,
-        },
-    )
-    cfg.rewards.lateral_velocity_penalty = RewTerm(
-        func=mdp.lateral_velocity_penalty,
-        weight=-0.8,
-        params={
-            "command_name": "motion",
-            "velocity_frame": "world",
-            "lateral_deadzone": 0.06,
-            "lateral_scale": 0.28,
-        },
-    )
-    cfg.rewards.task_heading_alignment = RewTerm(
-        func=mdp.task_heading_alignment_reward,
-        weight=1.5,
-        params={"command_name": "motion"},
-    )
-
-
 @configclass
 class G1FlatMotionEnvCfg(G1FlatEnvCfg):
     scene: G1FlatSoccerSceneCfg = G1FlatSoccerSceneCfg(num_envs=4096, env_spacing=2.5)
@@ -487,19 +312,6 @@ class G1FlatMotionStrictPretrainEnvCfg(G1FlatMotionEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         _apply_stage1_strict_mimic_pretrain(self)
-
-
-@configclass
-class G1FlatMotionTaskPretrainEnvCfg(G1FlatMotionEnvCfg):
-    """Stage-1 flat motion pretrain with task +X velocity / heading (``*-Motion-RNN-task``).
-
-    Sibling of :class:`G1FlatMotionPretrainEnvCfg`: same scene/commands, but uses
-    :func:`_apply_stage1_task_pretrain` instead of layered mimic-only rewards.
-    """
-
-    def __post_init__(self):
-        super().__post_init__()
-        _apply_stage1_task_pretrain(self)
 
 
 @configclass
@@ -653,6 +465,8 @@ class G1FlatProximityEnvCfg(G1FlatMotionEnvCfg):
 
 @configclass
 class G1FlatKickEnvCfg(G1FlatProximityEnvCfg):
+    """Minimal retained kick environment without kick-specific objectives."""
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -667,131 +481,3 @@ class G1FlatKickEnvCfg(G1FlatProximityEnvCfg):
         #         "ball_sensor_name": "soccer_ball_contact",
         #     },
         # )
-
-        self.rewards.target_point_contact = RewTerm(
-            func=mdp.target_point_contact,
-            weight=50.0,
-            params={
-                "command_name": "motion",
-                "ball_sensor_name": "soccer_ball_contact",
-                "horizontal_force_threshold": 10,
-                "foot_cfg": self.foot_cfg,
-            },
-        )
-
-        self.rewards.sideways_kick = RewTerm(
-            func=mdp.sideways_kick,
-            weight=50.0,
-            params={
-                "command_name": "motion",
-                "ball_sensor_name": "soccer_ball_contact",
-                "horizontal_force_threshold": 10,
-                "foot_cfg": self.foot_cfg,
-            },
-        )
-
-        
-        self.rewards.ball_velocity_direction_alignment = RewTerm(
-            func=mdp.ball_velocity_direction_alignment,
-            weight=30.0,
-            params={
-                "command_name": "motion",
-                "std": 0.8,
-                "velocity_threshold": 0.5,
-                "ball_sensor_name": "soccer_ball_contact",
-                "horizontal_force_threshold": 10,
-                "foot_cfg": self.foot_cfg,
-            },
-        )
-
-        self.rewards.ball_speed_reward = RewTerm(
-            func=mdp.ball_speed_reward,
-            weight=10.0,
-            params={
-                "command_name": "motion",
-                # "target_speed": 4.0,
-                "std": 1.2,
-                "velocity_threshold": 0.5,
-                "ball_sensor_name": "soccer_ball_contact",
-                "horizontal_force_threshold": 10,
-                "foot_cfg": self.foot_cfg,
-            },
-        )
-
-        self.rewards.ball_z_speed_penalty_reward = RewTerm(
-            func=mdp.ball_z_speed_penalty_reward,
-            weight=-0.0,
-            params={
-                "command_name": "motion",
-                "std": 3,
-                "velocity_threshold": 0.5,
-            },
-        )
-
-@configclass
-class G1FlatKickMovingEnvCfg(G1FlatKickEnvCfg):
-    def __post_init__(self):
-        super().__post_init__()
-        # Initial soccer-ball linear velocity configuration.
-        self.commands.motion.enable_soccer_ball_init_vel = True  # Enable sampling of initial ball velocity.
-        self.commands.motion.soccer_ball_init_lin_vel_range = {
-            "x": (-0.3, 0.3),
-            "y": (-0.3, 0.3),
-            "z": (0.0, 0.0),
-        }
-
-
-@configclass
-class G1FlatSoccerBlindEnvCfg(G1FlatKickEnvCfg):
-    def __post_init__(self):
-        super().__post_init__()
-        
-        # Custom blind-zone range: the ball is invisible when (x, y) distance is outside [min, max].
-        self.commands.motion.blind_distance_min_range = (0.2, 0.8)  # Minimum distance sampling range.
-        self.commands.motion.blind_distance_max_range = (1.8, 2.5)  # Maximum distance sampling range.
-        
-        self.observations.policy.target_point_pos = ObsTerm(
-            func=mdp.blind_zone_target_point_pos,
-            params={"command_name": "motion"},
-        )
-
-        self.observations.critic.target_point_pos = ObsTerm(
-            func=mdp.blind_zone_target_point_pos,
-            params={"command_name": "motion"},
-        )
-
-
-@configclass
-class G1FlatSuperSoccerEnvCfg(G1FlatKickEnvCfg):
-    def __post_init__(self):
-        super().__post_init__()
-
-        self.observations.policy.motion_anchor_pos_b = ObsTerm(func=mdp.motion_anchor_pos_b, params={"command_name": "motion"})
-        self.observations.policy.motion_anchor_ori_b = ObsTerm(func=mdp.motion_anchor_ori_b, params={"command_name": "motion"})
-        self.observations.policy.body_pos = ObsTerm(func=mdp.robot_body_pos_b, params={"command_name": "motion"})
-        self.observations.policy.body_ori = ObsTerm(func=mdp.robot_body_ori_b, params={"command_name": "motion"})
-        self.observations.policy.base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
-
-
-        self.observations.critic.projected_gravity = ObsTerm(func=mdp.projected_gravity)
-        self.observations.critic.motion_ref_ang_vel = ObsTerm(func=mdp.motion_anchor_ang_vel, params={"command_name": "motion"})
-
-
-
-
-@configclass
-class G1FlatSoccerStudentEnvCfg(G1FlatKickEnvCfg):
-
-    def __post_init__(self):
-        super().__post_init__()
-        student_obs = self.observations.policy.copy()
-        student_obs.target_point_pos = ObsTerm(
-            func=mdp.target_point_pos_first_frame,
-            params={"command_name": "motion"},
-        )
-        self.observations.StudentPolicyCfg = student_obs
-
-        student_obs.target_destination_pos_local = ObsTerm(
-            func=mdp.target_destination_pos_local_first_frame,
-            params={"command_name": "motion"},
-        )

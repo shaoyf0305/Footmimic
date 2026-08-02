@@ -26,6 +26,15 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
     and the term decodes them around the current motion reference.  This removes
     the redundant upper-body action null space that otherwise lets raw actions
     grow without changing the executed pose.
+
+    The executed-target contract is deliberately linear and visible through
+    public diagnostic tensors:
+
+    ``policy action`` -> parent action clip/scale/offset -> reference envelope
+    -> PCA projection -> soft joint limits -> low-pass filter ->
+    ``executed_joint_targets``.  The articulation actuator then converts this
+    one final joint target into PD effort and applies its own effort limits; no
+    second torque or target transform is performed by this action term.
     """
 
     cfg: UpperBodyManifoldJointPositionActionCfg
@@ -204,6 +213,8 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.manifold_reference_upper_target = torch.zeros_like(self._filtered_upper_target)
         self.manifold_constrained_upper_target = torch.zeros_like(self._filtered_upper_target)
         self.manifold_projected_upper_target = torch.zeros_like(self._filtered_upper_target)
+        self.manifold_joint_limited_upper_target = torch.zeros_like(self._filtered_upper_target)
+        self.manifold_executed_upper_target = torch.zeros_like(self._filtered_upper_target)
         self.manifold_latent = torch.zeros_like(self._filtered_latent)
         self.manifold_projection_error = torch.zeros(self.num_envs, device=self.device)
         self.manifold_projection_error_after_reference_constraint = torch.zeros(
@@ -216,6 +227,8 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.manifold_latent_clip_fraction = torch.zeros(self.num_envs, device=self.device)
         self.manifold_reference_overflow = torch.zeros_like(self._filtered_upper_target)
         self.manifold_reference_clamp_fraction = torch.zeros(self.num_envs, device=self.device)
+        self.manifold_joint_limit_clamp_fraction = torch.zeros(self.num_envs, device=self.device)
+        self.manifold_filter_lag = torch.zeros(self.num_envs, device=self.device)
         self.manifold_policy_latent = torch.zeros(self.num_envs, rank, device=self.device)
         self.trunk_pitch_raw_target = torch.full((self.num_envs,), torch.nan, device=self.device)
         self.trunk_pitch_reference_target = torch.full((self.num_envs,), torch.nan, device=self.device)
@@ -228,6 +241,11 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.trunk_pitch_active_cutoff_frequency_hz = torch.full((self.num_envs,), torch.nan, device=self.device)
         self.effective_raw_actions = torch.zeros_like(self.raw_actions)
         self.prev_effective_raw_actions = torch.zeros_like(self.raw_actions)
+        # Full joint-space target immediately after the parent action transform,
+        # and the exact target submitted to the articulation after all custom
+        # transforms. These are diagnostics, not additional control paths.
+        self.requested_joint_targets = torch.zeros_like(self._processed_actions)
+        self.executed_joint_targets = torch.zeros_like(self._processed_actions)
 
     def _fit_manifold_from_motion_bank(self) -> None:
         """Fit PCA from all valid motion frames without consulting the active phase."""
@@ -373,6 +391,7 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
                 actions[:, self._upper_action_ids], min=-limit, max=limit
             )
         super().process_actions(actions)
+        self.requested_joint_targets[:] = self._processed_actions
         if self._manifold_mean is None:
             self._fit_manifold_from_motion_bank()
 
@@ -429,6 +448,8 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         if self._use_direct_upper_body_latent:
             filtered_target = torch.clamp(constrained_target, min=soft_limits[..., 0], max=soft_limits[..., 1])
             nullspace_residual = torch.zeros(self.num_envs, device=self.device)
+            projected_target = constrained_target
+            joint_limited_target = filtered_target
         else:
             centered = constrained_target - self._manifold_mean
             raw_latent = centered @ self._manifold_basis
@@ -442,8 +463,10 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             nullspace_residual = torch.mean(torch.abs(orthogonal), dim=1)
             residual_limit = float(self.cfg.orthogonal_residual_limit)
             bounded_orthogonal = residual_limit * torch.tanh(orthogonal / max(residual_limit, 1.0e-6))
-            projected = self._manifold_mean + parallel + bounded_orthogonal
-            projected = torch.clamp(projected, min=soft_limits[..., 0], max=soft_limits[..., 1])
+            projected_target = self._manifold_mean + parallel + bounded_orthogonal
+            joint_limited_target = torch.clamp(
+                projected_target, min=soft_limits[..., 0], max=soft_limits[..., 1]
+            )
             alpha = 1.0 - math.exp(-2.0 * math.pi * float(self.cfg.cutoff_frequency_hz) * step_dt)
             alpha = min(max(alpha, 0.0), 1.0)
             initialized = self._filter_initialized[:, None]
@@ -457,7 +480,7 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
                 self._filtered_upper_target,
                 self._asset.data.joint_pos[:, self._upper_robot_ids],
             )
-            filtered_target = previous_target + alpha * (projected - previous_target)
+            filtered_target = previous_target + alpha * (joint_limited_target - previous_target)
             filtered_target = torch.clamp(filtered_target, min=soft_limits[..., 0], max=soft_limits[..., 1])
             self._filtered_latent[:] = filtered_latent
             self._filter_initialized[:] = True
@@ -656,16 +679,23 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.manifold_raw_upper_target[:] = upper_raw_target
         self.manifold_reference_upper_target[:] = reference_target
         self.manifold_constrained_upper_target[:] = constrained_target
-        self.manifold_projected_upper_target[:] = filtered_target
+        self.manifold_projected_upper_target[:] = projected_target
+        self.manifold_joint_limited_upper_target[:] = joint_limited_target
+        self.manifold_executed_upper_target[:] = filtered_target
         self.manifold_latent[:] = filtered_latent
-        self.manifold_projection_error[:] = torch.mean(torch.abs(filtered_target - upper_raw_target), dim=1)
+        self.manifold_projection_error[:] = torch.mean(torch.abs(projected_target - upper_raw_target), dim=1)
         self.manifold_projection_error_after_reference_constraint[:] = torch.mean(
-            torch.abs(filtered_target - constrained_target), dim=1
+            torch.abs(projected_target - constrained_target), dim=1
         )
         self.manifold_nullspace_residual[:] = nullspace_residual
         self.manifold_latent_clip_fraction[:] = clipped.float().mean(dim=1)
         self.manifold_reference_overflow[:] = reference_overflow
         self.manifold_reference_clamp_fraction[:] = (reference_overflow > 0.0).float().mean(dim=1)
+        self.manifold_joint_limit_clamp_fraction[:] = (
+            torch.abs(joint_limited_target - projected_target) > 1.0e-6
+        ).float().mean(dim=1)
+        self.manifold_filter_lag[:] = torch.mean(torch.abs(filtered_target - joint_limited_target), dim=1)
+        self.executed_joint_targets[:] = self._processed_actions
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         super().reset(env_ids)
@@ -687,8 +717,12 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.trunk_pitch_active_cutoff_frequency_hz[env_ids] = torch.nan
         self.manifold_policy_latent[env_ids] = 0.0
         self.manifold_nullspace_residual[env_ids] = 0.0
+        self.manifold_joint_limit_clamp_fraction[env_ids] = 0.0
+        self.manifold_filter_lag[env_ids] = 0.0
         self.effective_raw_actions[env_ids] = 0.0
         self.prev_effective_raw_actions[env_ids] = 0.0
+        self.requested_joint_targets[env_ids] = 0.0
+        self.executed_joint_targets[env_ids] = 0.0
 
 
 @configclass
@@ -701,6 +735,8 @@ class UpperBodyManifoldJointPositionActionCfg(JointPositionActionCfg):
     manifold_rank: int = 6
     latent_std_limit: float = 3.0
     min_latent_limit: float = 0.03
+    # Preserve the legacy bounded-residual default. The frozen unified control
+    # contract explicitly sets this to zero for a strict PCA projection.
     orthogonal_residual_limit: float = 0.10
     cutoff_frequency_hz: float = 1.8
     reference_target_margin: float | None = None

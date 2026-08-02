@@ -780,6 +780,8 @@ def _create_diagnostic(
         "manifold_reference_upper_target": [],
         "manifold_constrained_upper_target": [],
         "manifold_projected_upper_target": [],
+        "manifold_joint_limited_upper_target": [],
+        "manifold_executed_upper_target": [],
         "manifold_latent": [],
         "manifold_projection_error": [],
         "manifold_projection_error_after_reference_constraint": [],
@@ -787,6 +789,8 @@ def _create_diagnostic(
         "manifold_latent_clip_fraction": [],
         "manifold_reference_overflow": [],
         "manifold_reference_clamp_fraction": [],
+        "manifold_joint_limit_clamp_fraction": [],
+        "manifold_filter_lag": [],
         "trunk_pitch_raw_target": [],
         "trunk_pitch_reference_target": [],
         "trunk_pitch_soft_target": [],
@@ -995,6 +999,12 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
     diagnostic["manifold_projected_upper_target"].append(
         _env0("manifold_projected_upper_target", (upper_dim,))
     )
+    diagnostic["manifold_joint_limited_upper_target"].append(
+        _env0("manifold_joint_limited_upper_target", (upper_dim,))
+    )
+    diagnostic["manifold_executed_upper_target"].append(
+        _env0("manifold_executed_upper_target", (upper_dim,))
+    )
     diagnostic["manifold_latent"].append(_env0("manifold_latent", (0,)))
     diagnostic["manifold_projection_error"].append(
         float(_env0("manifold_projection_error", ()).item())
@@ -1013,6 +1023,12 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
     )
     diagnostic["manifold_reference_clamp_fraction"].append(
         float(_env0("manifold_reference_clamp_fraction", ()).item())
+    )
+    diagnostic["manifold_joint_limit_clamp_fraction"].append(
+        float(_env0("manifold_joint_limit_clamp_fraction", ()).item())
+    )
+    diagnostic["manifold_filter_lag"].append(
+        float(_env0("manifold_filter_lag", ()).item())
     )
     diagnostic["trunk_pitch_raw_target"].append(
         float(_env0("trunk_pitch_raw_target", ()).item())

@@ -10,9 +10,11 @@ interaction trajectory. Optional ``dribble_cg_snap_mode``:
 - ``non_contact_only``: only overwrite the ball when the CG label says
   non-contact, leaving physics during annotated contact segments.
 
-Contact / foot masks come from ``dribble_cg_contact`` / ``dribble_cg_foot`` in
-``.npz``, or from ``kick_frame`` / ``kick_end_frame`` / ``kick_leg`` fallback
-(see :class:`MultiMotionLoader`).
+Contact / foot / surface masks come from ``dribble_cg_contact``,
+``dribble_cg_foot``, and ``dribble_cg_surface`` in ``.npz``.  The legacy
+``kick_frame`` / ``kick_end_frame`` / ``kick_leg`` metadata remains a fallback
+for contact timing and foot side, but cannot describe an instep surface (see
+:class:`MultiMotionLoader`).
 """
 
 from __future__ import annotations
@@ -35,6 +37,85 @@ if TYPE_CHECKING:
 
 class DribbleCGMotionCommand(MotionCommand):
     """Soccer motion command + demo ball sync for dribbling CG."""
+
+    def __init__(self, cfg: DribbleCGMotionCommandCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._validate_fixed_touch_spec()
+
+    def _validate_fixed_touch_spec(self) -> None:
+        """Reject CG clips that conflict with a fixed foot and/or instep region.
+
+        A fixed-touch task cannot mix labels that describe another foot or a
+        different contact surface.  Failing during environment creation makes
+        the data-contract error explicit; callers must relabel or omit the
+        conflicting motion instead of silently changing the learned contact
+        graph.
+        """
+        configured_foot = getattr(self.cfg, "dribble_cg_fixed_touch_foot", None)
+        configured_surface = getattr(self.cfg, "dribble_cg_fixed_touch_surface", None)
+
+        foot_to_id = {"left": 0, "right": 1}
+        surface_to_id = {"inside_instep": 0, "outside_instep": 1}
+
+        foot_name: str | None = None
+        if configured_foot is not None:
+            foot_name = str(configured_foot).lower().strip()
+        if foot_name is not None and foot_name not in foot_to_id:
+            raise ValueError(
+                "dribble_cg_fixed_touch_foot must be 'left', 'right', or None; "
+                f"got {configured_foot!r}."
+            )
+
+        surface_name: str | None = None
+        if configured_surface is not None:
+            surface_name = str(configured_surface).lower().strip()
+        if surface_name is not None and surface_name not in surface_to_id:
+            raise ValueError(
+                "dribble_cg_fixed_touch_surface must be 'inside_instep', "
+                "'outside_instep', or None; "
+                f"got {configured_surface!r}."
+            )
+
+        if foot_name is None and surface_name is None:
+            return
+
+        expected_foot_id = foot_to_id[foot_name] if foot_name is not None else None
+        expected_surface_id = surface_to_id[surface_name] if surface_name is not None else None
+        violations: list[str] = []
+        for motion_idx, motion_name in enumerate(self.motion.motion_name):
+            contact = self.motion.dribble_cg_contact[motion_idx] > 0
+            contact_foot = self.motion.dribble_cg_foot[motion_idx]
+            contact_surface = self.motion.dribble_cg_surface[motion_idx]
+            distance_foot = self.motion.dribble_cg_dist_foot[motion_idx]
+            kick_leg_id = int(self.motion_kick_leg[motion_idx].item())
+            if expected_foot_id is not None:
+                unknown_contact_foot = contact & (contact_foot < 0)
+                wrong_contact_foot = contact & (contact_foot >= 0) & (contact_foot != expected_foot_id)
+                wrong_distance_foot = (distance_foot >= 0) & (distance_foot != expected_foot_id)
+                wrong_kick_leg = kick_leg_id >= 0 and kick_leg_id != expected_foot_id
+                if bool(torch.any(unknown_contact_foot)):
+                    violations.append(f"{motion_name}: contact frames without a foot label")
+                if bool(torch.any(wrong_contact_foot)):
+                    violations.append(f"{motion_name}: contact labels include the other foot")
+                if bool(torch.any(wrong_distance_foot)):
+                    violations.append(f"{motion_name}: distance labels include the other foot")
+                if wrong_kick_leg:
+                    violations.append(f"{motion_name}: kick_leg disagrees with fixed {foot_name} foot")
+
+            if expected_surface_id is not None:
+                unknown_contact_surface = contact & (contact_surface < 0)
+                wrong_contact_surface = contact & (contact_surface >= 0) & (
+                    contact_surface != expected_surface_id
+                )
+                if bool(torch.any(unknown_contact_surface)):
+                    violations.append(f"{motion_name}: contact frames without an instep-surface label")
+                if bool(torch.any(wrong_contact_surface)):
+                    violations.append(f"{motion_name}: contact labels include the other instep surface")
+        if violations:
+            configured = " ".join(part for part in (foot_name, surface_name) if part is not None)
+            raise ValueError(
+                f"Fixed {configured} CG task received incompatible motions: " + "; ".join(violations)
+            )
 
     def _use_demo_ball(self) -> bool:
         return bool(getattr(self.cfg, "dribble_cg_use_demo_ball", True))
@@ -182,3 +263,10 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     dribble_cg_front_ball_distance: float = 0.45
     dribble_cg_front_ball_lateral_offset: float = 0.0
     dribble_cg_front_ball_height: float = 0.11
+    # ``None`` preserves the historical mixed-foot CG behavior. Unified
+    # training sets this to one side and validates every motion at startup.
+    dribble_cg_fixed_touch_foot: str | None = None
+    # ``None`` preserves legacy foot-only labels.  A fixed inside/outside
+    # instep task requires ``dribble_cg_surface`` on every annotated contact
+    # frame and validates it at environment creation.
+    dribble_cg_fixed_touch_surface: str | None = None

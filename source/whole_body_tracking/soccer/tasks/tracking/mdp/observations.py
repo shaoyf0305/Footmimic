@@ -142,11 +142,15 @@ def motion_locomotion_polar_command(env: ManagerBasedEnv, command_name: str) -> 
     when ``locomotion_command_mode`` is ``resampled`` or ``manual``.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
-    if hasattr(command, "locomotion_cmd_speed") and hasattr(command, "locomotion_cmd_heading"):
+    if getattr(command, "locomotion_command_mode", "reference") in {"manual", "resampled"}:
         speed = command.locomotion_cmd_speed
         heading = command.locomotion_cmd_heading
     else:
-        lin = command.locomotion_lin_vel_command_w() if hasattr(command, "locomotion_lin_vel_command_w") else command.anchor_lin_vel_w
+        lin = (
+            command.locomotion_lin_vel_command_w()
+            if hasattr(command, "locomotion_lin_vel_command_w")
+            else command.anchor_lin_vel_w
+        )
         speed = torch.norm(lin[:, :2], dim=-1)
         heading = torch.atan2(lin[:, 1], lin[:, 0])
     return torch.stack([speed, torch.cos(heading), torch.sin(heading)], dim=-1)

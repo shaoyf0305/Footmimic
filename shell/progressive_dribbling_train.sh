@@ -1,116 +1,77 @@
 #!/usr/bin/env bash
 #
-# Progressive Dribbling (2-Stage) — dribble motion + flat motion pretrain
+# Progressive dribbling training.
 #
-# Stage 1: Motion tracking on **flat** ground (same ball/target obs as dribble MDP)
-#   - Default:           Tracking-Flat-G1-Motion-RNN-v0  (mimic pretrain)
-#   - Flat task variant: Tracking-Flat-G1-Motion-RNN-task  (forward/lateral/heading)
-#   - --cg:              Tracking-CG-G1-Motion-RNN-mimic  (default CG Stage 1 in this script)
-#   - --cg-task:         Tracking-CG-G1-Motion-RNN-task  (= historical ...-v0)
-#   Gym aliases: Tracking-CG-G1-Motion-RNN-v0 -> task, ...-v1 -> mimic
-#   - --ankle-disturb:   Tracking-Flat-G1-Dribbling-AnkleDisturb-RNN-v0
-#                        (ignored when --cg is also set)
-#
-# Stage 2: Dribbling stage-2 task (baseline or CG variant, resume from Stage 1 run)
-#   - Default: Tracking-Flat-G1-Dribbling-RNN-v0
-#   - --cg:            Tracking-CG-G1-Dribbling-RNN-forward  (fixed +X velocity)
-#   - --cg-follow:     Tracking-CG-G1-Dribbling-RNN-follow  (demo root vel, per-frame)
-#   - --cg-control:    Tracking-CG-G1-Dribbling-RNN-control  (v4.4 continuous speed/heading/duration)
-#   - --cg-full-control: Tracking-CG-G1-Dribbling-RNN-full-control (stateful IDLE/dribble/STOP)
-#
-# Resume v1.20 forward checkpoint into follow/control (skip Stage 1):
-#   python scripts/rsl_rl/train_multi.py --task Tracking-CG-G1-Dribbling-RNN-follow \
-#     --motion_path "$MOTION_PATH" --load_run "<v1.20_run_dir>" --run_name v120_follow \
-#     --experiment_name g1_dribbling --resume True --num_envs 2000 --headless
-#   (same with ...-control). Obs expansion is automatic on --resume.
-#   - Heuristic-only CG (no labels): pass task explicitly, e.g.
-#       --task Tracking-CG-Heuristic-G1-Dribbling-RNN-v0
-#
-# Motion directory: set DRIBBLE_MOTION_PATH to your folder of dribble .npz files
-# (defaults to motions/dribble). CG training expects ``ball_pos_w`` in each .npz
-# (or merged from a sidecar) plus ``dribble_cg_contact`` / ``dribble_cg_foot``
-# from dribble_label_tool apply (or kick_frame/kick_end/kick_leg fallback).
+# Default: flat motion imitation -> flat dribbling.
+# CG baselines:
+#   --cg-control       legacy continuous command baseline
+#   --cg-full-control  frozen IDLE/DRIBBLE/STOP baseline
+#   --cg-unified-control  polar-only unified interface, fixed right instep touch
 #
 # Usage:
-#   DRIBBLE_MOTION_PATH=motions/my_dribble bash shell/progressive_dribbling_train.sh [RUN_NAME] [--ankle-disturb] [--cg] [--cg-follow] [--cg-control] [--cg-full-control]
-#
+#   DRIBBLE_MOTION_PATH=motions/my_dribble \
+#     bash shell/progressive_dribbling_train.sh [RUN_NAME] \
+#       [--cg-control | --cg-full-control | --cg-unified-control]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 EXPERIMENT_DIR="${REPO_ROOT}/logs/rsl_rl/g1_dribbling"
-
 MOTION_PATH="${DRIBBLE_MOTION_PATH:-motions/dribble}"
+# Used only by --cg-unified-control. ``any`` is the dataset-compatible
+# default; instep modes require a matching surface label on every contact.
+CONTACT_SURFACE="${DRIBBLE_CONTACT_SURFACE:-any}"
 
-RUN_NAME="${1:-dribbling}"
-ANKLE_DISTURB=false
-USE_CG=false
-USE_CG_TASK=false
-USE_CG_FOLLOW=false
-USE_CG_CONTROL=false
-USE_CG_FULL_CONTROL=false
+case "${CONTACT_SURFACE}" in
+    any|inside_instep|outside_instep) ;;
+    *)
+        echo "DRIBBLE_CONTACT_SURFACE must be any, inside_instep, or outside_instep; got: ${CONTACT_SURFACE}" >&2
+        exit 2
+        ;;
+esac
+
+RUN_NAME="dribbling"
+MODE="flat"
+STAGE2_EXTRA_ARGS=()
 for arg in "$@"; do
-    if [[ "${arg}" == "--ankle-disturb" ]]; then
-        ANKLE_DISTURB=true
-    elif [[ "${arg}" == "--cg" ]]; then
-        USE_CG=true
-    elif [[ "${arg}" == "--cg-task" ]]; then
-        USE_CG=true
-        USE_CG_TASK=true
-    elif [[ "${arg}" == "--cg-follow" ]]; then
-        USE_CG=true
-        USE_CG_FOLLOW=true
-    elif [[ "${arg}" == "--cg-control" ]]; then
-        USE_CG=true
-        USE_CG_CONTROL=true
-    elif [[ "${arg}" == "--cg-full-control" ]]; then
-        USE_CG=true
-        USE_CG_FULL_CONTROL=true
-    fi
+    case "${arg}" in
+        --cg-control) MODE="cg-control" ;;
+        --cg-full-control) MODE="cg-full-control" ;;
+        --cg-unified-control) MODE="cg-unified-control" ;;
+        --*) ;;
+        *) RUN_NAME="${arg}" ;;
+    esac
 done
 
-if [[ "${USE_CG}" == "true" ]]; then
-    # CG dribble (Stage 2) adds `anchor_ball_polar` to the policy/critic obs,
-    # so Stage 1 must use the obs-compatible CG-pretrain motion env.
-    if [[ "${USE_CG_TASK}" == "true" ]]; then
-        STAGE1_TASK="Tracking-CG-G1-Motion-RNN-task"
-        echo ">>> CG motion pretrain Stage 1 (task forward/lateral/heading) <<<"
-    else
+case "${MODE}" in
+    flat)
+        STAGE1_TASK="Tracking-Flat-G1-Motion-RNN-v0"
+        STAGE2_TASK="Tracking-Flat-G1-Dribbling-RNN-v0"
+        ;;
+    cg-control)
         STAGE1_TASK="Tracking-CG-G1-Motion-RNN-mimic"
-        echo ">>> CG motion pretrain Stage 1 (mimic-only) <<<"
-    fi
-    STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-forward"
-    if [[ "${USE_CG_FOLLOW}" == "true" ]]; then
-        STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-follow"
-        echo ">>> CG Stage 2: follow demo root velocity (per-frame) <<<"
-    elif [[ "${USE_CG_FULL_CONTROL}" == "true" ]]; then
-        STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-full-control"
-        echo ">>> CG Stage 2: full-control (stateful IDLE -> DRIBBLE -> STOP) <<<"
-    elif [[ "${USE_CG_CONTROL}" == "true" ]]; then
         STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-control"
-        echo ">>> CG Stage 2: v4.4 continuous sampled velocity command <<<"
-    fi
-    if [[ "${ANKLE_DISTURB}" == "true" ]]; then
-        echo ">>> Warning: --ankle-disturb is ignored under --cg (no CG-compatible ankle-disturb Stage 1 env). <<<"
-    fi
-elif [[ "${ANKLE_DISTURB}" == "true" ]]; then
-    STAGE1_TASK="Tracking-Flat-G1-Dribbling-AnkleDisturb-RNN-v0"
-    STAGE2_TASK="Tracking-Flat-G1-Dribbling-RNN-v0"
-    echo ">>> Ankle disturbance Stage 1 <<<"
-else
-    STAGE1_TASK="Tracking-Flat-G1-Motion-RNN-v0"
-    STAGE2_TASK="Tracking-Flat-G1-Dribbling-RNN-v0"
-    echo ">>> Flat motion tracking Stage 1 <<<"
-fi
+        ;;
+    cg-full-control)
+        STAGE1_TASK="Tracking-CG-G1-Motion-RNN-mimic"
+        STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-full-control"
+        ;;
+    cg-unified-control)
+        # This pair has the same 163-D actor input layout.  Stage 1 fixes the
+        # polar command to [speed, cos(heading), sin(heading)] = [0, 1, 0]
+        # and task state to IDLE, so resume needs no zero-padding.
+        STAGE1_TASK="Tracking-CG-G1-Motion-RNN-unified-mimic"
+        STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-unified-control"
+        STAGE2_EXTRA_ARGS=("dribble_contact_surface=${CONTACT_SURFACE}")
+        ;;
+esac
 
 cd "${REPO_ROOT}"
 
-echo "════════════════════════════════════════════════════════════════"
-echo " Stage 1: ${STAGE1_TASK}"
-echo " motion_path: ${MOTION_PATH}"
-echo " run_name:    ${RUN_NAME}"
-echo "════════════════════════════════════════════════════════════════"
+echo "Stage 1: ${STAGE1_TASK}"
+echo "motion_path: ${MOTION_PATH}"
+echo "run_name: ${RUN_NAME}"
 
 python scripts/rsl_rl/train_multi.py --task "${STAGE1_TASK}" \
     --motion_path "${MOTION_PATH}" \
@@ -121,18 +82,14 @@ python scripts/rsl_rl/train_multi.py --task "${STAGE1_TASK}" \
     --headless
 
 LOAD_RUN="$(find "${EXPERIMENT_DIR}" -maxdepth 1 -mindepth 1 -type d -name "*_${RUN_NAME}" | sort | tail -n 1 | xargs -r basename)"
-
 if [[ -z "${LOAD_RUN}" ]]; then
     echo "Failed to resolve Stage 1 checkpoint from ${EXPERIMENT_DIR}"
     exit 1
 fi
 
-echo ""
-echo "════════════════════════════════════════════════════════════════"
-echo " Stage 2: ${STAGE2_TASK}"
-echo " resume: ${LOAD_RUN}"
-echo " motion_path: ${MOTION_PATH}"
-echo "════════════════════════════════════════════════════════════════"
+echo "Stage 2: ${STAGE2_TASK}"
+echo "resume: ${LOAD_RUN}"
+echo "motion_path: ${MOTION_PATH}"
 
 python scripts/rsl_rl/train_multi.py --task "${STAGE2_TASK}" \
     --motion_path "${MOTION_PATH}" \
@@ -141,14 +98,9 @@ python scripts/rsl_rl/train_multi.py --task "${STAGE2_TASK}" \
     --experiment_name g1_dribbling \
     --num_envs 2000 \
     --resume True \
+    "${STAGE2_EXTRA_ARGS[@]}" \
     --headless
 
-echo ""
-echo "Play checkpoints (logs live under logs/rsl_rl/g1_dribbling/):"
-echo "  Stage 2 dribbling policy:"
-echo "    python scripts/rsl_rl/play_multi.py --task ${STAGE2_TASK} \\"
-echo "      --motion_path \"${MOTION_PATH}\" --load_run \"<RUN_DIR>_dribble\" --checkpoint model_XXXX.pt ..."
-echo "  Stage 1 motion policy — add --experiment_name g1_dribbling:"
-echo "    python scripts/rsl_rl/play_multi.py --task ${STAGE1_TASK} \\"
-echo "      --experiment_name g1_dribbling --motion_path \"${MOTION_PATH}\" \\"
-echo "      --load_run \"${LOAD_RUN}\" --checkpoint model_XXXX.pt ..."
+echo "Play Stage 2:"
+echo "  python scripts/rsl_rl/play_multi.py --task ${STAGE2_TASK} \\\"
+echo "    --motion_path \"${MOTION_PATH}\" --load_run \"<RUN_DIR>_dribble\" --checkpoint model_XXXX.pt"

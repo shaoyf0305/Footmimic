@@ -4,18 +4,45 @@ Read this before changing control-related code. Follow the constraints below.
 
 ## Task IDs
 
-- Tracking-CG-G1-Motion-RNN-original: exact released PAiD Stage-1 recipe (rough terrain, adaptive motion-phase sampling, torso anchor, original 160-D Cartesian observation layout; logs under `g1_flat`).
-- Tracking-CG-G1-Motion-RNN-strict: Stage-1 raw-reference full-body tracking. It preserves the demo root path/yaw and has no reset or domain randomization.
-- Tracking-CG-G1-Motion-RNN-mimic: Stage-1 motion style from demo. Preferred warm-start for control.
-- Tracking-CG-G1-Motion-RNN-task: Stage-1 with fixed +X / anti-lateral terms. Do not use as control warm-start.
-- Tracking-CG-G1-Dribbling-RNN-forward: Stage-2 fixed task +X dribbling.
-- Tracking-CG-G1-Dribbling-RNN-follow: Stage-2 root velocity from demo anchor vel.
+- Tracking-Flat-G1-Motion-RNN-v0: flat motion imitation baseline.
+- Tracking-Flat-G1-SoccerDestination-v0 / -RNN-v0: retained minimal Kick environment (no kick-specific objective).
+- Tracking-Flat-G1-Dribbling-v0 / -RNN-v0: non-CG dribbling baseline.
+- Tracking-CG-G1-Motion-RNN-strict: raw-reference Stage-1 tracking.
+- Tracking-CG-G1-Motion-RNN-mimic: legacy Stage-1 mimic for the frozen Stage-2 baselines.
 - Tracking-CG-G1-Dribbling-RNN-control: preserved v4.4 continuous Stage-2 command control (speed 0.40–1.50, heading, duration; +9 resume inputs).
-- Tracking-CG-G1-Dribbling-RNN-full-control: current stateful Stage-2 control (IDLE/DRIBBLE/STOP; +12 resume inputs).
+- Tracking-CG-G1-Dribbling-RNN-full-control: preserved stateful IDLE/DRIBBLE/STOP baseline.
+- Tracking-CG-G1-Motion-RNN-unified-mimic: frozen-interface pure-mimic Stage-1. Its 163-D actor input keeps only ``anchor_ball_polar`` for the ball, removes the kick-only destination, and appends fixed zero-speed / IDLE command values.
+- Tracking-CG-G1-Dribbling-RNN-unified-control: polar-only Stage-2 interface: matching 163-D actor input, 29-D action, strict upper-body PCA projection, command ``[speed, cos(heading), sin(heading)]``, IDLE/DRIBBLE/STOP state, and a fixed right-foot contact graph.
 
 Play entry: scripts/rsl_rl/play_multi.py with dual_view and locomotion_cmd_speed / heading / duration.
-Train helper: shell/progressive_dribbling_train.sh with --cg --cg-control (v4.4) or --cg --cg-full-control (current).
-Stage-1 warm-start expands trailing observations automatically: +9 for control, +12 for full-control.
+Train helper: shell/progressive_dribbling_train.sh with --cg-control, --cg-full-control, or --cg-unified-control.
+The legacy pairs keep their historical resume behavior; the unified pair needs no observation expansion.
+
+The two `unified-*` tasks are the new progressive pair and require no observation expansion on resume: their policy and critic layouts already match. Existing `control` and `full-control` tasks remain frozen verification baselines. The unified task enforces the fixed right foot but leaves the contact surface unconstrained by default, so the current foot-only labels work unchanged.
+
+## Fixed instep contacts
+
+`dribble_contact_mode` selects the leg (`right`, `left`, or `both`) and
+`dribble_contact_surface` selects `any`, `inside_instep`, or
+`outside_instep`. The instep modes classify the ball centre in the contacted
+ankle link's local frame: dorsal (`+Z`) plus medial for inside, or dorsal plus
+lateral for outside. They reward only the requested region and penalize every
+other ball contact, rather than treating the entire ankle link as equivalent.
+
+The unified task defaults to `any`, so no `surface` field is required. Once a
+surface-labelled dataset exists, to train the outer-instep alternative label
+every contact segment as `"surface": "outside_instep"` and run:
+
+```bash
+DRIBBLE_CONTACT_SURFACE=outside_instep \
+  bash shell/progressive_dribbling_train.sh my_outer_instep --cg-unified-control
+```
+
+The label JSON must use segments such as
+`{"start": 10, "end": 18, "foot": "right", "surface": "inside_instep"}`.
+Apply it with `scripts/dribble/dribble_label_tool.py apply ...`; this writes
+the per-frame `dribble_cg_surface` field. Auto-labelling can only pre-fill a
+chosen default surface from proximity, so manually review it before applying.
 
 ## Goals you must respect
 
@@ -25,7 +52,7 @@ Ball chase and sustained ball control matter. Do not cut chase or contact reward
 
 The geometric conflict between an oblique command and a ball ahead of the robot is intentional. Do not spawn or move the ball onto the command heading to remove that conflict. The policy should learn to turn while keeping the ball.
 
-Do not resume control from a strongly trained forward checkpoint. Prefer Motion-RNN-mimic into Dribbling-RNN-control.
+For the unified task, resume only Motion-RNN-unified-mimic into Dribbling-RNN-unified-control.
 
 Slalom clips already contain turns, but current control does not use demo yaw as the locomotion target. Mimic strips demo yaw into the task frame and root velocity comes from resampled commands. Having turns in the data does not mean the policy is learning to follow heading commands.
 
@@ -51,7 +78,7 @@ Do not weaken core chase or CG weights to buy turning.
 
 Do not treat more locomotion reward weight as the main fix.
 
-Do not change shared MotionCommand defaults in a way that breaks forward, follow, or Stage-1. Any shared change must be behind a config flag that defaults to the old behavior.
+Do not change shared MotionCommand defaults in a way that breaks retained baselines or Stage-1. Any shared change must be behind a config flag that defaults to the old behavior.
 
 Do not make control follow demo root velocity again.
 

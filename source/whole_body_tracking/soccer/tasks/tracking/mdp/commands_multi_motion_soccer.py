@@ -101,6 +101,7 @@ class MultiMotionLoader:
         ball_pos_w_list: list[torch.Tensor] = []
         dribble_cg_contact_list: list[torch.Tensor] = []
         dribble_cg_foot_list: list[torch.Tensor] = []
+        dribble_cg_surface_list: list[torch.Tensor] = []
         dribble_cg_foot_ball_dist_list: list[torch.Tensor] = []
         dribble_cg_dist_foot_list: list[torch.Tensor] = []
         motion_has_ball_demo_list: list[bool] = []
@@ -178,6 +179,10 @@ class MultiMotionLoader:
 
             cg_contact = torch.zeros(T, dtype=torch.int8, device=device)
             cg_foot = torch.full((T,), -1, dtype=torch.int8, device=device)
+            # Contact surface id: -1 none/unknown, 0 inside instep,
+            # 1 outside instep.  Keep it independent from foot side: the
+            # same local region names work for either foot.
+            cg_surface = torch.full((T,), -1, dtype=torch.int8, device=device)
             if "dribble_cg_contact" in data.files:
                 cc = np.asarray(data["dribble_cg_contact"]).reshape(-1).astype(np.int8)[:T]
                 cg_contact[: cc.shape[0]] = torch.as_tensor(cc, device=device, dtype=torch.int8)
@@ -192,6 +197,10 @@ class MultiMotionLoader:
                 cf = np.asarray(data["dribble_cg_foot"]).reshape(-1).astype(np.int8)[:T]
                 cg_foot[: cf.shape[0]] = torch.as_tensor(cf, device=device, dtype=torch.int8)
 
+            if "dribble_cg_surface" in data.files:
+                cs = np.asarray(data["dribble_cg_surface"]).reshape(-1).astype(np.int8)[:T]
+                cg_surface[: cs.shape[0]] = torch.as_tensor(cs, device=device, dtype=torch.int8)
+
             cg_foot_ball_dist = torch.full((T,), -1.0, dtype=torch.float32, device=device)
             if "dribble_cg_foot_ball_dist" in data.files:
                 cd = np.asarray(data["dribble_cg_foot_ball_dist"], dtype=np.float32).reshape(-1)[:T]
@@ -204,6 +213,7 @@ class MultiMotionLoader:
 
             dribble_cg_contact_list.append(cg_contact)
             dribble_cg_foot_list.append(cg_foot)
+            dribble_cg_surface_list.append(cg_surface)
             dribble_cg_foot_ball_dist_list.append(cg_foot_ball_dist)
             dribble_cg_dist_foot_list.append(cg_dist_foot)
 
@@ -261,6 +271,7 @@ class MultiMotionLoader:
         self._ball_pos_w = pad_tensor_list(ball_pos_w_list, pad_value=0.0)
         self._dribble_cg_contact = pad_1d_int8(dribble_cg_contact_list, pad_value=0)
         self._dribble_cg_foot = pad_1d_int8(dribble_cg_foot_list, pad_value=-1)
+        self._dribble_cg_surface = pad_1d_int8(dribble_cg_surface_list, pad_value=-1)
         self._dribble_cg_foot_ball_dist = pad_1d_float(dribble_cg_foot_ball_dist_list, pad_value=-1.0)
         self._dribble_cg_dist_foot = pad_1d_int8(dribble_cg_dist_foot_list, pad_value=-1)
         self.motion_has_ball_demo = torch.tensor(motion_has_ball_demo_list, dtype=torch.bool, device=self.device)
@@ -311,6 +322,11 @@ class MultiMotionLoader:
     def dribble_cg_foot(self) -> torch.Tensor:
         """Per-frame foot id: -1 unknown/none, 0 left, 1 right (padded with -1)."""
         return self._dribble_cg_foot
+
+    @property
+    def dribble_cg_surface(self) -> torch.Tensor:
+        """Per-frame contact surface: -1 unknown, 0 inside instep, 1 outside instep."""
+        return self._dribble_cg_surface
 
     @property
     def dribble_cg_foot_ball_dist(self) -> torch.Tensor:
@@ -1212,6 +1228,11 @@ class MotionCommand(CommandTerm):
         return self.motion.dribble_cg_foot[self.motion_idx, self.time_steps].to(torch.int64)
 
     @property
+    def dribble_cg_surface_ref(self) -> torch.Tensor:
+        """Contact surface id (-1 none, 0 inside instep, 1 outside instep)."""
+        return self.motion.dribble_cg_surface[self.motion_idx, self.time_steps].to(torch.int64)
+
+    @property
     def dribble_cg_foot_ball_dist_ref(self) -> torch.Tensor:
         """Demo foot–ball distance at current frame (m); ``-1`` if unlabeled."""
         return self.motion.dribble_cg_foot_ball_dist[self.motion_idx, self.time_steps]
@@ -1430,7 +1451,7 @@ class MotionCommand(CommandTerm):
         the clip's complete planar anchor displacement.  Its direction was
         optionally perturbed by ``arc_angle``; ``radius`` supplied the radial
         offset.  Keep this path isolated from the newer task-+X spawn recipes
-        so ``Tracking-CG-G1-Motion-RNN-original`` remains reproducible.
+        so legacy reference-tracking configurations remain reproducible.
         """
         arc_limit = float(self._target_arc_angle)
         base_height = float(self._target_height)

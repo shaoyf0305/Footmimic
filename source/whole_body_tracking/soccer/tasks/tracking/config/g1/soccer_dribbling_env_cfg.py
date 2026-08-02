@@ -15,7 +15,6 @@ Inherits proximity-level tracking and adds dribbling-specific rewards:
 """
 
 import isaaclab.sim as sim_utils
-from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
@@ -28,7 +27,6 @@ from soccer.tasks.tracking.mdp.commands_dribble_cg import DribbleCGMotionCommand
 from .soccer_flat_env_cfg import (
     G1FlatMotionPretrainEnvCfg,
     G1FlatMotionStrictPretrainEnvCfg,
-    G1FlatMotionTaskPretrainEnvCfg,
     G1FlatProximityEnvCfg,
 )
 
@@ -58,6 +56,10 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
     # Optional override: "both" (default) allows either ankle; single-foot modes kept for ablations.
     dribble_contact_mode: str = "both"
+    # ``any`` preserves the old whole-foot rule.  ``inside_instep`` and
+    # ``outside_instep`` use the closest ankle link's local frame, requiring
+    # a dorsal/medial or dorsal/lateral ball contact rather than just a foot.
+    dribble_contact_surface: str = "any"
 
     def __post_init__(self):
         super().__post_init__()
@@ -182,6 +184,13 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             raise ValueError(
                 f"Unsupported dribble_contact_mode={self.dribble_contact_mode}. "
                 "Expected one of: right, left, both."
+            )
+
+        surface = str(self.dribble_contact_surface).lower().strip()
+        if surface not in {"any", "inside_instep", "outside_instep"}:
+            raise ValueError(
+                f"Unsupported dribble_contact_surface={self.dribble_contact_surface}. "
+                "Expected one of: any, inside_instep, outside_instep."
             )
 
         if mode == "right":
@@ -410,6 +419,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "force_threshold": 14.0,
                 "all_body_cfg": _contact_body_cfg,
                 "num_ankle_links": _num_ankle_links,
+                "contact_surface": surface,
                 "min_pelvis_heading": 0.55,
             },
         )
@@ -436,6 +446,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "ball_sensor_name": "soccer_ball_contact",
                 "all_body_cfg": _contact_body_cfg,
                 "num_ankle_links": _num_ankle_links,
+                "contact_surface": surface,
             },
         )
 
@@ -461,55 +472,6 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
 
 @configclass
-class G1TerrainDribblingAnkleDisturbEnvCfg(G1FlatDribblingEnvCfg):
-    """Flat dribbling with ankle disturbances (stage-1 style pretrain for dribble)."""
-
-    def __post_init__(self):
-        super().__post_init__()
-
-        self.rewards.motion_foot_pos.weight = 0.0
-
-        self.events.ankle_torque_disturbance = EventTerm(
-            func=mdp.apply_random_ankle_torque,
-            mode="interval",
-            interval_range_s=(0.1, 0.3),
-            params={
-                "asset_cfg": SceneEntityCfg(
-                    "robot",
-                    joint_names=[
-                        "left_ankle_pitch_joint",
-                        "left_ankle_roll_joint",
-                        "right_ankle_pitch_joint",
-                        "right_ankle_roll_joint",
-                    ],
-                ),
-                "torque_range": (-15.0, 15.0),
-            },
-        )
-
-
-@configclass
-class G1FlatDribblingCGHeuristicEnvCfg(G1FlatDribblingEnvCfg):
-    """Legacy CG shaping: heuristic approach/interact phases (no motion labels)."""
-
-    def __post_init__(self):
-        super().__post_init__()
-
-        self.rewards.dribbling_phase_graph_alignment = RewTerm(
-            func=mdp.dribbling_phase_graph_alignment,
-            weight=6.0,
-            params={
-                "command_name": "motion",
-                "ball_sensor_name": "soccer_ball_contact",
-                "contact_force_threshold": 0.5,
-                "approach_xy_dist": 0.55,
-                "approach_dist_std": 0.20,
-                "push_speed_threshold": 0.22,
-            },
-        )
-
-
-@configclass
 class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
     """Dribbling with annotated contact graph + stitched demo ``ball_pos_w``.
 
@@ -517,9 +479,6 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
     to optionally drive the sim ball along the demo trajectory (anchor-relative),
     and rewards that align sensor contact / foot side with ``dribble_cg_*`` labels.
 
-    For the previous distance-only heuristic CG, use
-    :class:`G1FlatDribblingCGHeuristicEnvCfg` / gym id
-    ``Tracking-CG-Heuristic-G1-Dribbling-RNN-v0``.
     """
 
     def __post_init__(self):
@@ -545,6 +504,7 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
         )
 
         mode = str(self.dribble_contact_mode).lower().strip()
+        surface = str(self.dribble_contact_surface).lower().strip()
         if mode == "right":
             legal_ankles = ["right_ankle_roll_link"]
             other_ankles = ["left_ankle_roll_link"]
@@ -607,6 +567,7 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
                 "all_body_cfg": cg_body_cfg,
+                "contact_surface": surface,
             },
         )
 
@@ -621,8 +582,12 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
         self.rewards.dribbling_rapid_retouch_penalty.params["min_steps_between_touches"] = 26
 
 
-def _apply_dribbling_locomotion_velocity_terms(cfg) -> None:
-    """Shared follow/control Stage-2: track active locomotion cmd + expose it in obs."""
+def _apply_dribbling_locomotion_velocity_terms(
+    cfg,
+    *,
+    include_cartesian_command_observations: bool = True,
+) -> None:
+    """Shared follow/control mechanics, optionally exposing legacy Cartesian command obs."""
     cfg.rewards.forward_velocity.weight = 0.0
     cfg.rewards.lateral_velocity_penalty.weight = 0.0
     cfg.rewards.task_heading_alignment.weight = 0.0
@@ -646,28 +611,23 @@ def _apply_dribbling_locomotion_velocity_terms(cfg) -> None:
     if hasattr(cfg.rewards, "dribbling_velocity_tracking"):
         cfg.rewards.dribbling_velocity_tracking.weight = 0.0
 
-    cfg.observations.policy.motion_anchor_lin_vel_cmd = ObsTerm(
-        func=mdp.motion_anchor_lin_vel_command,
-        params={"command_name": "motion"},
-    )
-    cfg.observations.critic.motion_anchor_lin_vel_cmd = ObsTerm(
-        func=mdp.motion_anchor_lin_vel_command,
-        params={"command_name": "motion"},
-    )
-    cfg.observations.policy.motion_anchor_ang_vel_cmd = ObsTerm(
-        func=mdp.motion_anchor_ang_vel_command,
-        params={"command_name": "motion"},
-    )
-    cfg.observations.critic.motion_anchor_ang_vel_cmd = ObsTerm(
-        func=mdp.motion_anchor_ang_vel_command,
-        params={"command_name": "motion"},
-    )
-
-
-def _apply_dribbling_follow_velocity_terms(cfg) -> None:
-    """Follow: per-frame demo root velocity command (time-varying with the clip)."""
-    _apply_dribbling_locomotion_velocity_terms(cfg)
-    cfg.commands.motion.locomotion_command_mode = "reference"
+    if include_cartesian_command_observations:
+        cfg.observations.policy.motion_anchor_lin_vel_cmd = ObsTerm(
+            func=mdp.motion_anchor_lin_vel_command,
+            params={"command_name": "motion"},
+        )
+        cfg.observations.critic.motion_anchor_lin_vel_cmd = ObsTerm(
+            func=mdp.motion_anchor_lin_vel_command,
+            params={"command_name": "motion"},
+        )
+        cfg.observations.policy.motion_anchor_ang_vel_cmd = ObsTerm(
+            func=mdp.motion_anchor_ang_vel_command,
+            params={"command_name": "motion"},
+        )
+        cfg.observations.critic.motion_anchor_ang_vel_cmd = ObsTerm(
+            func=mdp.motion_anchor_ang_vel_command,
+            params={"command_name": "motion"},
+        )
 
 
 def _apply_dribbling_control_velocity_terms(cfg) -> None:
@@ -859,9 +819,16 @@ def _apply_dribbling_control_velocity_terms(cfg) -> None:
     )
 
 
-def _apply_dribbling_full_control_velocity_terms(cfg) -> None:
+def _apply_dribbling_full_control_velocity_terms(
+    cfg,
+    *,
+    include_cartesian_command_observations: bool = True,
+) -> None:
     """Current full Control: stateful external command + start/dribble/stop task."""
-    _apply_dribbling_locomotion_velocity_terms(cfg)
+    _apply_dribbling_locomotion_velocity_terms(
+        cfg,
+        include_cartesian_command_observations=include_cartesian_command_observations,
+    )
     cfg.commands.motion.locomotion_command_mode = "resampled"
     # The task input is distinct from speed: both IDLE and STOP command zero
     # velocity, but only STOP asks the policy to settle the ball after a run.
@@ -1177,30 +1144,107 @@ def _apply_dribbling_full_control_velocity_terms(cfg) -> None:
     )
 
 
-@configclass
-class G1FlatCGDribblingForwardEnvCfg(G1FlatCGDribblingEnvCfg):
-    """CG Stage-2 with fixed task +X velocity / anti-lateral terms (baseline forward dribble).
+def _apply_unified_control_action_contract(cfg) -> None:
+    """Install the frozen 29-D action contract used by the next training run.
 
-    Gym id: ``Tracking-CG-G1-Dribbling-RNN-forward`` (alias: ``...-v0``).
+    The policy keeps one action for each robot joint, so Stage-1 and Stage-2
+    share the action head.  Only the selected upper-body targets are projected
+    onto the PCA manifold.  A zero residual limit makes this a strict
+    projection; requested, projected, limited, and executed targets remain
+    available on the action term for diagnostics.
     """
+    old_action_cfg = cfg.actions.joint_pos
+    cfg.actions.joint_pos = mdp.UpperBodyManifoldJointPositionActionCfg(
+        asset_name=old_action_cfg.asset_name,
+        joint_names=old_action_cfg.joint_names,
+        use_default_offset=old_action_cfg.use_default_offset,
+        upper_body_joint_names=_CONTROL_UPPER_BODY_JOINT_NAMES,
+        command_name="motion",
+        manifold_rank=6,
+        latent_std_limit=3.0,
+        min_latent_limit=0.03,
+        orthogonal_residual_limit=0.0,
+        cutoff_frequency_hz=1.8,
+        reference_target_margin=0.25,
+        direct_upper_body_latent_action=False,
+    )
+    cfg.actions.joint_pos.scale = old_action_cfg.scale
+    cfg.actions.joint_pos.offset = old_action_cfg.offset
+    cfg.actions.joint_pos.preserve_order = getattr(old_action_cfg, "preserve_order", False)
+    if hasattr(old_action_cfg, "clip"):
+        cfg.actions.joint_pos.clip = old_action_cfg.clip
 
-    pass
+    # Recurrent action feedback and rate regularization must use the command
+    # after PCA projection, joint limits, and filtering rather than the raw
+    # policy value that may never reach the actuator.
+    cfg.observations.policy.actions.func = mdp.effective_joint_action
+    cfg.observations.policy.actions.params = {"action_name": "joint_pos"}
+    cfg.observations.critic.actions.func = mdp.effective_joint_action
+    cfg.observations.critic.actions.params = {"action_name": "joint_pos"}
+    cfg.rewards.action_rate_l2.func = mdp.effective_action_rate_l2_clip
+    cfg.rewards.action_rate_l2.params = {"action_name": "joint_pos"}
+    cfg.rewards.upper_body_reference_overflow = RewTerm(
+        func=mdp.upper_body_reference_overflow_penalty,
+        weight=-0.05,
+        params={"action_name": "joint_pos"},
+    )
+    cfg.rewards.upper_body_manifold_nullspace = RewTerm(
+        func=mdp.upper_body_manifold_nullspace_penalty,
+        weight=-0.02,
+        params={"action_name": "joint_pos", "scale": 0.10},
+    )
 
 
-@configclass
-class G1FlatCGDribblingFollowEnvCfg(G1FlatCGDribblingEnvCfg):
-    """CG Stage-2 **follow**: time-varying velocity command from demo root vel each frame.
+def _apply_unified_control_command_observations(cfg) -> None:
+    """Use one polar locomotion command plus the explicit task-state input.
 
-    Pose/style from motion reference; speed + turn from ``anchor_lin_vel_w`` / ``anchor_ang_vel_w``.
-    Supports warm-start from ``Tracking-CG-G1-Dribbling-RNN-forward`` (v1.20) via obs expansion
-    on ``--resume`` (+6 policy/critic dims: lin/ang vel cmd).
-
-    Gym id: ``Tracking-CG-G1-Dribbling-RNN-follow``.
+    The complete Stage-2 policy command is
+    ``[speed, cos(heading), sin(heading), idle, dribble, stop]``.  Cartesian
+    velocity terms are intentionally absent: they duplicate the same planar
+    command and made checkpoint resume depend on an observation expansion.
     """
+    cfg.observations.policy.motion_locomotion_polar_cmd = ObsTerm(
+        func=mdp.motion_locomotion_polar_command,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.critic.motion_locomotion_polar_cmd = ObsTerm(
+        func=mdp.motion_locomotion_polar_command,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.policy.motion_locomotion_task_state = ObsTerm(
+        func=mdp.motion_locomotion_task_state,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.critic.motion_locomotion_task_state = ObsTerm(
+        func=mdp.motion_locomotion_task_state,
+        params={"command_name": "motion"},
+    )
 
-    def __post_init__(self):
-        super().__post_init__()
-        _apply_dribbling_follow_velocity_terms(self)
+
+def _remove_unified_kick_only_terms(cfg) -> None:
+    """Remove ball Cartesian and kick-destination signals from unified dribbling.
+
+    ``target_point_pos`` is the simulated ball position in pelvis-frame
+    Cartesian coordinates, which duplicates ``anchor_ball_polar``.  The
+    destination signal and the inherited frozen-proximity reward belong to the
+    kick task, not continuous dribbling.  Keep the command's internal target
+    buffers untouched: generic ball reset/visualization code still owns them,
+    but they are no longer policy inputs or learning objectives here.
+    """
+    for observations in (cfg.observations.policy, cfg.observations.critic):
+        observations.target_point_pos = None
+        observations.target_destination_pos_local = None
+
+    # G1FlatDribblingEnvCfg already assigns zero weight.  Removing the term
+    # entirely prevents a later parent-config change from reintroducing a
+    # kick-style objective into the frozen unified contract.
+    if hasattr(cfg.rewards, "target_point_proximity"):
+        cfg.rewards.target_point_proximity = None
+
+    # These markers communicate kick-only targets and become misleading when
+    # the associated observations/objective are absent.
+    cfg.commands.motion.target_point_marker_cfg = None
+    cfg.commands.motion.target_destination_marker_cfg = None
 
 
 @configclass
@@ -1209,8 +1253,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatCGDribblingEnvCfg):
 
     Reference motion teaches **pose / gait / CG touch timing** only. Locomotion is driven by
     a sampled ``(speed, heading, duration)`` command — not ``anchor_lin_vel_w`` from the clip.
-    Supports warm-start from ``Tracking-CG-G1-Dribbling-RNN-forward`` (v1.20) via obs expansion
-    on ``--resume`` (+9 policy/critic dims: lin/ang vel cmd + polar cmd).
+    Kept unchanged as a frozen verification baseline.
 
     Gym id: ``Tracking-CG-G1-Dribbling-RNN-control``.
     """
@@ -1238,6 +1281,36 @@ class G1FlatCGDribblingFullControlEnvCfg(G1FlatCGDribblingEnvCfg):
         _apply_dribbling_full_control_velocity_terms(self)
 
 
+@configclass
+class G1FlatCGDribblingUnifiedControlEnvCfg(G1FlatCGDribblingEnvCfg):
+    """Stateful CG Stage-2 control with the frozen polar-only interface.
+
+    This is a sibling of the frozen ``full-control`` baseline.  It carries the
+    same state machine but never creates legacy Cartesian command observations.
+    """
+
+    dribble_contact_mode: str = "right"
+    # Current datasets only label contact foot.  Keep the optional instep
+    # classifier disabled until a surface-labelled dataset is available.
+    dribble_contact_surface: str = "any"
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dribbling_full_control_velocity_terms(
+            self,
+            include_cartesian_command_observations=False,
+        )
+        _remove_unified_kick_only_terms(self)
+        _apply_unified_control_action_contract(self)
+        # Always enforce the configured foot.  A non-``any`` surface activates
+        # the additional label check only when a surface-labelled dataset is
+        # deliberately supplied.
+        setattr(self.commands.motion, "dribble_cg_fixed_touch_foot", self.dribble_contact_mode)
+        setattr(
+            self.commands.motion,
+            "dribble_cg_fixed_touch_surface",
+            None if self.dribble_contact_surface == "any" else self.dribble_contact_surface,
+        )
 def _apply_cg_pretrain_obs(cfg) -> None:
     """``anchor_ball_polar`` on policy/critic — required for CG Stage-2 resume."""
     cfg.observations.policy.anchor_ball_polar = ObsTerm(
@@ -1248,6 +1321,36 @@ def _apply_cg_pretrain_obs(cfg) -> None:
         func=obs_anchor.anchor_ball_polar,
         params={"command_name": "motion"},
     )
+
+
+def _apply_unified_stage1_command_inputs(cfg) -> None:
+    """Make pure imitation expose the exact Stage-2 task-command layout.
+
+    Stage-1 does not train a locomotion task: it observes a fixed zero-speed,
+    zero-heading polar command ``[0, 1, 0]`` and the IDLE one-hot default.  The
+    values are explicit and stable, while the tensor layout is identical to
+    the Stage-2 unified-control environment, so resume has no padded inputs.
+    """
+    cfg.commands.motion.locomotion_command_mode = "manual"
+    cfg.commands.motion.locomotion_manual_lin_vel = (0.0, 0.0, 0.0)
+    cfg.commands.motion.locomotion_manual_ang_vel = (0.0, 0.0, 0.0)
+    cfg.commands.motion.locomotion_task_state_enabled = True
+    cfg.commands.motion.locomotion_task_state_sequence = ("idle",)
+    _apply_unified_control_command_observations(cfg)
+
+
+@configclass
+class G1FlatMotionCGPretrainUnifiedMimicEnvCfg(G1FlatMotionPretrainEnvCfg):
+    """Pure-mimic Stage-1 with the frozen unified Stage-2 input interface.
+
+    Gym id: ``Tracking-CG-G1-Motion-RNN-unified-mimic``.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_cg_pretrain_obs(self)
+        _remove_unified_kick_only_terms(self)
+        _apply_unified_stage1_command_inputs(self)
 
 
 @configclass
@@ -1268,30 +1371,12 @@ class G1FlatMotionCGPretrainStrictEnvCfg(G1FlatMotionStrictPretrainEnvCfg):
 
 @configclass
 class G1FlatMotionCGPretrainMimicEnvCfg(G1FlatMotionPretrainEnvCfg):
-    """Stage-1 CG mimic pretrain (``Tracking-CG-G1-Motion-RNN-mimic`` / ``...-v1``).
+    """Legacy Stage-1 CG mimic pretrain.
 
-    Later split: layered mimic only (no forward/lateral/heading task terms).
-    Obs-compatible with :class:`G1FlatCGDribblingForwardEnvCfg` for rsl_rl ``--resume``
-    (follow/control/full-control Stage-2 add command observations on top).
+    This keeps the historical observation layout for frozen ``control`` and
+    ``full-control`` comparisons.
     """
 
     def __post_init__(self):
         super().__post_init__()
         _apply_cg_pretrain_obs(self)
-
-
-@configclass
-class G1FlatMotionCGPretrainTaskEnvCfg(G1FlatMotionTaskPretrainEnvCfg):
-    """Stage-1 CG task pretrain (``Tracking-CG-G1-Motion-RNN-task`` / ``...-v0``).
-
-    Original CG Stage-1: upper-body mimic + ``forward_velocity`` /
-    ``lateral_velocity_penalty`` / ``task_heading_alignment``. Same obs layout as mimic.
-    """
-
-    def __post_init__(self):
-        super().__post_init__()
-        _apply_cg_pretrain_obs(self)
-
-
-# Backward-compatible alias (historical gym id ``Tracking-CG-G1-Motion-RNN-v0`` = task).
-G1FlatMotionCGPretrainEnvCfg = G1FlatMotionCGPretrainTaskEnvCfg

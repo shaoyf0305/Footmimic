@@ -14,9 +14,11 @@ Written fields (compatible with current loader):
   - kick_frame: int
   - kick_end_frame: int
 
-Contact-graph (for ``Tracking-CG-G1-Dribbling-RNN-v0``):
-  - contact_segments: list of {start, end, foot} with foot in {left, right}
-  - apply writes ``dribble_cg_contact`` / ``dribble_cg_foot`` per frame
+Contact-graph (for ``Tracking-CG-G1-Dribbling-RNN-unified-control``):
+  - contact_segments: list of {start, end, foot, surface}; ``foot`` is
+    {left, right} and ``surface`` is {inside_instep, outside_instep}.
+  - apply writes ``dribble_cg_contact`` / ``dribble_cg_foot`` /
+    ``dribble_cg_surface`` per frame.
 
 3) autolabel
    Semi-automatic pre-labeling from foot–ball proximity (XY by default).
@@ -48,7 +50,8 @@ def _default_entry(path: Path) -> dict[str, Any]:
         "kick_leg": "right",
         "kick_frame": -1,
         "kick_end_frame": -1,
-        # CG: [{"start": 10, "end": 40, "foot": "right"}, ...]
+        # CG: [{"start": 10, "end": 40, "foot": "right",
+        #       "surface": "inside_instep"}, ...]
         "contact_segments": [],
         "notes": "",
         "file": path.name,
@@ -60,7 +63,7 @@ def cmd_template(args: argparse.Namespace) -> None:
     files = _collect_npz_files(motion_path)
 
     root: dict[str, Any] = {
-        "version": 1,
+        "version": 2,
         "description": "Manual dribble labels for motion files.",
         "labels": {},
     }
@@ -92,6 +95,15 @@ def _validate_entry(name: str, entry: dict[str, Any]) -> None:
         foot = str(seg.get("foot", "")).lower().strip()
         if foot not in {"left", "right"}:
             raise ValueError(f"{name}: contact_segments[{i}].foot must be left|right, got {seg.get('foot')}")
+        # Surface is optional only for old foot-only tasks.  The fixed-instep
+        # unified task rejects missing surfaces when it loads the motion.
+        if "surface" in seg:
+            surface = str(seg["surface"]).lower().strip()
+            if surface not in {"inside_instep", "outside_instep"}:
+                raise ValueError(
+                    f"{name}: contact_segments[{i}].surface must be "
+                    f"inside_instep|outside_instep, got {seg.get('surface')}"
+                )
         s = int(seg.get("start", -1))
         e = int(seg.get("end", -1))
         if s < 0 or e < s:
@@ -145,6 +157,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
         if isinstance(csegs, list) and len(csegs) > 0:
             cc = np.zeros(T, dtype=np.int8)
             cf = np.full(T, -1, dtype=np.int8)
+            cs = np.full(T, -1, dtype=np.int8)
             for seg in csegs:
                 s = max(0, min(T - 1, int(seg["start"])))
                 e = max(0, min(T - 1, int(seg["end"])))
@@ -154,8 +167,13 @@ def cmd_apply(args: argparse.Namespace) -> None:
                 kid = 0 if foot == "left" else 1
                 cc[s : e + 1] = 1
                 cf[s : e + 1] = kid
+                surface = str(seg.get("surface", "")).lower().strip()
+                if surface:
+                    sid = 0 if surface == "inside_instep" else 1
+                    cs[s : e + 1] = sid
             updates["dribble_cg_contact"] = cc
             updates["dribble_cg_foot"] = cf
+            updates["dribble_cg_surface"] = cs
 
         _npz_replace(
             file_map[fname],
@@ -206,9 +224,12 @@ def _load_ball_pos(npz_path: Path, sidecar_path: Path | None) -> np.ndarray:
 
 
 def _contact_segments_from_mask(
-    contact: np.ndarray, foot_side: np.ndarray, default_foot: str
+    contact: np.ndarray,
+    foot_side: np.ndarray,
+    default_foot: str,
+    default_surface: str,
 ) -> list[dict[str, Any]]:
-    """Merge consecutive contact frames into ``contact_segments`` with foot side."""
+    """Merge contact frames into segments with foot side and a reviewable surface."""
     n = int(contact.size)
     if n == 0:
         return []
@@ -234,7 +255,7 @@ def _contact_segments_from_mask(
             foot = "left"
         else:
             foot = "right" if df != "left" else "left"
-        out.append({"start": i, "end": j - 1, "foot": foot})
+        out.append({"start": i, "end": j - 1, "foot": foot, "surface": default_surface})
         i = j
     return out
 
@@ -253,7 +274,7 @@ def cmd_autolabel(args: argparse.Namespace) -> None:
         labels_root.pop("phase_type_map", None)
     else:
         labels_root = {
-            "version": 1,
+            "version": 2,
             "description": "Auto prelabels for dribble contact; please review manually.",
             "labels": {},
         }
@@ -328,7 +349,12 @@ def cmd_autolabel(args: argparse.Namespace) -> None:
         ent["kick_frame"] = kf
         ent["kick_end_frame"] = kef
         ent.pop("phases", None)
-        ent["contact_segments"] = _contact_segments_from_mask(contact, foot_side, str(args.default_foot))
+        ent["contact_segments"] = _contact_segments_from_mask(
+            contact,
+            foot_side,
+            str(args.default_foot),
+            str(args.default_surface),
+        )
         note_extra = ""
         warn_large = 0.55 if not getattr(args, "contact_dist_3d", False) else 0.45
         if float(args.contact_dist_threshold) > warn_large:
@@ -337,7 +363,8 @@ def cmd_autolabel(args: argparse.Namespace) -> None:
         ent["notes"] = (
             "AUTO_PRELABEL: review contact_segments/foot. "
             f"contact_dist={args.contact_dist_threshold} ({contact_mode}), "
-            f"foot_vote_max={foot_vote_max}, default_foot={args.default_foot}.{note_extra}"
+            f"foot_vote_max={foot_vote_max}, default_foot={args.default_foot}, "
+            f"default_surface={args.default_surface}; review both fields.{note_extra}"
         )
         ent["file"] = f.name
         labels_root["labels"][f.name] = ent
@@ -396,6 +423,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="right",
         choices=("right", "left"),
         help="When foot votes tie or absent, label kick_leg / segment foot with this side.",
+    )
+    p_auto.add_argument(
+        "--default_surface",
+        type=str,
+        default="inside_instep",
+        choices=("inside_instep", "outside_instep"),
+        help=(
+            "Surface written to auto-labelled contact segments. Proximity alone cannot infer it, "
+            "so review this value before applying labels."
+        ),
     )
     p_auto.add_argument("--min_contact_run", type=int, default=3, help="Minimum run length for contact mask smoothing")
     p_auto.set_defaults(func=cmd_autolabel)
