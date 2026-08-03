@@ -84,3 +84,21 @@ _register(
     soccer_dribbling_env_cfg.G1FlatMotionCGPretrainUnifiedStrictEnvCfg,
     "G1DribblingRecurrentPPORunnerCfg",
 )
+
+# Isolated three-stage unified curriculum. All stages use the same 163-D
+# actor interface and 29-D projected joint-action contract.
+_register(
+    "Tracking-CG-G1-Motion-RNN-unified-s1-mimic",
+    soccer_dribbling_env_cfg.G1FlatMotionCGPretrainUnifiedS1MimicEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
+    "Tracking-CG-G1-Dribbling-RNN-unified-s2-reference",
+    soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2ReferenceEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
+    "Tracking-CG-G1-Dribbling-RNN-unified-s3-task",
+    soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS3TaskEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)

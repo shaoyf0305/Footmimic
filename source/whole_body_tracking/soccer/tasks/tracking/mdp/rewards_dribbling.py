@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_error_magnitude
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_error_magnitude, yaw_quat
 
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import (
     TASK_STATE_DRIBBLE,
@@ -615,7 +615,7 @@ def _is_dribble_legal_ankle_contact(closest_body_idx: torch.Tensor, num_ankle_li
     return closest_body_idx < num_ankle_links
 
 
-_DRIBBLE_CONTACT_SURFACES = ("any", "inside_instep", "outside_instep")
+_DRIBBLE_CONTACT_SURFACES = ("any", "instep", "inside_instep", "outside_instep")
 
 
 def _dribbling_contact_surface_match(
@@ -623,6 +623,7 @@ def _dribbling_contact_surface_match(
     all_body_cfg: SceneEntityCfg,
     closest_body_idx: torch.Tensor,
     *,
+    command_name: str = "motion",
     contact_surface: str,
     num_ankle_links: int,
     medial_y_min: float = 0.018,
@@ -630,14 +631,15 @@ def _dribbling_contact_surface_match(
     instep_x_min: float = -0.035,
     instep_x_max: float = 0.140,
 ) -> torch.Tensor:
-    """Check whether the ball centre lies in a requested foot-local instep zone.
+    """Check whether the ball centre lies in a requested body-frame instep zone.
 
     Isaac's ball contact sensor reports the net force on the ball but not the
     individual collision capsule that produced it.  We therefore identify the
-    closest contacted ankle link and classify the ball centre in that link's
-    local frame.  ``+Y`` points inward for the right foot and ``-Y`` inward
-    for the left foot; ``+Z`` is the dorsal (instep) direction.  This is a
-    stable semantic constraint despite ankle yaw/roll during a touch.
+    closest contacted ankle link and express the ankle-to-ball offset in the
+    pelvis yaw frame. ``+X`` is body forward, ``+Y`` is body left, and ``+Z``
+    is up. The right foot's medial direction is ``+Y`` and the left foot's is
+    ``-Y``. Restricting the frame to pelvis yaw keeps the region stable while
+    an ankle rolls, pitches, or yaws during a touch.
     """
     surface = str(contact_surface).lower().strip()
     if surface not in _DRIBBLE_CONTACT_SURFACES:
@@ -671,12 +673,13 @@ def _dribbling_contact_surface_match(
     selected_body_idx = body_indices[selected_cfg_idx]
     batch_ids = torch.arange(env.num_envs, device=env.device)
     foot_pos_w = robot.data.body_pos_w[batch_ids, selected_body_idx]
-    foot_quat_w = robot.data.body_quat_w[batch_ids, selected_body_idx]
     ball_pos_w = env.scene["soccer_ball"].data.root_pos_w[:, :3]
-    ball_local = quat_apply_inverse(foot_quat_w, ball_pos_w - foot_pos_w)
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    pelvis_yaw_w = yaw_quat(command.robot_pelvis_quat_w)
+    ball_local = quat_apply_inverse(pelvis_yaw_w, ball_pos_w - foot_pos_w)
 
-    # In the robot's local coordinate system +Y is left.  Thus the right
-    # foot's medial side is +Y, while the left foot's medial side is -Y.
+    # In the pelvis yaw frame +Y is body-left. Thus the right foot's medial
+    # side is +Y, while the left foot's medial side is -Y.
     medial_sign = torch.zeros(env.num_envs, dtype=ball_local.dtype, device=env.device)
     for cfg_idx, body_name in enumerate(names):
         if "right_ankle" in body_name:
@@ -690,7 +693,9 @@ def _dribbling_contact_surface_match(
         & (ball_local[:, 2] >= instep_z_min)
     )
     medial_offset = ball_local[:, 1] * medial_sign
-    if surface == "inside_instep":
+    if surface == "instep":
+        side_match = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    elif surface == "inside_instep":
         side_match = medial_offset >= medial_y_min
     else:
         side_match = medial_offset <= -medial_y_min
@@ -1046,6 +1051,7 @@ def dribbling_legal_foot_touch(
         env,
         all_body_cfg,
         closest_idx,
+        command_name=command_name,
         contact_surface=contact_surface,
         num_ankle_links=num_ankle_links,
         medial_y_min=medial_y_min,
@@ -1154,6 +1160,7 @@ def dribbling_undesired_contact_penalty(
         env,
         all_body_cfg,
         closest_idx,
+        command_name=command_name,
         contact_surface=contact_surface,
         num_ankle_links=num_ankle_links,
         medial_y_min=medial_y_min,
@@ -1397,6 +1404,7 @@ def dribbling_cg_foot_consistency(
         env,
         all_body_cfg,
         closest,
+        command_name=command_name,
         contact_surface=contact_surface,
         num_ankle_links=2,
         medial_y_min=medial_y_min,

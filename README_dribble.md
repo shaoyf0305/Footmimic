@@ -14,23 +14,32 @@ Read this before changing control-related code. Follow the constraints below.
 - Tracking-CG-G1-Dribbling-RNN-full-control: preserved stateful IDLE/DRIBBLE/STOP baseline.
 - Tracking-CG-G1-Motion-RNN-unified-mimic: frozen-interface pure-mimic Stage-1. Its 163-D actor input keeps only ``anchor_ball_polar`` for the ball, removes the kick-only destination, and appends fixed zero-speed / IDLE command values.
 - Tracking-CG-G1-Dribbling-RNN-unified-control: polar-only Stage-2 interface: matching 163-D actor input, 29-D action, strict upper-body PCA projection, command ``[speed, cos(heading), sin(heading)]``, IDLE/DRIBBLE/STOP state, and a fixed right-foot contact graph.
+- Tracking-CG-G1-Motion-RNN-unified-s1-mimic: three-stage S1 pure imitation, conditioned on the exact reference polar velocity.
+- Tracking-CG-G1-Dribbling-RNN-unified-s2-reference: three-stage S2 reference-speed dribbling with physical contact execution.
+- Tracking-CG-G1-Dribbling-RNN-unified-s3-task: three-stage S3 free task control without reference-timed ball/contact-position rewards.
 
 Play entry: scripts/rsl_rl/play_multi.py with dual_view and locomotion_cmd_speed / heading / duration.
-Train helper: shell/progressive_dribbling_train.sh with --cg-control, --cg-full-control, or --cg-unified-control.
+Train helper: shell/progressive_dribbling_train.sh with --cg-control, --cg-full-control, --cg-unified-control, or --cg-unified-3stage.
 The legacy pairs keep their historical resume behavior; the unified pair needs no observation expansion.
 
 The two `unified-*` tasks are the new progressive pair and require no observation expansion on resume: their policy and critic layouts already match. Existing `control` and `full-control` tasks remain frozen verification baselines. The unified task enforces the fixed right foot but leaves the contact surface unconstrained by default, so the current foot-only labels work unchanged.
 
+## Three-stage unified curriculum
+
+Run `bash shell/progressive_dribbling_train.sh my_run --cg-unified-3stage`.
+S1, S2 and S3 share the same 163-D actor layout and 29-D projected action feedback. S1/S2 expose the exact task-frame reference velocity as the polar command; S3 samples the normal task command range. S3 removes all demo-ball, foot-ball-distance, contact-time and labelled-foot rewards, retaining task ball-control rewards, generic legal `instep` contacts and non-contact gait style.
+
 ## Fixed instep contacts
 
 `dribble_contact_mode` selects the leg (`right`, `left`, or `both`) and
-`dribble_contact_surface` selects `any`, `inside_instep`, or
+`dribble_contact_surface` selects `any`, `instep`, `inside_instep`, or
 `outside_instep`. The instep modes classify the ball centre in the contacted
-ankle link's local frame: dorsal (`+Z`) plus medial for inside, or dorsal plus
-lateral for outside. They reward only the requested region and penalize every
-other ball contact, rather than treating the entire ankle link as equivalent.
+ankle's offset expressed in the pelvis-yaw frame: dorsal (`+Z`) plus medial
+for inside, or dorsal plus lateral for outside. `instep` accepts either
+dorsal side. They reward only the requested region and penalize every other
+ball contact, rather than treating the entire ankle link as equivalent.
 
-The unified task defaults to `any`, so no `surface` field is required. Once a
+The legacy unified-control task defaults to `any`, so no `surface` field is required. The new three-stage S2/S3 recipes use `instep`: it constrains the contact to the dorsal instep without forcing a medial/lateral side. Once a
 surface-labelled dataset exists, to train the outer-instep alternative label
 every contact segment as `"surface": "outside_instep"` and run:
 

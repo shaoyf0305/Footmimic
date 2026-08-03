@@ -56,9 +56,9 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
     # Optional override: "both" (default) allows either ankle; single-foot modes kept for ablations.
     dribble_contact_mode: str = "both"
-    # ``any`` preserves the old whole-foot rule.  ``inside_instep`` and
-    # ``outside_instep`` use the closest ankle link's local frame, requiring
-    # a dorsal/medial or dorsal/lateral ball contact rather than just a foot.
+    # ``any`` preserves the old whole-foot rule. ``instep`` accepts the union
+    # of both body-frame dorsal instep regions. ``inside_instep`` and
+    # ``outside_instep`` require a dorsal/medial or dorsal/lateral contact.
     dribble_contact_surface: str = "any"
 
     def __post_init__(self):
@@ -187,10 +187,10 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             )
 
         surface = str(self.dribble_contact_surface).lower().strip()
-        if surface not in {"any", "inside_instep", "outside_instep"}:
+        if surface not in {"any", "instep", "inside_instep", "outside_instep"}:
             raise ValueError(
                 f"Unsupported dribble_contact_surface={self.dribble_contact_surface}. "
-                "Expected one of: any, inside_instep, outside_instep."
+                "Expected one of: any, instep, inside_instep, outside_instep."
             )
 
         if mode == "right":
@@ -1337,6 +1337,133 @@ def _apply_unified_stage1_command_inputs(cfg) -> None:
     cfg.commands.motion.locomotion_task_state_enabled = True
     cfg.commands.motion.locomotion_task_state_sequence = ("idle",)
     _apply_unified_control_command_observations(cfg)
+
+
+def _apply_unified_reference_command_inputs(cfg) -> None:
+    """Expose reference root velocity through the unified command inputs.
+
+    Moving reference frames must not be paired with a synthetic zero-speed
+    IDLE input. ``reference`` mode maps the task-frame reference anchor
+    velocity to the polar command, while the default state representation is
+    DRIBBLE on every frame. This gives S1/S2 the same command semantics used
+    by the S3 task policy.
+    """
+    cfg.commands.motion.locomotion_command_mode = "reference"
+    cfg.commands.motion.locomotion_task_state_enabled = False
+    cfg.commands.motion.locomotion_task_state_sequence = ("dribble",)
+    _apply_unified_control_command_observations(cfg)
+
+
+def _apply_unified_163_contract(cfg) -> None:
+    """Install the observation/action contract shared by the 3-stage path.
+
+    The actor input remains 163-D in every stage: base motion observations,
+    ``anchor_ball_polar``, polar command, and one-hot task state. The projected
+    29-D action and effective-action feedback are also shared so recurrent
+    input semantics do not change at a stage boundary.
+    """
+    _apply_cg_pretrain_obs(cfg)
+    _remove_unified_kick_only_terms(cfg)
+    _apply_unified_control_action_contract(cfg)
+
+
+def _disable_reference_ball_contact_terms(cfg) -> None:
+    """Remove reference-timed ball and contact-position objectives for S3."""
+    for reward_name in (
+        "dribbling_cg_demo_ball_tracking",
+        "dribbling_cg_foot_ball_distance",
+        "dribbling_cg_contact_consistency",
+        "dribbling_cg_premature_contact",
+        "dribbling_cg_foot_consistency",
+        "dribbling_phase_graph_alignment",
+        "dribbling_support_ankle_roll",
+    ):
+        if hasattr(cfg.rewards, reward_name):
+            setattr(cfg.rewards, reward_name, None)
+
+    # Keep reference gait only between touches. At contact, the task owns the
+    # foot, surface, time, and ball position.
+    if hasattr(cfg.rewards, "motion_foot_pos"):
+        cfg.rewards.motion_foot_pos.weight = 0.0
+    if hasattr(cfg.rewards, "dribbling_legal_foot_touch"):
+        cfg.rewards.dribbling_legal_foot_touch.params["cg_gated"] = False
+    if hasattr(cfg.rewards, "dribbling_rapid_retouch_penalty"):
+        cfg.rewards.dribbling_rapid_retouch_penalty.params["cg_gated"] = False
+
+
+@configclass
+class G1FlatMotionCGPretrainUnifiedS1MimicEnvCfg(G1FlatMotionPretrainEnvCfg):
+    """S1: pure task-frame imitation conditioned on exact reference velocity.
+
+    The ball input is retained solely to preserve the 163-D unified interface;
+    S1 has no ball or contact reward.
+
+    Gym id: ``Tracking-CG-G1-Motion-RNN-unified-s1-mimic``.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_unified_163_contract(self)
+        _apply_unified_reference_command_inputs(self)
+
+
+@configclass
+class G1FlatCGDribblingUnifiedS2ReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
+    """S2: reference-conditioned dribbling with physical contact execution.
+
+    The demo ball aligns only outside labelled contact windows. Foot-ball
+    placement, contact timing, and the kick itself remain physically executed
+    and receive the existing contact-graph rewards.
+
+    Gym id: ``Tracking-CG-G1-Dribbling-RNN-unified-s2-reference``.
+    """
+
+    dribble_contact_mode: str = "both"
+    dribble_contact_surface: str = "instep"
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dribbling_locomotion_velocity_terms(
+            self,
+            include_cartesian_command_observations=False,
+        )
+        _apply_unified_163_contract(self)
+        _apply_unified_reference_command_inputs(self)
+
+        setattr(self.commands.motion, "dribble_cg_use_demo_ball", True)
+        setattr(self.commands.motion, "dribble_cg_use_task_frame", False)
+        setattr(self.commands.motion, "dribble_cg_snap_mode", "non_contact_only")
+        self.commands.motion.mimic_align_locomotion_heading = False
+
+
+@configclass
+class G1FlatCGDribblingUnifiedS3TaskEnvCfg(G1FlatCGDribblingEnvCfg):
+    """S3: free task-command dribbling without reference contact placement.
+
+    Task commands own root motion and ball interaction. Reference data remains
+    a torso/gait style prior but cannot dictate touching foot, instep side,
+    ball position, or contact time.
+
+    Gym id: ``Tracking-CG-G1-Dribbling-RNN-unified-s3-task``.
+    """
+
+    dribble_contact_mode: str = "both"
+    dribble_contact_surface: str = "instep"
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dribbling_full_control_velocity_terms(
+            self,
+            include_cartesian_command_observations=False,
+        )
+        _apply_unified_163_contract(self)
+        _disable_reference_ball_contact_terms(self)
+
+        # S3 always starts a task-owned physical ball ahead of the pelvis.
+        setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
+        setattr(self.commands.motion, "dribble_cg_use_task_frame", True)
+        setattr(self.commands.motion, "dribble_cg_fixed_touch_foot", None)
+        setattr(self.commands.motion, "dribble_cg_fixed_touch_surface", None)
 
 
 @configclass
