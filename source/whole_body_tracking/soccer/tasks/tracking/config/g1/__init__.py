@@ -63,7 +63,7 @@ _register(
     "G1DribblingRecurrentPPORunnerCfg",
 )
 
-# CG Stage-1 variants.  Only unified-mimic has the exact unified-control input layout.
+# CG Stage-1 variants.  Both unified recipes have the exact unified-control input layout.
 _register(
     "Tracking-CG-G1-Motion-RNN-strict",
     soccer_dribbling_env_cfg.G1FlatMotionCGPretrainStrictEnvCfg,
@@ -77,5 +77,10 @@ _register(
 _register(
     "Tracking-CG-G1-Motion-RNN-unified-mimic",
     soccer_dribbling_env_cfg.G1FlatMotionCGPretrainUnifiedMimicEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
+    "Tracking-CG-G1-Motion-RNN-unified-strict",
+    soccer_dribbling_env_cfg.G1FlatMotionCGPretrainUnifiedStrictEnvCfg,
     "G1DribblingRecurrentPPORunnerCfg",
 )

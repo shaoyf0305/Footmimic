@@ -8,6 +8,7 @@ Read this before changing control-related code. Follow the constraints below.
 - Tracking-Flat-G1-SoccerDestination-v0 / -RNN-v0: retained minimal Kick environment (no kick-specific objective).
 - Tracking-Flat-G1-Dribbling-v0 / -RNN-v0: non-CG dribbling baseline.
 - Tracking-CG-G1-Motion-RNN-strict: raw-reference Stage-1 tracking.
+- Tracking-CG-G1-Motion-RNN-unified-strict: raw-reference Stage-1 tracking with the frozen unified Stage-2 input layout.
 - Tracking-CG-G1-Motion-RNN-mimic: legacy Stage-1 mimic for the frozen Stage-2 baselines.
 - Tracking-CG-G1-Dribbling-RNN-control: preserved v4.4 continuous Stage-2 command control (speed 0.40–1.50, heading, duration; +9 resume inputs).
 - Tracking-CG-G1-Dribbling-RNN-full-control: preserved stateful IDLE/DRIBBLE/STOP baseline.
@@ -52,7 +53,7 @@ Ball chase and sustained ball control matter. Do not cut chase or contact reward
 
 The geometric conflict between an oblique command and a ball ahead of the robot is intentional. Do not spawn or move the ball onto the command heading to remove that conflict. The policy should learn to turn while keeping the ball.
 
-For the unified task, resume only Motion-RNN-unified-mimic into Dribbling-RNN-unified-control.
+For the unified task, resume either Motion-RNN-unified-mimic or Motion-RNN-unified-strict into Dribbling-RNN-unified-control; both use the same input layout.
 
 Slalom clips already contain turns, but current control does not use demo yaw as the locomotion target. Mimic strips demo yaw into the task frame and root velocity comes from resampled commands. Having turns in the data does not mean the policy is learning to follow heading commands.
 

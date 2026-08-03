@@ -124,7 +124,7 @@ _STAGE1_LEG_VEL_BODY_NAMES = [
 
 
 def _apply_stage1_strict_mimic_pretrain(cfg) -> None:
-    """Stage-1 raw-reference motion tracking with no task-frame or reset perturbations.
+    """Stage-1 raw-reference motion tracking without task-frame or reset perturbations.
 
     This is the strict replay recipe: reward all of the original global anchor,
     relative-body pose, and global-body velocity terms in the demonstration frame.
@@ -133,8 +133,9 @@ def _apply_stage1_strict_mimic_pretrain(cfg) -> None:
 
     The standard action/limit/contact regularizers remain so the reference is
     reproduced by a physically feasible robot rather than by an unconstrained pose
-    player.  Domain randomization and reset noise are disabled here because they
-    would make the initial robot state differ from the reference being imitated.
+    player.  The base domain-randomization events intentionally remain enabled,
+    matching the unified-mimic recipe.  Reset noise is still disabled so each
+    episode starts at the exact sampled reference state.
     """
     cfg.commands.motion.anchor_body_name = "pelvis"
     cfg.commands.motion.mimic_align_task_frame = False
@@ -185,13 +186,11 @@ def _apply_stage1_strict_mimic_pretrain(cfg) -> None:
         "height": SOCCER_BALL_RADIUS,
     }
 
-    # No random material/COM/default-joint offsets or interval pushes in strict
-    # Stage-1.  The ball remains in the scene solely to preserve the CG observation
-    # layout; no ball/task reward is introduced by this configuration.
-    cfg.events.physics_material = None
-    cfg.events.add_joint_default_pos = None
-    cfg.events.base_com = None
-    cfg.events.push_robot = None
+    # Keep the base domain randomization: material friction/restitution,
+    # default-joint offsets, torso COM offsets, and interval velocity pushes.
+    # These are the same events and values used by unified-mimic.  The ball
+    # remains in the scene solely to preserve the CG observation layout; no
+    # ball/task reward is introduced by this configuration.
 
 
 def _apply_stage1_mimic_pretrain(cfg) -> None:

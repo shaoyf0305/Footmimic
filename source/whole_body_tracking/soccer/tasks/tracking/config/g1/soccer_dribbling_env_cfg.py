@@ -1354,12 +1354,30 @@ class G1FlatMotionCGPretrainUnifiedMimicEnvCfg(G1FlatMotionPretrainEnvCfg):
 
 
 @configclass
+class G1FlatMotionCGPretrainUnifiedStrictEnvCfg(G1FlatMotionStrictPretrainEnvCfg):
+    """Raw-reference strict Stage-1 with the frozen unified input interface.
+
+    Gym id: ``Tracking-CG-G1-Motion-RNN-unified-strict``.  It retains strict
+    global-reference tracking while exposing the same polar/IDLE command and
+    ball observations as unified-control, so the checkpoint needs no input
+    expansion when resumed into that Stage-2 task.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_cg_pretrain_obs(self)
+        _remove_unified_kick_only_terms(self)
+        _apply_unified_stage1_command_inputs(self)
+
+
+@configclass
 class G1FlatMotionCGPretrainStrictEnvCfg(G1FlatMotionStrictPretrainEnvCfg):
     """Strict CG Stage-1 (``Tracking-CG-G1-Motion-RNN-strict``).
 
     Tracks the raw demonstration root path, yaw, pose and velocity without the
-    task-frame transform or reset/domain perturbations used by the other Stage-1
-    recipes.  ``anchor_ball_polar`` is retained on both observation groups so its
+    task-frame transform or reset perturbations used by the other Stage-1
+    recipes.  It retains the standard domain randomization. ``anchor_ball_polar``
+    is retained on both observation groups so its
     policy layout matches the other CG Stage-1 environments.  Stage-2 adds command
     inputs on resume; only full-control additionally adds the task-state input.
     """
