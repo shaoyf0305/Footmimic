@@ -4,12 +4,19 @@
 Pipeline (XGen-style, football simplification):
 
 1. **Contact segments** (``dribble_cg_contact==1``, foot from ``dribble_cg_foot``):
-   Place the ball at the labeled ankle + a fixed offset in horizontal yaw
-   (``p_ball = p_foot + R_yaw @ phi``).
+   At a surface-labelled contact instant, transform a calibrated shoe-side point
+   by the ankle-roll link's full quaternion, then offset the ball centre along
+   the transformed side normal. Inside/outside is defined entirely in the
+   ankle-roll link's local frame (right inside = +Y; left inside = -Y), so the
+   complete foot yaw/pitch/roll determines the world-space contact geometry.
 
-2. **``traj_mode=hybrid``** (recommended): **contact** frames adhere to the foot
-   (ground foot bodies + optional medial/inward offset); **gaps** linearly interpolate
-   in XY between contact endpoints; pre-first-contact approaches the first touch.
+2. **``traj_mode=hybrid``** (recommended): for surface-labelled data, the rising
+   edge of each contact segment is the hand-labelled **contact instant**.  Only
+   that anchor is constrained to the shoe surface; the remaining ``+5`` CG
+   frames stay labelled for training but do not drag the ball with the foot.
+   Gaps linearly interpolate through the anchors and the tail releases with the
+   incoming ball velocity.  Missing surface labels preserve the legacy
+   contact-adhere behavior.
 
    ``foot_follow``: ball tracks a stepping foot every frame. ``lerp``: legacy gaps +
    anchor spawn (avoid for master data).
@@ -27,8 +34,9 @@ Pipeline (XGen-style, football simplification):
 pelvis. Use ``--auto_foot_indices`` (default) to pick the lowest, most mobile foot
 links (``LL_FOOT`` / ``LR_FOOT`` class).
 
-Writes ``ball_pos_w``, ``dribble_cg_foot_ball_dist``, and ``dribble_cg_dist_foot``
-into each ``.npz``.
+Writes ``ball_pos_w``, ``dribble_cg_foot_ball_dist``,
+``dribble_cg_dist_foot``, and the rising-edge mask
+``dribble_contact_anchor`` into each ``.npz``.
 """
 
 from __future__ import annotations
@@ -66,6 +74,15 @@ def _yaw_rotate_xy(yaw: np.ndarray, vec_xy: np.ndarray) -> np.ndarray:
     return np.stack([c * x - s * y, s * x + c * y], axis=-1)
 
 
+def _quat_rotate_wxyz(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate a 3-vector by a quaternion in wxyz order."""
+    q = np.asarray(q, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    w = float(q[0])
+    qv = q[1:4]
+    return v + 2.0 * (w * np.cross(qv, v) + np.cross(qv, np.cross(qv, v)))
+
+
 def _contact_segments(contact: np.ndarray, foot: np.ndarray) -> list[tuple[int, int, int]]:
     """Return list of (start, end, foot_id) for contiguous contact runs."""
     n = int(contact.size)
@@ -92,7 +109,9 @@ def _contact_segments(contact: np.ndarray, foot: np.ndarray) -> list[tuple[int, 
 def _resolve_anchor_body_index(num_bodies: int, anchor_body_index: int) -> int:
     if anchor_body_index >= 0:
         return anchor_body_index
-    return 0 if num_bodies >= 20 else 7
+    # Motion exports use body 0 as the floating-base pelvis. Keep heading and
+    # fallback translation/velocity pelvis-based for every body layout.
+    return 0
 
 
 def resolve_foot_body_indices(
@@ -214,8 +233,8 @@ def _inward_xy(
     right_foot_index: int,
     magnitude: float,
 ) -> np.ndarray:
-    """Unit inward (medial) offset in XY: left foot → toward right, vice versa."""
-    if magnitude <= 0.0:
+    """Signed medial offset in XY; a negative magnitude points lateral/outward."""
+    if abs(magnitude) <= 1.0e-12:
         return np.zeros(2, dtype=np.float64)
     lp = body_pos_w[t, left_foot_index, :2]
     rp = body_pos_w[t, right_foot_index, :2]
@@ -267,6 +286,7 @@ def synthesize_ball_trajectory(
     body_quat_w: np.ndarray,
     cg_contact: np.ndarray,
     cg_foot: np.ndarray,
+    cg_surface: np.ndarray | None = None,
     *,
     left_foot_index: int,
     right_foot_index: int,
@@ -275,6 +295,11 @@ def synthesize_ball_trajectory(
     foot_offset_x: float,
     foot_offset_y: float,
     foot_inner_offset: float,
+    foot_surface_offset: float,
+    foot_contact_x: float,
+    foot_half_width: float,
+    foot_contact_z: float,
+    terminal_forward_limit: float,
     init_forward_dist: float,
     use_foot_yaw: bool,
     traj_mode: str = "hybrid",
@@ -303,18 +328,102 @@ def synthesize_ball_trajectory(
     def _foot_idx(fid: int) -> int:
         return left_foot_index if fid == 0 else right_foot_index
 
-    def _place_contact_frame(t: int, fid: int) -> None:
-        """Adhere ball to foot: forward offset in foot yaw + medial (inward) shift."""
+    def _surface_id_at(t: int) -> int:
+        if cg_surface is None or t < 0 or t >= int(cg_surface.size):
+            return -1
+        return int(cg_surface[t])
+
+    def _segment_surface_id(s: int, e: int) -> int:
+        if cg_surface is None:
+            return -1
+        values = np.asarray(cg_surface[s : e + 1], dtype=np.int8)
+        values = values[(values == 0) | (values == 1)]
+        if values.size == 0:
+            return -1
+        return int(np.bincount(values.astype(np.int64), minlength=2).argmax())
+
+    def _guard_truncated_terminal_contact() -> None:
+        """Cap forward drift caused by a short contact cut off at clip end.
+
+        A terminal segment is considered truncated when it reaches ``T - 1``
+        and is shorter than the median of the preceding contact segments.  The
+        guard is limited to surface-labelled data so legacy motions retain their
+        exact historical synthesis.  Only anchor-local forward is clamped;
+        anchor-local lateral (and therefore the annotated side) is preserved.
+        """
+        if terminal_forward_limit < 0.0 or len(segs) < 2:
+            return
+        s_last, e_last, _ = segs[-1]
+        if e_last != T - 1 or _segment_surface_id(s_last, e_last) not in (0, 1):
+            return
+        prior_lengths = np.asarray([e - s + 1 for s, e, _ in segs[:-1]], dtype=np.float64)
+        expected_length = float(np.median(prior_lengths))
+        if (e_last - s_last + 1) >= expected_length:
+            return
+
+        for t in range(s_last, e_last + 1):
+            anchor_xy = body_pos_w[t, anchor_body_index, :2]
+            anchor_yaw = float(_yaw_from_quat_wxyz(body_quat_w[t, anchor_body_index]))
+            c, s = np.cos(anchor_yaw), np.sin(anchor_yaw)
+            delta = ball[t, :2] - anchor_xy
+            local_forward = c * delta[0] + s * delta[1]
+            if local_forward <= terminal_forward_limit:
+                continue
+            local_lateral = -s * delta[0] + c * delta[1]
+            ball[t, 0] = anchor_xy[0] + c * terminal_forward_limit - s * local_lateral
+            ball[t, 1] = anchor_xy[1] + s * terminal_forward_limit + c * local_lateral
+
+    def _place_contact_frame(t: int, fid: int, surface_id: int | None = None) -> None:
+        """Adhere ball to the requested side of the labeled foot."""
         fi = _foot_idx(fid)
-        foot_p = body_pos_w[t, fi, :2]
-        if use_foot_yaw and body_quat_w is not None:
-            yaw = _yaw_from_quat_wxyz(body_quat_w[t, fi])
+        foot_p = body_pos_w[t, fi]
+        sid = _surface_id_at(t) if surface_id is None else int(surface_id)
+        # Surface semantics and geometry both live in the ankle-roll frame.
+        # G1 local +Y points to the left: it is medial for the right foot and
+        # lateral for the left foot. The full foot quaternion then carries this
+        # fixed inside/outside axis (including yaw, pitch and roll) into world.
+        if sid in (0, 1):
+            medial_sign = 1.0 if fid == 1 else -1.0
+            side_local_sign = medial_sign if sid == 0 else -medial_sign
+
+            foot_q = body_quat_w[t, fi]
+            side_normal_w = _quat_rotate_wxyz(
+                foot_q,
+                np.array([0.0, side_local_sign, 0.0], dtype=np.float64),
+            )
+            side_normal_xy = side_normal_w[:2]
+            norm_xy = float(np.linalg.norm(side_normal_xy))
+            if norm_xy < 1.0e-6:
+                # A near-vertical local Y axis has no stable horizontal contact
+                # normal. Retain the foot-local sign without consulting pelvis.
+                side_normal_xy = np.array([0.0, side_local_sign], dtype=np.float64)
+            else:
+                side_normal_xy /= norm_xy
+
+            contact_local = np.array(
+                [foot_contact_x, side_local_sign * foot_half_width, foot_contact_z],
+                dtype=np.float64,
+            )
+            contact_w = foot_p.astype(np.float64) + _quat_rotate_wxyz(foot_q, contact_local)
+            ball_xy = contact_w[:2] + side_normal_xy * foot_surface_offset
         else:
-            yaw = _yaw_from_quat_wxyz(body_quat_w[t, anchor_body_index])
-        phi_fwd = np.array([foot_offset_x, foot_offset_y], dtype=np.float64)
-        off_fwd = _yaw_rotate_xy(np.asarray([yaw]), phi_fwd)[0]
-        off_in = _inward_xy(t, fid, body_pos_w, left_foot_index, right_foot_index, foot_inner_offset)
-        ball_xy = foot_p + off_fwd + off_in
+            # Preserve the historical inter-foot medial shift for datasets that
+            # do not carry dribble_cg_surface.
+            if use_foot_yaw and body_quat_w is not None:
+                yaw = _yaw_from_quat_wxyz(body_quat_w[t, fi])
+            else:
+                yaw = _yaw_from_quat_wxyz(body_quat_w[t, anchor_body_index])
+            phi_fwd = np.array([foot_offset_x, foot_offset_y], dtype=np.float64)
+            off_fwd = _yaw_rotate_xy(np.asarray([yaw]), phi_fwd)[0]
+            off_side = _inward_xy(
+                t,
+                fid,
+                body_pos_w,
+                left_foot_index,
+                right_foot_index,
+                foot_inner_offset,
+            )
+            ball_xy = foot_p[:2] + off_fwd + off_side
         ball[t, 0] = ball_xy[0]
         ball[t, 1] = ball_xy[1]
         ball[t, 2] = ball_radius
@@ -335,10 +444,61 @@ def synthesize_ball_trajectory(
         if not segs:
             return
 
+        # Surface labels originate from manually clicked contact instants.  The
+        # label tool expands each instant to +5 frames for CG training; ball
+        # synthesis must not interpret that window as six frames of rigid
+        # foot-ball adhesion.  Constrain only the segment starts and interpolate
+        # an independent ball trajectory through those anchors.
+        surface_anchors = [
+            (s, fid, _segment_surface_id(s, e))
+            for s, e, fid in segs
+            if _segment_surface_id(s, e) in (0, 1)
+        ]
+        if len(surface_anchors) == len(segs) and surface_anchors:
+            for t, fid, sid in surface_anchors:
+                _place_contact_frame(t, fid, sid)
+
+            for k in range(len(surface_anchors) - 1):
+                t0, _, _ = surface_anchors[k]
+                t1, fid1, _ = surface_anchors[k + 1]
+                _lerp_gap(t0, t1, ball[t0, :2], ball[t1, :2], fid1)
+
+            t_first, fid_first, sid_first = surface_anchors[0]
+            if t_first > 0:
+                _place_contact_frame(0, fid_first, sid_first)
+                p_start = ball[0, :2].copy()
+                _lerp_gap(-1, t_first, p_start, ball[t_first, :2], fid_first)
+                ball[0, :2] = p_start
+                placement_foot[0] = fid_first
+
+            # Release after the final anchor with the incoming anchor-to-anchor
+            # velocity.  This avoids both freezing in world space and following
+            # the final +5 CG frames with a rapidly rotating foot.
+            t_last, fid_last, _ = surface_anchors[-1]
+            if t_last < T - 1:
+                if len(surface_anchors) >= 2:
+                    t_prev = surface_anchors[-2][0]
+                    step_xy = (ball[t_last, :2] - ball[t_prev, :2]) / float(t_last - t_prev)
+                else:
+                    step_xy = body_pos_w[t_last, anchor_body_index, :2] * 0.0
+                    if t_last > 0:
+                        step_xy = body_pos_w[t_last, anchor_body_index, :2] - body_pos_w[t_last - 1, anchor_body_index, :2]
+                    elif T > 1:
+                        step_xy = body_pos_w[1, anchor_body_index, :2] - body_pos_w[0, anchor_body_index, :2]
+                for t in range(t_last + 1, T):
+                    ball[t, :2] = ball[t_last, :2] + float(t - t_last) * step_xy
+                    ball[t, 2] = ball_radius
+                    placement_foot[t] = fid_last
+            return
+
         for s, e, fid in segs:
             for t in range(s, e + 1):
                 seg_fid = int(cg_foot[t]) if cg_foot[t] >= 0 else fid
                 _place_contact_frame(t, seg_fid)
+
+        # Do this before gap interpolation: the preceding gap then approaches
+        # the guarded terminal endpoint smoothly instead of snapping at contact.
+        _guard_truncated_terminal_contact()
 
         for k in range(len(segs) - 1):
             s0, e0, _ = segs[k]
@@ -347,7 +507,7 @@ def synthesize_ball_trajectory(
 
         s0, _, fid0 = segs[0]
         if s0 > 0:
-            _place_contact_frame(0, fid0)
+            _place_contact_frame(0, fid0, _segment_surface_id(*segs[0][:2]))
             p_start = ball[0, :2].copy()
             _lerp_gap(-1, s0, p_start, ball[s0, :2], fid0)
             ball[0, :2] = p_start
@@ -392,6 +552,8 @@ def synthesize_ball_trajectory(
         for s, e, fid in segs:
             for t in range(s, e + 1):
                 _place_contact_frame(t, fid)
+
+        _guard_truncated_terminal_contact()
 
         for k in range(len(segs) - 1):
             s0, e0, _ = segs[k]
@@ -456,12 +618,55 @@ def main() -> None:
         "--foot_inner_offset",
         type=float,
         default=0.035,
-        help="Medial shift (m) toward the other foot during contact adhere (0=disable).",
+        help=(
+            "Legacy medial shift (m) for motions without surface labels (0=disable)."
+        ),
+    )
+    parser.add_argument(
+        "--foot_surface_offset",
+        type=float,
+        default=0.11,
+        help=(
+            "Ball-centre clearance (m) along the ankle-link side normal, measured from the "
+            "shoe edge at a contact anchor (default: ball radius, 0.11 m)."
+        ),
+    )
+    parser.add_argument(
+        "--foot_contact_x",
+        type=float,
+        default=0.04,
+        help="Shoe-side contact point X in ankle-roll local coordinates (m; default: 0.04).",
+    )
+    parser.add_argument(
+        "--foot_half_width",
+        type=float,
+        default=0.026,
+        help="Shoe half-width used for inside/outside surface points (m; default: 0.026).",
+    )
+    parser.add_argument(
+        "--foot_contact_z",
+        type=float,
+        default=-0.025,
+        help="Shoe-side contact point Z in ankle-roll local coordinates (m; default: -0.025).",
+    )
+    parser.add_argument(
+        "--terminal_forward_limit",
+        type=float,
+        default=0.12,
+        help=(
+            "Maximum ball forward offset (m) from the body anchor for a surface-labelled "
+            "contact truncated at clip end; negative disables the guard (default: 0.12)."
+        ),
     )
     parser.add_argument("--init_forward_dist", type=float, default=0.45, help="Pre-contact spawn distance (m, lerp mode only)")
     parser.add_argument("--left_foot_index", type=int, default=-1, help="Left foot body index (-1 = auto)")
     parser.add_argument("--right_foot_index", type=int, default=-1, help="Right foot body index (-1 = auto)")
-    parser.add_argument("--anchor_body_index", type=int, default=-1, help="Anchor body for yaw fallback (-1 = pelvis/torso auto)")
+    parser.add_argument(
+        "--anchor_body_index",
+        type=int,
+        default=-1,
+        help="Anchor body for heading fallback (-1 = pelvis, body index 0).",
+    )
     parser.add_argument(
         "--no_auto_foot_indices",
         action="store_true",
@@ -472,12 +677,18 @@ def main() -> None:
         type=str,
         default="hybrid",
         choices=("hybrid", "foot_follow", "lerp"),
-        help="hybrid: contact adhere + gap lerp; foot_follow: always track foot; lerp: legacy.",
+        help=(
+            "hybrid: surface contact-instant anchors + gap lerp (legacy adhere without surface); "
+            "foot_follow: always track foot; lerp: legacy."
+        ),
     )
     parser.add_argument(
         "--no_foot_yaw",
         action="store_true",
-        help="Use anchor/torso yaw for offset (default: foot quaternion yaw).",
+        help=(
+            "Use pelvis/anchor yaw for legacy contacts without surface labels "
+            "(surface-labelled contacts always use full foot yaw/pitch/roll)."
+        ),
     )
     args = parser.parse_args()
 
@@ -509,6 +720,10 @@ def main() -> None:
                 cg_foot = np.asarray(d["dribble_cg_foot"], dtype=np.int8).reshape(-1)[:T]
             else:
                 cg_foot = np.full(T, -1, dtype=np.int8)
+            if "dribble_cg_surface" in d.files:
+                cg_surface = np.asarray(d["dribble_cg_surface"], dtype=np.int8).reshape(-1)[:T]
+            else:
+                cg_surface = None
 
         li = 3 if args.no_auto_foot_indices and args.left_foot_index < 0 else args.left_foot_index
         ri = 6 if args.no_auto_foot_indices and args.right_foot_index < 0 else args.right_foot_index
@@ -518,6 +733,7 @@ def main() -> None:
             body_quat,
             cg_contact,
             cg_foot,
+            cg_surface,
             left_foot_index=li,
             right_foot_index=ri,
             anchor_body_index=args.anchor_body_index,
@@ -525,11 +741,22 @@ def main() -> None:
             foot_offset_x=args.foot_offset_x,
             foot_offset_y=args.foot_offset_y,
             foot_inner_offset=args.foot_inner_offset,
+            foot_surface_offset=args.foot_surface_offset,
+            foot_contact_x=args.foot_contact_x,
+            foot_half_width=args.foot_half_width,
+            foot_contact_z=args.foot_contact_z,
+            terminal_forward_limit=args.terminal_forward_limit,
             init_forward_dist=args.init_forward_dist,
             use_foot_yaw=not args.no_foot_yaw,
             traj_mode=args.traj_mode,
             auto_foot_indices=not args.no_auto_foot_indices,
         )
+
+        contact_anchor = np.zeros(T, dtype=np.int8)
+        if T > 0:
+            contact_anchor[0] = np.int8(cg_contact[0] > 0)
+        if T > 1:
+            contact_anchor[1:] = ((cg_contact[1:] > 0) & (cg_contact[:-1] <= 0)).astype(np.int8)
 
         _npz_replace(
             target,
@@ -537,6 +764,7 @@ def main() -> None:
                 "ball_pos_w": ball.astype(np.float32),
                 "dribble_cg_foot_ball_dist": dist.astype(np.float32),
                 "dribble_cg_dist_foot": dist_foot.astype(np.int8),
+                "dribble_contact_anchor": contact_anchor,
             },
         )
         n_labeled = int(np.sum(dist >= 0))

@@ -1,0 +1,30 @@
+{
+  "version": 2,
+  "description": "Manual strict-single contact labels mapped from 30 fps to 50 fps.",
+  "labels": {
+    "master_001675_001884_unitree_g1.npz": {
+      "kick_leg": "right",
+      "kick_frame": -1,
+      "kick_end_frame": -1,
+      "contact_segments": [
+        {"start": 35, "end": 40, "foot": "right", "surface": "outside_instep"},
+        {"start": 67, "end": 72, "foot": "right", "surface": "inside_instep"},
+        {"start": 85, "end": 90, "foot": "right", "surface": "outside_instep"},
+        {"start": 107, "end": 112, "foot": "right", "surface": "outside_instep"},
+        {"start": 123, "end": 128, "foot": "right", "surface": "outside_instep"},
+        {"start": 145, "end": 150, "foot": "right", "surface": "inside_instep"},
+        {"start": 163, "end": 168, "foot": "right", "surface": "inside_instep"},
+        {"start": 185, "end": 190, "foot": "right", "surface": "outside_instep"},
+        {"start": 202, "end": 207, "foot": "right", "surface": "outside_instep"},
+        {"start": 225, "end": 230, "foot": "right", "surface": "inside_instep"},
+        {"start": 240, "end": 245, "foot": "right", "surface": "inside_instep"},
+        {"start": 263, "end": 268, "foot": "right", "surface": "outside_instep"},
+        {"start": 278, "end": 283, "foot": "right", "surface": "outside_instep"},
+        {"start": 303, "end": 308, "foot": "right", "surface": "inside_instep"},
+        {"start": 325, "end": 330, "foot": "right", "surface": "inside_instep"}
+      ],
+      "notes": "Source labels use the one-based OpenCV display counter at 30 fps: 22w 41n 52w 65w 75w 88n 99n 112w 122w 136n 145n 159w 168w 183n 196n; w=outside_instep, n=inside_instep, all right foot. Mapped to zero-based 50 fps by round((frame - 1) * 50 / 30), with +5 end frames. The reference is trimmed after frame 330 to remove the high-motion tail, so the original terminal 208w contact is intentionally discarded.",
+      "file": "master_001675_001884_unitree_g1.npz"
+    }
+  }
+}

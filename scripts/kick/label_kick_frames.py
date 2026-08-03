@@ -6,7 +6,7 @@ import os
 import cv2
 import glob
 
-VIDEO_ROOT = "usage/soccerkicks"
+VIDEO_ROOT = "/data/Footmimic/pipeline/master1/gvhmr"
 LABEL_FILE = "kick_labels.txt"
 
 # 自动生成空label文件

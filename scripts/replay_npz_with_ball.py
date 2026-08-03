@@ -238,6 +238,11 @@ class SoccerMotionReplayData:
             cc = np.asarray(data["dribble_cg_contact"], dtype=np.int8).reshape(-1)[: self.time_step_total]
             self.cg_contact = torch.tensor(cc, device=device, dtype=torch.bool)
 
+        self.contact_anchor = None
+        if "dribble_contact_anchor" in data.files:
+            ca = np.asarray(data["dribble_contact_anchor"], dtype=np.int8).reshape(-1)[: self.time_step_total]
+            self.contact_anchor = torch.tensor(ca, device=device, dtype=torch.bool)
+
         self.cg_foot_ball_dist = None
         if "dribble_cg_foot_ball_dist" in data.files:
             cd = np.asarray(data["dribble_cg_foot_ball_dist"], dtype=np.float32).reshape(-1)[: self.time_step_total]
@@ -247,6 +252,11 @@ class SoccerMotionReplayData:
         if "dribble_cg_foot" in data.files:
             cf = np.asarray(data["dribble_cg_foot"], dtype=np.int8).reshape(-1)[: self.time_step_total]
             self.cg_foot = torch.tensor(cf, device=device, dtype=torch.int8)
+
+        self.cg_surface = None
+        if "dribble_cg_surface" in data.files:
+            cs = np.asarray(data["dribble_cg_surface"], dtype=np.int8).reshape(-1)[: self.time_step_total]
+            self.cg_surface = torch.tensor(cs, device=device, dtype=torch.int8)
 
         self._body_index = torch.tensor([0], dtype=torch.long, device=device)
 
@@ -364,10 +374,17 @@ def _build_video_overlay(
     if motion.cg_contact is not None:
         contact = int(motion.cg_contact[frame_idx].item())
         lines.append(f"CG contact: {contact}")
+    if motion.contact_anchor is not None:
+        anchor = int(motion.contact_anchor[frame_idx].item())
+        lines.append(f"Contact anchor: {anchor}")
     if motion.cg_foot is not None:
         foot_id = int(motion.cg_foot[frame_idx].item())
         foot_lbl = {0: "L", 1: "R"}.get(foot_id, "-")
         lines.append(f"CG foot: {foot_lbl}")
+    if motion.cg_surface is not None:
+        surface_id = int(motion.cg_surface[frame_idx].item())
+        surface_lbl = {0: "inside", 1: "outside"}.get(surface_id, "-")
+        lines.append(f"CG surface: {surface_lbl}")
     if motion.cg_foot_ball_dist is not None:
         d = float(motion.cg_foot_ball_dist[frame_idx].item())
         lines.append(f"Foot-Ball dist: {d:.3f} m" if d >= 0.0 else "Foot-Ball dist: -")
@@ -529,6 +546,12 @@ def run_simulator(sim: SimulationContext, scene: InteractiveScene, motion_files:
             hud += f"  ball=({bp[0]:+.2f},{bp[1]:+.2f},{bp[2]:.2f})  |v|={spd:.2f}"
         if motion.cg_contact is not None:
             hud += f"  CG={int(motion.cg_contact[t].item())}"
+        if motion.contact_anchor is not None:
+            hud += f"  anchor={int(motion.contact_anchor[t].item())}"
+        if motion.cg_surface is not None:
+            surface_id = int(motion.cg_surface[t].item())
+            surface_lbl = {0: "inside", 1: "outside"}.get(surface_id, "-")
+            hud += f"  surface={surface_lbl}"
         if motion.cg_foot_ball_dist is not None:
             d = float(motion.cg_foot_ball_dist[t].item())
             if d >= 0.0:
