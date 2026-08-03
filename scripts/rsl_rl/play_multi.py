@@ -151,8 +151,7 @@ parser.add_argument(
     action="store_true",
     default=False,
     help=(
-        "Save arm and waist reference/actual joints, policy actions, pelvis/torso motion, phase, "
-        "and command values to a .npz file."
+        "Save action-layer, command, pelvis/torso, contact-region, phase, and reward telemetry to a .npz file."
     ),
 )
 parser.add_argument(
@@ -227,7 +226,10 @@ import pathlib
 import numpy as np
 import torch
 
-from soccer.tasks.tracking.mdp.rewards_dribbling import soccer_ball_contact_force_magnitude
+from soccer.tasks.tracking.mdp.rewards_dribbling import (
+    dribbling_contact_telemetry,
+    soccer_ball_contact_force_magnitude,
+)
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -350,6 +352,7 @@ def get_motion_files(motion_path: str) -> list[str]:
 _BALL_SENSOR_NAME = "soccer_ball_contact"
 _CONTACT_FORCE_THRESHOLD = 1.0
 _LAST_TERM_REASON: str = "-"
+_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v2"
 
 _ARM_DIAGNOSTIC_JOINT_NAMES = [
     "left_shoulder_pitch_joint",
@@ -493,6 +496,76 @@ def _world_quat_to_rpy(quat: torch.Tensor) -> torch.Tensor:
     pitch = torch.asin(torch.clamp(2.0 * (w * y - z * x), min=-1.0, max=1.0))
     yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
     return torch.stack((roll, pitch, yaw), dim=-1)
+
+
+def _diagnostic_reward_params(base_env, reward_name: str) -> dict:
+    """Return a reward's effective params, unwrapping task-state gates."""
+    rewards_cfg = getattr(getattr(base_env, "cfg", None), "rewards", None)
+    term_cfg = getattr(rewards_cfg, reward_name, None)
+    params = getattr(term_cfg, "params", None)
+    if not isinstance(params, dict):
+        return {}
+    nested = params.get("reward_params")
+    return dict(nested) if isinstance(nested, dict) else dict(params)
+
+
+def _diagnostic_contact_settings(base_env) -> dict:
+    """Resolve the exact legal-touch geometry configured for this task."""
+    params = _diagnostic_reward_params(base_env, "dribbling_legal_foot_touch")
+    all_body_cfg = params.get("all_body_cfg")
+    return {
+        "command_name": str(params.get("command_name", "motion")),
+        "ball_sensor_name": str(params.get("ball_sensor_name", _BALL_SENSOR_NAME)),
+        "all_body_cfg": all_body_cfg,
+        "num_ankle_links": int(params.get("num_ankle_links", 2)),
+        "contact_surface": str(params.get("contact_surface", "any")),
+        "medial_y_min": float(params.get("medial_y_min", 0.018)),
+        "instep_z_min": float(params.get("instep_z_min", 0.010)),
+        "instep_x_min": float(params.get("instep_x_min", -0.035)),
+        "instep_x_max": float(params.get("instep_x_max", 0.140)),
+        "contact_force_threshold": float(params.get("force_threshold", 14.0)),
+        "cg_gated": bool(params.get("cg_gated", False)),
+        "body_names": tuple(getattr(all_body_cfg, "body_names", ()) or ()),
+    }
+
+
+def _active_locomotion_command(command) -> dict[str, torch.Tensor | str | bool]:
+    """Describe the velocity command actually active for this policy step.
+
+    Reference-mode tasks derive their command from the yaw-aligned motion
+    anchor instead of the resampled/manual command buffers. This helper keeps
+    diagnostic fields correct for every mode.
+    """
+    mode = str(getattr(command, "locomotion_command_mode", "reference"))
+    if hasattr(command, "locomotion_lin_vel_command_w"):
+        lin_vel_w = command.locomotion_lin_vel_command_w()
+    else:
+        lin_vel_w = command.anchor_lin_vel_w
+    if hasattr(command, "locomotion_ang_vel_command_w"):
+        ang_vel_w = command.locomotion_ang_vel_command_w()
+    else:
+        ang_vel_w = command.anchor_ang_vel_w
+
+    speed = torch.norm(lin_vel_w[:, :2], dim=-1)
+    heading = torch.atan2(lin_vel_w[:, 1], lin_vel_w[:, 0])
+    heading_valid = speed > 1.0e-6
+    if mode in {"manual", "resampled"}:
+        target_speed = getattr(command, "locomotion_cmd_target_speed", command.locomotion_cmd_speed)
+        target_heading = getattr(command, "locomotion_cmd_target_heading", command.locomotion_cmd_heading)
+    else:
+        # A reference command has no independent requested endpoint.
+        target_speed = speed
+        target_heading = heading
+    return {
+        "mode": mode,
+        "lin_vel_w": lin_vel_w,
+        "ang_vel_w": ang_vel_w,
+        "speed": speed,
+        "heading": heading,
+        "heading_valid": heading_valid,
+        "target_speed": target_speed,
+        "target_heading": target_heading,
+    }
 
 
 def _create_joint_reference_constraint(env, margin: float, group: str, joint_names: list[str]) -> dict:
@@ -659,7 +732,10 @@ def _create_diagnostic(
             f"Motion command does not expose every trunk diagnostic body: {_TRUNK_DIAGNOSTIC_BODY_NAMES}."
         ) from exc
     action_term, action_joint_ids = _get_joint_position_action_term(base_env)
+    if hasattr(action_term, "diagnostic_snapshot_enabled"):
+        action_term.diagnostic_snapshot_enabled = True
     arm_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, joint_ids)
+    trunk_full_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, trunk_joint_ids)
     direct_upper_latent = bool(getattr(action_term, "uses_direct_upper_body_latent", False))
     if direct_upper_latent:
         trunk_action_ids = action_term.policy_action_ids_for_robot_joint_ids(trunk_joint_ids)
@@ -673,6 +749,7 @@ def _create_diagnostic(
     )
     reward_manager = getattr(base_env, "reward_manager", None)
     reward_term_names = np.asarray(getattr(reward_manager, "_term_names", []))
+    contact_settings = _diagnostic_contact_settings(base_env)
     constraint_groups = np.asarray([constraint["group"] for constraint in constraints])
     constraint_margins = np.asarray([constraint["margin"] for constraint in constraints], dtype=np.float32)
     constraint_joint_names = (
@@ -682,6 +759,18 @@ def _create_diagnostic(
     return {
         "path": output_path,
         "stride": int(stride),
+        "schema_version": _DIAGNOSTIC_SCHEMA_VERSION,
+        "sample_timing": (
+            "state/reference/policy/submitted/contact are pre-step; reward/done/executed_action "
+            "are the resulting transition"
+        ),
+        "action_value_semantics": np.asarray(
+            [
+                "policy_action: raw policy output before playback constraints",
+                "submitted_action: action passed to env.step after playback constraints",
+                "effective_action: action after action-layer projection, limits, and filtering",
+            ]
+        ),
         "joint_ids": torch.as_tensor(joint_ids, dtype=torch.long, device=base_env.device),
         "joint_names": np.asarray(_ARM_DIAGNOSTIC_JOINT_NAMES),
         "action_ids": torch.as_tensor(arm_action_ids, dtype=torch.long, device=base_env.device),
@@ -689,6 +778,9 @@ def _create_diagnostic(
         "trunk_joint_ids": torch.as_tensor(trunk_joint_ids, dtype=torch.long, device=base_env.device),
         "trunk_joint_names": np.asarray(_TRUNK_DIAGNOSTIC_JOINT_NAMES),
         "trunk_action_ids": torch.as_tensor(trunk_action_ids, dtype=torch.long, device=base_env.device),
+        "trunk_full_action_ids": torch.as_tensor(
+            trunk_full_action_ids, dtype=torch.long, device=base_env.device
+        ),
         "trunk_body_ids": torch.as_tensor(trunk_body_ids, dtype=torch.long, device=base_env.device),
         "trunk_reference_body_ids": torch.as_tensor(
             trunk_reference_body_ids, dtype=torch.long, device=base_env.device
@@ -703,27 +795,43 @@ def _create_diagnostic(
         "constraint_margins": constraint_margins,
         "waist_roll_stiffness_scale": float(waist_roll_stiffness_scale),
         "waist_roll_damping_scale": float(waist_roll_stiffness_scale) ** 0.5,
+        "contact_settings": contact_settings,
+        "contact_region_frame": "pelvis_yaw",
+        "contact_body_names": np.asarray(contact_settings["body_names"]),
+        "contact_surface": contact_settings["contact_surface"],
+        "contact_force_threshold": contact_settings["contact_force_threshold"],
+        "contact_cg_gated": contact_settings["cg_gated"],
         "step": [],
         "motion_idx": [],
         "style_phase": [],
         "segment_idx": [],
         "task_state": [],
+        "command_mode": [],
         "command_heading": [],
         "effective_command_speed": [],
         "effective_command_heading": [],
+        "active_command_lin_vel_w": [],
+        "active_command_ang_vel_w": [],
+        "command_heading_valid": [],
         "pelvis_yaw": [],
         "reference_joint_pos": [],
         "reference_joint_vel": [],
         "actual_joint_pos": [],
         "actual_joint_vel": [],
         "policy_action": [],
+        "submitted_action": [],
+        "effective_action": [],
         "applied_action": [],
+        "action_snapshot_available": [],
+        "post_step_state_valid": [],
         "upper_policy_latent": [],
         "trunk_reference_joint_pos": [],
         "trunk_reference_joint_vel": [],
         "trunk_actual_joint_pos": [],
         "trunk_actual_joint_vel": [],
         "trunk_policy_action": [],
+        "trunk_submitted_action": [],
+        "trunk_effective_action": [],
         "trunk_applied_action": [],
         "trunk_processed_joint_target": [],
         "trunk_target_minus_reference": [],
@@ -750,6 +858,25 @@ def _create_diagnostic(
         "torso_minus_pelvis_ang_vel_w": [],
         "ball_pelvis_xy_distance": [],
         "ball_contact": [],
+        "contact_force_magnitude": [],
+        "contact_body_idx": [],
+        "contact_foot": [],
+        "contact_legal_ankle": [],
+        "contact_generic_instep": [],
+        "contact_inside_instep": [],
+        "contact_outside_instep": [],
+        "contact_requested_surface_match": [],
+        "contact_gentle": [],
+        "contact_legal_touch": [],
+        "contact_cg_gate_pass": [],
+        "contact_cg_eligible": [],
+        "contact_ball_offset_pelvis_yaw": [],
+        "contact_medial_offset": [],
+        "cg_label_available": [],
+        "cg_reference_contact": [],
+        "cg_reference_foot": [],
+        "cg_reference_surface": [],
+        "cg_contact_foot_match": [],
         "ball_xy_speed": [],
         "ball_command_forward_speed": [],
         "pelvis_xy_speed": [],
@@ -837,13 +964,19 @@ def _append_diagnostic(
     diagnostic["segment_idx"].append(int(command._locomotion_segment_idx[0].item()))
     task_state = getattr(command, "locomotion_task_state", None)
     diagnostic["task_state"].append(1 if task_state is None else int(task_state[0].item()))
-    diagnostic["command_heading"].append(float(command.locomotion_cmd_heading[0].item()))
-    target_speed = getattr(command, "locomotion_cmd_target_speed", command.locomotion_cmd_speed)
-    target_heading = getattr(command, "locomotion_cmd_target_heading", command.locomotion_cmd_heading)
-    diagnostic["command_target_speed"].append(float(target_speed[0].item()))
-    diagnostic["command_target_heading"].append(float(target_heading[0].item()))
-    diagnostic["effective_command_speed"].append(float(command.locomotion_cmd_speed[0].item()))
-    diagnostic["effective_command_heading"].append(float(command.locomotion_cmd_heading[0].item()))
+    active_command = _active_locomotion_command(command)
+    active_speed = active_command["speed"]
+    active_heading = active_command["heading"]
+    heading_valid = active_command["heading_valid"]
+    diagnostic["command_mode"].append(str(active_command["mode"]))
+    diagnostic["command_heading"].append(float(active_heading[0].item()))
+    diagnostic["command_target_speed"].append(float(active_command["target_speed"][0].item()))
+    diagnostic["command_target_heading"].append(float(active_command["target_heading"][0].item()))
+    diagnostic["effective_command_speed"].append(float(active_speed[0].item()))
+    diagnostic["effective_command_heading"].append(float(active_heading[0].item()))
+    diagnostic["active_command_lin_vel_w"].append(_cpu(active_command["lin_vel_w"]))
+    diagnostic["active_command_ang_vel_w"].append(_cpu(active_command["ang_vel_w"]))
+    diagnostic["command_heading_valid"].append(bool(heading_valid[0].item()))
 
     pelvis_id = robot.body_names.index("pelvis")
     pelvis_quat = robot.data.body_quat_w[0, pelvis_id]
@@ -857,14 +990,27 @@ def _append_diagnostic(
     diagnostic["actual_joint_vel"].append(_cpu(robot.data.joint_vel[:, ids]))
     action_term = base_env.action_manager.get_term("joint_pos")
     if diagnostic["direct_upper_body_latent"]:
-        # A direct-latent policy has no per-arm input actions.  Store the
-        # decoded pre-envelope target alongside the physically effective arm
-        # action so the diagnostic remains comparable with legacy traces.
-        diagnostic["policy_action"].append(_cpu(action_term.manifold_raw_upper_target))
-        diagnostic["applied_action"].append(_cpu(action_term.effective_raw_actions[:, action_ids]))
-        diagnostic["upper_policy_latent"].append(_cpu(action_term.manifold_policy_latent))
+        # A direct-latent policy has no one-to-one arm action. Keep arm-shaped
+        # entries NaN and record the actual latent policy coordinates instead.
+        arm_nan = torch.full(
+            (policy_actions.shape[0], len(action_ids)), torch.nan,
+            dtype=policy_actions.dtype, device=policy_actions.device,
+        )
+        latent_ids = getattr(action_term, "_latent_policy_action_ids", None)
+        latent = (
+            policy_actions[:, latent_ids]
+            if isinstance(latent_ids, torch.Tensor)
+            else torch.full((policy_actions.shape[0], 0), torch.nan, device=policy_actions.device)
+        )
+        diagnostic["policy_action"].append(_cpu(arm_nan))
+        diagnostic["submitted_action"].append(_cpu(arm_nan))
+        diagnostic["applied_action"].append(_cpu(arm_nan))
+        diagnostic["upper_policy_latent"].append(_cpu(latent))
     else:
         diagnostic["policy_action"].append(_cpu(policy_actions[:, action_ids]))
+        diagnostic["submitted_action"].append(_cpu(applied_actions[:, action_ids]))
+        # Kept as a compatibility alias; use submitted_action/effective_action
+        # in new analysis code.
         diagnostic["applied_action"].append(_cpu(applied_actions[:, action_ids]))
         diagnostic["upper_policy_latent"].append(np.empty(0, dtype=np.float32))
     diagnostic["trunk_reference_joint_pos"].append(_cpu(command.joint_pos[:, trunk_ids]))
@@ -872,6 +1018,7 @@ def _append_diagnostic(
     diagnostic["trunk_actual_joint_pos"].append(_cpu(robot.data.joint_pos[:, trunk_ids]))
     diagnostic["trunk_actual_joint_vel"].append(_cpu(robot.data.joint_vel[:, trunk_ids]))
     diagnostic["trunk_policy_action"].append(_cpu(policy_actions[:, trunk_action_ids]))
+    diagnostic["trunk_submitted_action"].append(_cpu(applied_actions[:, trunk_action_ids]))
     diagnostic["trunk_applied_action"].append(_cpu(applied_actions[:, trunk_action_ids]))
 
     trunk_quat = robot.data.body_quat_w[0, trunk_body_ids]
@@ -907,26 +1054,76 @@ def _append_diagnostic(
     soccer_ball = base_env.scene["soccer_ball"]
     ball_delta_xy = soccer_ball.data.root_pos_w[0, :2] - robot.data.body_pos_w[0, pelvis_id, :2]
     diagnostic["ball_pelvis_xy_distance"].append(float(torch.norm(ball_delta_xy).item()))
-    contact_force = soccer_ball_contact_force_magnitude(base_env, _BALL_SENSOR_NAME)[0]
-    diagnostic["ball_contact"].append(bool(contact_force.item() > _CONTACT_FORCE_THRESHOLD))
+    contact_settings = diagnostic["contact_settings"]
+    contact = dribbling_contact_telemetry(
+        base_env,
+        command_name=contact_settings["command_name"],
+        ball_sensor_name=contact_settings["ball_sensor_name"],
+        all_body_cfg=contact_settings["all_body_cfg"],
+        num_ankle_links=contact_settings["num_ankle_links"],
+        contact_surface=contact_settings["contact_surface"],
+        medial_y_min=contact_settings["medial_y_min"],
+        instep_z_min=contact_settings["instep_z_min"],
+        instep_x_min=contact_settings["instep_x_min"],
+        instep_x_max=contact_settings["instep_x_max"],
+        contact_force_threshold=contact_settings["contact_force_threshold"],
+    )
+    diagnostic["ball_contact"].append(bool(contact["has_contact"][0].item()))
+    diagnostic["contact_force_magnitude"].append(float(contact["force_magnitude"][0].item()))
+    diagnostic["contact_body_idx"].append(int(contact["contact_body_idx"][0].item()))
+    diagnostic["contact_foot"].append(int(contact["contact_foot"][0].item()))
+    diagnostic["contact_legal_ankle"].append(bool(contact["legal_ankle"][0].item()))
+    diagnostic["contact_generic_instep"].append(bool(contact["generic_instep"][0].item()))
+    diagnostic["contact_inside_instep"].append(bool(contact["inside_instep"][0].item()))
+    diagnostic["contact_outside_instep"].append(bool(contact["outside_instep"][0].item()))
+    diagnostic["contact_requested_surface_match"].append(bool(contact["requested_surface_match"][0].item()))
+    diagnostic["contact_gentle"].append(bool(contact["gentle"][0].item()))
+    diagnostic["contact_legal_touch"].append(bool(contact["legal_touch"][0].item()))
+    diagnostic["contact_ball_offset_pelvis_yaw"].append(_cpu(contact["ball_offset_pelvis_yaw"]))
+    diagnostic["contact_medial_offset"].append(float(contact["medial_offset"][0].item()))
+    cg_labeled = getattr(command, "motion_has_dribble_cg_label", None)
+    cg_ref_contact = getattr(command, "dribble_cg_contact_ref", None)
+    cg_ref_foot = getattr(command, "dribble_cg_foot_ref", None)
+    cg_ref_surface = getattr(command, "dribble_cg_surface_ref", None)
+    has_cg_label = isinstance(cg_labeled, torch.Tensor) and bool(cg_labeled[0].item())
+    ref_contact = bool(cg_ref_contact[0].item()) if isinstance(cg_ref_contact, torch.Tensor) else False
+    ref_foot = int(cg_ref_foot[0].item()) if isinstance(cg_ref_foot, torch.Tensor) else -1
+    ref_surface = int(cg_ref_surface[0].item()) if isinstance(cg_ref_surface, torch.Tensor) else -1
+    actual_foot = int(contact["contact_foot"][0].item())
+    diagnostic["cg_label_available"].append(has_cg_label)
+    diagnostic["cg_reference_contact"].append(ref_contact)
+    diagnostic["cg_reference_foot"].append(ref_foot)
+    diagnostic["cg_reference_surface"].append(ref_surface)
+    diagnostic["cg_contact_foot_match"].append(
+        bool(contact["has_contact"][0].item()) and has_cg_label and ref_contact and actual_foot == ref_foot
+    )
+    cg_gate_pass = not (contact_settings["cg_gated"] and has_cg_label) or ref_contact
+    diagnostic["contact_cg_gate_pass"].append(cg_gate_pass)
+    diagnostic["contact_cg_eligible"].append(
+        bool(contact["legal_touch"][0].item()) and cg_gate_pass
+    )
     ball_vel_xy = soccer_ball.data.root_lin_vel_w[0, :2]
     diagnostic["ball_xy_speed"].append(float(torch.norm(ball_vel_xy).item()))
-    command_dir = torch.stack((
-        torch.cos(command.locomotion_cmd_heading[0]),
-        torch.sin(command.locomotion_cmd_heading[0]),
-    ))
-    diagnostic["ball_command_forward_speed"].append(float(torch.dot(ball_vel_xy, command_dir).item()))
+    if bool(heading_valid[0].item()):
+        command_dir = torch.stack((torch.cos(active_heading[0]), torch.sin(active_heading[0])))
+        ball_forward_speed = float(torch.dot(ball_vel_xy, command_dir).item())
+    else:
+        ball_forward_speed = np.nan
+    diagnostic["ball_command_forward_speed"].append(ball_forward_speed)
     diagnostic["pelvis_xy_speed"].append(float(torch.norm(robot.data.body_lin_vel_w[0, pelvis_id, :2]).item()))
     foot_ref_ids = [command.cfg.body_names.index(name) for name in _FOOT_DIAGNOSTIC_BODY_NAMES]
     foot_error = torch.norm(
         command.robot_body_pos_w[0, foot_ref_ids] - command.body_pos_relative_w[0, foot_ref_ids], dim=-1
     ).mean()
     diagnostic["foot_reference_position_error"].append(float(foot_error.item()))
-    heading_error = torch.atan2(
-        torch.sin(command.locomotion_cmd_heading[0] - diagnostic["pelvis_yaw"][-1]),
-        torch.cos(command.locomotion_cmd_heading[0] - diagnostic["pelvis_yaw"][-1]),
-    )
-    diagnostic["heading_error"].append(float(heading_error.item()))
+    if bool(heading_valid[0].item()):
+        heading_error = torch.atan2(
+            torch.sin(active_heading[0] - diagnostic["pelvis_yaw"][-1]),
+            torch.cos(active_heading[0] - diagnostic["pelvis_yaw"][-1]),
+        )
+        diagnostic["heading_error"].append(float(heading_error.item()))
+    else:
+        diagnostic["heading_error"].append(np.nan)
     no_contact_count = getattr(base_env, "_dribbling_no_contact_count", None)
     diagnostic["no_contact_count"].append(
         np.nan if no_contact_count is None else float(no_contact_count[0].item())
@@ -975,16 +1172,24 @@ def _append_diagnostic(
     return True
 
 
-def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
+def _append_upper_body_manifold_diagnostic(diagnostic: dict, env, dones: torch.Tensor) -> None:
     """Record post-step arm projection and trunk target/actuator telemetry."""
     base_env = _resolve_base_env(env)
     action_term = base_env.action_manager.get_term("joint_pos")
+    snapshot = getattr(action_term, "diagnostic_snapshot", {})
+    snapshot_available = isinstance(snapshot, dict) and bool(snapshot)
+    post_step_state_valid = not bool(dones[0].item())
 
     def _env0(name: str, fallback_shape: tuple[int, ...]) -> np.ndarray:
-        value = getattr(action_term, name, None)
+        value = snapshot.get(name, getattr(action_term, name, None)) if snapshot_available else getattr(action_term, name, None)
         if not isinstance(value, torch.Tensor):
             return np.full(fallback_shape, np.nan, dtype=np.float32)
         return value[0].detach().cpu().numpy().copy()
+
+    def _tensor(name: str):
+        if snapshot_available and isinstance(snapshot.get(name), torch.Tensor):
+            return snapshot[name]
+        return getattr(action_term, name, None)
 
     upper_dim = len(_ARM_DIAGNOSTIC_JOINT_NAMES)
     diagnostic["manifold_raw_upper_target"].append(
@@ -1062,21 +1267,45 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
     robot = base_env.scene[command.cfg.asset_name]
     trunk_ids = diagnostic["trunk_joint_ids"]
     trunk_action_ids = diagnostic["trunk_action_ids"]
-    processed_actions = getattr(action_term, "processed_actions", None)
+    trunk_full_action_ids = diagnostic["trunk_full_action_ids"]
+    effective_raw_actions = _tensor("effective_raw_actions")
+    if isinstance(effective_raw_actions, torch.Tensor):
+        diagnostic["effective_action"].append(
+            effective_raw_actions[0, diagnostic["action_ids"]].detach().cpu().numpy().copy()
+        )
+        diagnostic["trunk_effective_action"].append(
+            effective_raw_actions[0, trunk_full_action_ids].detach().cpu().numpy().copy()
+        )
+    else:
+        diagnostic["effective_action"].append(
+            np.full((len(diagnostic["action_ids"]),), np.nan, dtype=np.float32)
+        )
+        diagnostic["trunk_effective_action"].append(
+            np.full((len(_TRUNK_DIAGNOSTIC_JOINT_NAMES),), np.nan, dtype=np.float32)
+        )
+    diagnostic["action_snapshot_available"].append(snapshot_available)
+    diagnostic["post_step_state_valid"].append(post_step_state_valid)
+    processed_actions = _tensor("executed_joint_targets")
     if processed_actions is None:
         processed_actions = getattr(action_term, "_processed_actions", None)
 
     if isinstance(processed_actions, torch.Tensor):
-        trunk_target = processed_actions[0, trunk_action_ids]
+        trunk_target = processed_actions[0, trunk_full_action_ids]
     else:
         trunk_target = torch.full(
             (len(_TRUNK_DIAGNOSTIC_JOINT_NAMES),),
             float("nan"),
             dtype=robot.data.joint_pos.dtype,
             device=base_env.device,
-        )
+    )
     trunk_post_step_pos = robot.data.joint_pos[0, trunk_ids]
-    trunk_reference = command.joint_pos[0, trunk_ids]
+    # This row's target was formed from the reference recorded before
+    # env.step(). The command style phase may already have advanced now.
+    trunk_reference = torch.as_tensor(
+        diagnostic["trunk_reference_joint_pos"][-1],
+        dtype=trunk_target.dtype,
+        device=base_env.device,
+    )
     soft_limits = robot.data.soft_joint_pos_limits[0, trunk_ids]
     trunk_actual_limit_margin = torch.minimum(
         trunk_post_step_pos - soft_limits[:, 0], soft_limits[:, 1] - trunk_post_step_pos
@@ -1097,6 +1326,16 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
     effort_limit = torch.as_tensor(_TRUNK_EFFORT_LIMITS, dtype=trunk_target.dtype, device=base_env.device)
     computed_effort_utilization = torch.abs(trunk_computed_torque) / effort_limit
     effort_utilization = torch.abs(trunk_applied_torque) / effort_limit
+    if not post_step_state_valid:
+        # Isaac Lab may already have reset the articulation. The saved action
+        # target still belongs to this transition, but live body/joint/torque
+        # data now belongs to the next episode and must not be mixed in.
+        trunk_post_step_pos = torch.full_like(trunk_post_step_pos, torch.nan)
+        trunk_actual_limit_margin = torch.full_like(trunk_actual_limit_margin, torch.nan)
+        trunk_computed_torque = torch.full_like(trunk_computed_torque, torch.nan)
+        trunk_applied_torque = torch.full_like(trunk_applied_torque, torch.nan)
+        computed_effort_utilization = torch.full_like(computed_effort_utilization, torch.nan)
+        effort_utilization = torch.full_like(effort_utilization, torch.nan)
 
     def _trunk_cpu(value: torch.Tensor) -> np.ndarray:
         return value.detach().cpu().numpy().copy()
@@ -1113,7 +1352,12 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
     diagnostic["trunk_effort_limit"].append(_trunk_cpu(effort_limit))
     diagnostic["trunk_computed_effort_utilization"].append(_trunk_cpu(computed_effort_utilization))
     diagnostic["trunk_effort_utilization"].append(_trunk_cpu(effort_utilization))
-    diagnostic["trunk_effort_saturated"].append(_trunk_cpu(effort_utilization >= 0.98))
+    effort_saturated = (
+        effort_utilization >= 0.98
+        if post_step_state_valid
+        else torch.full_like(effort_utilization, torch.nan)
+    )
+    diagnostic["trunk_effort_saturated"].append(_trunk_cpu(effort_saturated))
 
 
 def _save_diagnostic(diagnostic: dict) -> None:
@@ -1123,11 +1367,13 @@ def _save_diagnostic(diagnostic: dict) -> None:
         return
     metadata_keys = {
         "path", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names", "task_state_names",
-        "trunk_joint_ids", "trunk_joint_names", "trunk_action_ids", "trunk_body_ids",
+        "trunk_joint_ids", "trunk_joint_names", "trunk_action_ids", "trunk_full_action_ids", "trunk_body_ids",
         "trunk_reference_body_ids", "trunk_body_names",
         "constraint_group", "constraint_margin", "constraint_joint_names", "constraint_groups",
         "constraint_margins", "waist_roll_stiffness_scale", "waist_roll_damping_scale",
-        "direct_upper_body_latent",
+        "direct_upper_body_latent", "schema_version", "sample_timing", "action_value_semantics",
+        "contact_settings", "contact_region_frame", "contact_body_names", "contact_surface",
+        "contact_force_threshold", "contact_cg_gated",
     }
     arrays = {
         key: np.asarray(value)
@@ -1147,14 +1393,27 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["waist_roll_stiffness_scale"] = np.asarray(diagnostic["waist_roll_stiffness_scale"])
     arrays["waist_roll_damping_scale"] = np.asarray(diagnostic["waist_roll_damping_scale"])
     arrays["direct_upper_body_latent"] = np.asarray(diagnostic["direct_upper_body_latent"])
+    arrays["schema_version"] = np.asarray(diagnostic["schema_version"])
+    arrays["sample_timing"] = np.asarray(diagnostic["sample_timing"])
+    arrays["action_value_semantics"] = diagnostic["action_value_semantics"]
+    arrays["contact_region_frame"] = np.asarray(diagnostic["contact_region_frame"])
+    arrays["contact_body_names"] = diagnostic["contact_body_names"]
+    arrays["contact_surface"] = np.asarray(diagnostic["contact_surface"])
+    arrays["contact_force_threshold"] = np.asarray(diagnostic["contact_force_threshold"])
+    arrays["contact_cg_gated"] = np.asarray(diagnostic["contact_cg_gated"])
     np.savez_compressed(diagnostic["path"], **arrays)
+
+    def _finite_mean(values: np.ndarray) -> float:
+        finite = values[np.isfinite(values)]
+        return float(np.mean(finite)) if finite.size else np.nan
+
     contact_rate = float(np.mean(arrays["ball_contact"]))
     ball_distance = float(np.mean(arrays["ball_pelvis_xy_distance"]))
     ball_speed = float(np.mean(arrays["ball_xy_speed"]))
-    ball_forward_speed = float(np.mean(arrays["ball_command_forward_speed"]))
+    ball_forward_speed = _finite_mean(arrays["ball_command_forward_speed"])
     pelvis_speed = float(np.mean(arrays["pelvis_xy_speed"]))
     foot_error = float(np.mean(arrays["foot_reference_position_error"]))
-    heading_error = float(np.mean(np.abs(arrays["heading_error"])))
+    heading_error = _finite_mean(np.abs(arrays["heading_error"]))
     task_state_names = np.asarray(["idle", "dribble", "stop"])
     task_state_counts = np.bincount(arrays["task_state"].astype(np.int64), minlength=3)[:3]
     task_state_summary = ", ".join(
@@ -1178,9 +1437,29 @@ def _save_diagnostic(diagnostic: dict) -> None:
     trunk_error = float(
         np.mean(np.abs(arrays["trunk_actual_joint_pos"] - arrays["trunk_reference_joint_pos"]))
     )
-    trunk_action_delta = np.diff(arrays["trunk_applied_action"], axis=0)
+    trunk_action_delta = np.diff(arrays["trunk_effective_action"], axis=0)
+    finite_trunk_action_delta = np.linalg.norm(trunk_action_delta, axis=1)
+    finite_trunk_action_delta = finite_trunk_action_delta[np.isfinite(finite_trunk_action_delta)]
     trunk_action_step = (
-        float(np.mean(np.linalg.norm(trunk_action_delta, axis=1))) if trunk_action_delta.size else np.nan
+        float(np.mean(finite_trunk_action_delta)) if finite_trunk_action_delta.size else np.nan
+    )
+    action_snapshot_coverage = float(np.mean(arrays["action_snapshot_available"].astype(np.float32)))
+    post_step_state_coverage = float(np.mean(arrays["post_step_state_valid"].astype(np.float32)))
+    contact_mask = arrays["ball_contact"].astype(bool)
+    legal_touch_rate = (
+        float(np.mean(arrays["contact_legal_touch"][contact_mask])) if np.any(contact_mask) else np.nan
+    )
+    cg_eligible_touch_rate = (
+        float(np.mean(arrays["contact_cg_eligible"][contact_mask])) if np.any(contact_mask) else np.nan
+    )
+    generic_instep_rate = (
+        float(np.mean(arrays["contact_generic_instep"][contact_mask])) if np.any(contact_mask) else np.nan
+    )
+    cg_expected_touch_mask = arrays["cg_label_available"].astype(bool) & arrays["cg_reference_contact"].astype(bool)
+    cg_foot_match_rate = (
+        float(np.mean(arrays["cg_contact_foot_match"][cg_expected_touch_mask]))
+        if np.any(cg_expected_touch_mask)
+        else np.nan
     )
     torso_rel_tilt = float(
         np.mean(np.linalg.norm(arrays["torso_minus_pelvis_rpy"][:, :2], axis=1))
@@ -1249,6 +1528,9 @@ def _save_diagnostic(diagnostic: dict) -> None:
     print(
         "[INFO] Counterfactual metrics: "
         f"contact_rate={contact_rate:.3f}  ball_pelvis_xy={ball_distance:.3f} m  "
+        f"legal_touch={legal_touch_rate:.3f}  cg_eligible={cg_eligible_touch_rate:.3f}  "
+        f"generic_instep={generic_instep_rate:.3f}  "
+        f"cg_foot_match={cg_foot_match_rate:.3f}  "
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
         f"pelvis_xy_speed={pelvis_speed:.3f} m/s  "
         f"task_states=({task_state_summary})  stop_settled={stop_settle_rate:.3f}  "
@@ -1257,7 +1539,9 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"stop_pelvis_w={stop_pelvis_angular_speed:.3f} rad/s  "
         f"foot_ref_err={foot_error:.3f} m  mean_abs_heading_err={heading_error:.3f} rad  "
         f"arm_joint_err={arm_error:.3f} rad  waist_joint_err={trunk_error:.3f} rad  "
-        f"waist_action_step={trunk_action_step:.3f}  torso_rel_tilt={torso_rel_tilt:.3f} rad  "
+        f"waist_effective_action_step={trunk_action_step:.3f}  action_snapshot={action_snapshot_coverage:.3f}  "
+        f"post_state_valid={post_step_state_coverage:.3f}  "
+        f"torso_rel_tilt={torso_rel_tilt:.3f} rad  "
         f"torso_rel_tilt_err={torso_rel_tilt_error:.3f} rad  "
         f"torso_rel_ang_vel={torso_rel_ang_vel:.3f} rad/s  manifold_projection={projection_error:.3f} rad  "
         f"manifold_nullspace={nullspace_residual:.3f} rad  "
@@ -1856,7 +2140,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # env stepping
             obs, reward, dones, _ = env.step(actions)
             if recorded_diagnostic_sample:
-                _append_upper_body_manifold_diagnostic(diagnostic, env)
+                _append_upper_body_manifold_diagnostic(diagnostic, env, dones)
                 diagnostic["step_reward"][-1] = float(reward[0].item())
                 diagnostic["done"].append(bool(dones[0].item()))
                 diagnostic["reward_terms"].append(_reward_term_values(base_env))

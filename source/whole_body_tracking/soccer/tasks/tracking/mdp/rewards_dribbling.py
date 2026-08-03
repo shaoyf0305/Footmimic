@@ -618,9 +618,99 @@ def _is_dribble_legal_ankle_contact(closest_body_idx: torch.Tensor, num_ankle_li
 _DRIBBLE_CONTACT_SURFACES = ("any", "instep", "inside_instep", "outside_instep")
 
 
+def _dribbling_contact_surface_geometry(
+    env: ManagerBasedRLEnv,
+    all_body_cfg: SceneEntityCfg | None,
+    closest_body_idx: torch.Tensor,
+    *,
+    command_name: str,
+    num_ankle_links: int,
+    medial_y_min: float,
+    instep_z_min: float,
+    instep_x_min: float,
+    instep_x_max: float,
+) -> dict[str, torch.Tensor]:
+    """Compute the shared pelvis-yaw contact-region geometry.
+
+    The reward and playback diagnostic both consume this helper. Keeping the
+    coordinates and thresholds in one place makes a recorded ``instep`` match
+    exactly the match used by the learning objective.
+    """
+    device = env.device
+    num_envs = env.num_envs
+    dtype = torch.float32
+    empty = {
+        "ball_offset_pelvis_yaw": torch.full((num_envs, 3), torch.nan, device=device, dtype=dtype),
+        "medial_offset": torch.full((num_envs,), torch.nan, device=device, dtype=dtype),
+        "medial_sign": torch.zeros(num_envs, device=device, dtype=dtype),
+        "legal_ankle": torch.zeros(num_envs, dtype=torch.bool, device=device),
+        "known_foot": torch.zeros(num_envs, dtype=torch.bool, device=device),
+        "instep": torch.zeros(num_envs, dtype=torch.bool, device=device),
+        "inside_instep": torch.zeros(num_envs, dtype=torch.bool, device=device),
+        "outside_instep": torch.zeros(num_envs, dtype=torch.bool, device=device),
+    }
+    if all_body_cfg is None or num_ankle_links <= 0:
+        return empty
+    if medial_y_min < 0.0 or instep_x_max <= instep_x_min:
+        raise ValueError("Invalid foot-contact surface bounds.")
+
+    names = tuple(all_body_cfg.body_names)
+    if not names:
+        return empty
+
+    robot = env.scene[all_body_cfg.name]
+    cache_name = "_dribbling_body_indices_cache"
+    cached = getattr(env, cache_name, None)
+    if cached is None or cached.get("names") != names:
+        body_indices = torch.as_tensor(
+            robot.find_bodies(all_body_cfg.body_names, preserve_order=True)[0],
+            dtype=torch.long,
+            device=device,
+        )
+        setattr(env, cache_name, {"names": names, "idx": body_indices})
+    body_indices = getattr(env, cache_name)["idx"]
+
+    selected_cfg_idx = closest_body_idx.clamp(min=0, max=len(names) - 1)
+    selected_body_idx = body_indices[selected_cfg_idx]
+    batch_ids = torch.arange(num_envs, device=device)
+    foot_pos_w = robot.data.body_pos_w[batch_ids, selected_body_idx]
+    ball_pos_w = env.scene["soccer_ball"].data.root_pos_w[:, :3]
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    pelvis_yaw_w = yaw_quat(command.robot_pelvis_quat_w)
+    ball_local = quat_apply_inverse(pelvis_yaw_w, ball_pos_w - foot_pos_w)
+
+    # In the pelvis yaw frame +Y is body-left. Thus the right foot's medial
+    # side is +Y, while the left foot's medial side is -Y.
+    medial_sign = torch.zeros(num_envs, dtype=ball_local.dtype, device=device)
+    for cfg_idx, body_name in enumerate(names):
+        if "right_ankle" in body_name:
+            medial_sign[selected_cfg_idx == cfg_idx] = 1.0
+        elif "left_ankle" in body_name:
+            medial_sign[selected_cfg_idx == cfg_idx] = -1.0
+
+    instep = (
+        (ball_local[:, 0] >= instep_x_min)
+        & (ball_local[:, 0] <= instep_x_max)
+        & (ball_local[:, 2] >= instep_z_min)
+    )
+    medial_offset = ball_local[:, 1] * medial_sign
+    known_foot = medial_sign != 0.0
+    legal_ankle = _is_dribble_legal_ankle_contact(closest_body_idx, num_ankle_links)
+    return {
+        "ball_offset_pelvis_yaw": ball_local,
+        "medial_offset": medial_offset,
+        "medial_sign": medial_sign,
+        "legal_ankle": legal_ankle,
+        "known_foot": known_foot,
+        "instep": instep,
+        "inside_instep": instep & (medial_offset >= medial_y_min),
+        "outside_instep": instep & (medial_offset <= -medial_y_min),
+    }
+
+
 def _dribbling_contact_surface_match(
     env: ManagerBasedRLEnv,
-    all_body_cfg: SceneEntityCfg,
+    all_body_cfg: SceneEntityCfg | None,
     closest_body_idx: torch.Tensor,
     *,
     command_name: str = "motion",
@@ -648,61 +738,129 @@ def _dribbling_contact_surface_match(
         )
     if surface == "any":
         return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
-    if all_body_cfg is None or num_ankle_links <= 0:
-        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    if medial_y_min < 0.0 or instep_x_max <= instep_x_min:
-        raise ValueError("Invalid foot-contact surface bounds.")
 
-    names = tuple(all_body_cfg.body_names)
-    if not names:
-        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-
-    robot = env.scene[all_body_cfg.name]
-    cache_name = "_dribbling_body_indices_cache"
-    cached = getattr(env, cache_name, None)
-    if cached is None or cached.get("names") != names:
-        body_indices = torch.as_tensor(
-            robot.find_bodies(all_body_cfg.body_names, preserve_order=True)[0],
-            dtype=torch.long,
-            device=env.device,
-        )
-        setattr(env, cache_name, {"names": names, "idx": body_indices})
-    body_indices = getattr(env, cache_name)["idx"]
-
-    selected_cfg_idx = closest_body_idx.clamp(min=0, max=len(names) - 1)
-    selected_body_idx = body_indices[selected_cfg_idx]
-    batch_ids = torch.arange(env.num_envs, device=env.device)
-    foot_pos_w = robot.data.body_pos_w[batch_ids, selected_body_idx]
-    ball_pos_w = env.scene["soccer_ball"].data.root_pos_w[:, :3]
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    pelvis_yaw_w = yaw_quat(command.robot_pelvis_quat_w)
-    ball_local = quat_apply_inverse(pelvis_yaw_w, ball_pos_w - foot_pos_w)
-
-    # In the pelvis yaw frame +Y is body-left. Thus the right foot's medial
-    # side is +Y, while the left foot's medial side is -Y.
-    medial_sign = torch.zeros(env.num_envs, dtype=ball_local.dtype, device=env.device)
-    for cfg_idx, body_name in enumerate(names):
-        if "right_ankle" in body_name:
-            medial_sign[selected_cfg_idx == cfg_idx] = 1.0
-        elif "left_ankle" in body_name:
-            medial_sign[selected_cfg_idx == cfg_idx] = -1.0
-
-    instep = (
-        (ball_local[:, 0] >= instep_x_min)
-        & (ball_local[:, 0] <= instep_x_max)
-        & (ball_local[:, 2] >= instep_z_min)
+    geometry = _dribbling_contact_surface_geometry(
+        env,
+        all_body_cfg,
+        closest_body_idx,
+        command_name=command_name,
+        num_ankle_links=num_ankle_links,
+        medial_y_min=medial_y_min,
+        instep_z_min=instep_z_min,
+        instep_x_min=instep_x_min,
+        instep_x_max=instep_x_max,
     )
-    medial_offset = ball_local[:, 1] * medial_sign
     if surface == "instep":
-        side_match = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        surface_geometry = geometry["instep"]
     elif surface == "inside_instep":
-        side_match = medial_offset >= medial_y_min
+        surface_geometry = geometry["inside_instep"]
     else:
-        side_match = medial_offset <= -medial_y_min
+        surface_geometry = geometry["outside_instep"]
+    return geometry["legal_ankle"] & geometry["known_foot"] & surface_geometry
 
-    known_foot = medial_sign != 0.0
-    legal_ankle = _is_dribble_legal_ankle_contact(closest_body_idx, num_ankle_links)
-    return legal_ankle & known_foot & instep & side_match
+
+def dribbling_contact_telemetry(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    all_body_cfg: SceneEntityCfg | None = None,
+    num_ankle_links: int = 2,
+    contact_surface: str = "any",
+    medial_y_min: float = 0.018,
+    instep_z_min: float = 0.010,
+    instep_x_min: float = -0.035,
+    instep_x_max: float = 0.140,
+    contact_force_threshold: float = 14.0,
+) -> dict[str, torch.Tensor]:
+    """Return contact-region telemetry using the exact reward geometry.
+
+    Values describe only a current sensor contact. ``ball_offset_pelvis_yaw``
+    is therefore NaN and ``contact_body_idx`` is -1 when the ball has no robot
+    contact. Foot ids use the CG convention: left=0, right=1, unknown=-1.
+    """
+    device = env.device
+    num_envs = env.num_envs
+    if all_body_cfg is None:
+        has_contact = soccer_ball_contact_force_magnitude(env, ball_sensor_name) > 1.0
+        force_mag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
+        false = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        return {
+            "has_contact": has_contact,
+            "force_magnitude": force_mag,
+            "contact_body_idx": torch.full((num_envs,), -1, dtype=torch.long, device=device),
+            "contact_foot": torch.full((num_envs,), -1, dtype=torch.long, device=device),
+            "legal_ankle": false,
+            "generic_instep": false,
+            "inside_instep": false,
+            "outside_instep": false,
+            "requested_surface_match": false,
+            "gentle": force_mag <= contact_force_threshold,
+            "legal_touch": false,
+            "ball_offset_pelvis_yaw": torch.full((num_envs, 3), torch.nan, device=device),
+            "medial_offset": torch.full((num_envs,), torch.nan, device=device),
+        }
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    has_contact, force_mag, closest_body_idx = _identify_contact_body(
+        env, command, ball_sensor_name, all_body_cfg
+    )
+    geometry = _dribbling_contact_surface_geometry(
+        env,
+        all_body_cfg,
+        closest_body_idx,
+        command_name=command_name,
+        num_ankle_links=num_ankle_links,
+        medial_y_min=medial_y_min,
+        instep_z_min=instep_z_min,
+        instep_x_min=instep_x_min,
+        instep_x_max=instep_x_max,
+    )
+    requested_surface_match = _dribbling_contact_surface_match(
+        env,
+        all_body_cfg,
+        closest_body_idx,
+        command_name=command_name,
+        contact_surface=contact_surface,
+        num_ankle_links=num_ankle_links,
+        medial_y_min=medial_y_min,
+        instep_z_min=instep_z_min,
+        instep_x_min=instep_x_min,
+        instep_x_max=instep_x_max,
+    )
+    contact_foot = torch.full((num_envs,), -1, dtype=torch.long, device=device)
+    contact_foot[geometry["medial_sign"] < 0.0] = 0
+    contact_foot[geometry["medial_sign"] > 0.0] = 1
+    contact_body_idx = torch.where(
+        has_contact,
+        closest_body_idx,
+        torch.full_like(closest_body_idx, -1),
+    )
+    offset = torch.where(
+        has_contact.unsqueeze(-1),
+        geometry["ball_offset_pelvis_yaw"],
+        torch.full_like(geometry["ball_offset_pelvis_yaw"], torch.nan),
+    )
+    medial_offset = torch.where(
+        has_contact,
+        geometry["medial_offset"],
+        torch.full_like(geometry["medial_offset"], torch.nan),
+    )
+    gentle = force_mag <= contact_force_threshold
+    return {
+        "has_contact": has_contact,
+        "force_magnitude": force_mag,
+        "contact_body_idx": contact_body_idx,
+        "contact_foot": torch.where(has_contact, contact_foot, torch.full_like(contact_foot, -1)),
+        "legal_ankle": has_contact & geometry["legal_ankle"],
+        "generic_instep": has_contact & geometry["legal_ankle"] & geometry["known_foot"] & geometry["instep"],
+        "inside_instep": has_contact & geometry["legal_ankle"] & geometry["known_foot"] & geometry["inside_instep"],
+        "outside_instep": has_contact & geometry["legal_ankle"] & geometry["known_foot"] & geometry["outside_instep"],
+        "requested_surface_match": has_contact & requested_surface_match,
+        "gentle": has_contact & gentle,
+        "legal_touch": has_contact & geometry["legal_ankle"] & requested_surface_match & gentle,
+        "ball_offset_pelvis_yaw": offset,
+        "medial_offset": medial_offset,
+    }
 
 
 # ---------------------------------------------------------------------------

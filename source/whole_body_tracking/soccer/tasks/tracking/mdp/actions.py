@@ -246,6 +246,10 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         # transforms. These are diagnostics, not additional control paths.
         self.requested_joint_targets = torch.zeros_like(self._processed_actions)
         self.executed_joint_targets = torch.zeros_like(self._processed_actions)
+        # Playback enables this explicitly. Keeping it off for training avoids
+        # copying large action tensors every simulation step.
+        self.diagnostic_snapshot_enabled = False
+        self.diagnostic_snapshot: dict[str, torch.Tensor] = {}
 
     def _fit_manifold_from_motion_bank(self) -> None:
         """Fit PCA from all valid motion frames without consulting the active phase."""
@@ -696,6 +700,41 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         ).float().mean(dim=1)
         self.manifold_filter_lag[:] = torch.mean(torch.abs(filtered_target - joint_limited_target), dim=1)
         self.executed_joint_targets[:] = self._processed_actions
+        if self.diagnostic_snapshot_enabled:
+            # These values are consumed after ``env.step()`` by playback
+            # diagnostics. Preserve the action that produced the just-finished
+            # transition even when that transition also resets an environment.
+            snapshot_names = (
+                "effective_raw_actions",
+                "executed_joint_targets",
+                "manifold_raw_upper_target",
+                "manifold_reference_upper_target",
+                "manifold_constrained_upper_target",
+                "manifold_projected_upper_target",
+                "manifold_joint_limited_upper_target",
+                "manifold_executed_upper_target",
+                "manifold_latent",
+                "manifold_projection_error",
+                "manifold_projection_error_after_reference_constraint",
+                "manifold_nullspace_residual",
+                "manifold_latent_clip_fraction",
+                "manifold_reference_overflow",
+                "manifold_reference_clamp_fraction",
+                "manifold_joint_limit_clamp_fraction",
+                "manifold_filter_lag",
+                "trunk_pitch_raw_target",
+                "trunk_pitch_reference_target",
+                "trunk_pitch_soft_target",
+                "trunk_pitch_filtered_target",
+                "trunk_pitch_reference_overflow",
+                "trunk_pitch_turn_relaxation",
+                "trunk_pitch_active_lower_deviation",
+                "trunk_pitch_active_upper_deviation",
+                "trunk_pitch_active_cutoff_frequency_hz",
+            )
+            self.diagnostic_snapshot = {
+                name: getattr(self, name).detach().clone() for name in snapshot_names
+            }
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         super().reset(env_ids)
