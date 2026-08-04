@@ -78,6 +78,15 @@ def motion_finished(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     return command.time_steps >= last_step
 
 
+def motion_clip_finished(env: ManagerBasedRLEnv, command_name: str = "motion") -> torch.Tensor:
+    """Return the command-owned clip-end flag for strict-reference episodes."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    finished = getattr(command, "_motion_clip_finished", None)
+    if not isinstance(finished, torch.Tensor) or finished.shape[0] != env.num_envs:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    return finished
+
+
 def locomotion_manual_sequence_finished(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",

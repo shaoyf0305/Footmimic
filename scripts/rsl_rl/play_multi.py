@@ -125,6 +125,15 @@ parser.add_argument(
     help="Optional yaw rate (rad/s) per polar segment; one value broadcasts to all segments.",
 )
 parser.add_argument(
+    "--locomotion_cmd_plan",
+    type=str,
+    default=None,
+    help=(
+        "JSON local-twist playback plan. Each segment supplies pelvis-local "
+        "vx, vy, wz, and duration_s; incompatible with --locomotion_cmd_speed/heading/state."
+    ),
+)
+parser.add_argument(
     "--locomotion_cmd_loop",
     dest="locomotion_cmd_loop",
     action="store_true",
@@ -222,6 +231,7 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 import os
 import glob
+import json
 import pathlib
 import numpy as np
 import torch
@@ -823,6 +833,11 @@ def _create_diagnostic(
         "step": [],
         "motion_idx": [],
         "style_phase": [],
+        "style_cycle_length": [],
+        "style_source_first_frame": [],
+        "style_source_second_frame": [],
+        "style_seam_blend": [],
+        "style_in_seam_bridge": [],
         "segment_idx": [],
         "task_state": [],
         "command_mode": [],
@@ -985,6 +1000,19 @@ def _append_diagnostic(
     diagnostic["step"].append(int(step))
     diagnostic["motion_idx"].append(int(command.motion_idx[0].item()))
     diagnostic["style_phase"].append(int(command.style_phase_steps[0].item()))
+    if hasattr(command, "style_phase_reference_info"):
+        style_info = command.style_phase_reference_info()
+        diagnostic["style_cycle_length"].append(int(style_info["cycle_length"][0].item()))
+        diagnostic["style_source_first_frame"].append(int(style_info["source_first_frame"][0].item()))
+        diagnostic["style_source_second_frame"].append(int(style_info["source_second_frame"][0].item()))
+        diagnostic["style_seam_blend"].append(float(style_info["seam_blend"][0].item()))
+        diagnostic["style_in_seam_bridge"].append(bool(style_info["in_seam_bridge"][0].item()))
+    else:
+        diagnostic["style_cycle_length"].append(int(command.motion_length[0].item()))
+        diagnostic["style_source_first_frame"].append(int(command.style_phase_steps[0].item()))
+        diagnostic["style_source_second_frame"].append(int(command.style_phase_steps[0].item()))
+        diagnostic["style_seam_blend"].append(0.0)
+        diagnostic["style_in_seam_bridge"].append(False)
     diagnostic["segment_idx"].append(int(command._locomotion_segment_idx[0].item()))
     task_state = getattr(command, "locomotion_task_state", None)
     diagnostic["task_state"].append(1 if task_state is None else int(task_state[0].item()))
@@ -1601,8 +1629,45 @@ def _save_diagnostic(diagnostic: dict) -> None:
     )
 
 
+def _load_local_twist_command_plan(plan_path: str) -> tuple[list[tuple[float, float, float, float]], bool, bool]:
+    """Read and validate a reproducible pelvis-local Cartesian command plan."""
+    path = pathlib.Path(plan_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Locomotion command plan not found: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in locomotion command plan {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Locomotion command plan must be a JSON object.")
+    frame = str(payload.get("frame", "pelvis_local")).strip().lower()
+    if frame != "pelvis_local":
+        raise ValueError(
+            f"Locomotion command plan frame must be 'pelvis_local', got {payload.get('frame')!r}."
+        )
+    raw_segments = payload.get("segments")
+    if not isinstance(raw_segments, list) or not raw_segments:
+        raise ValueError("Locomotion command plan needs a non-empty 'segments' array.")
+    segments: list[tuple[float, float, float, float]] = []
+    required = ("vx", "vy", "wz", "duration_s")
+    for index, raw_segment in enumerate(raw_segments):
+        if not isinstance(raw_segment, dict):
+            raise ValueError(f"Plan segment {index} must be an object.")
+        missing = [field for field in required if field not in raw_segment]
+        if missing:
+            raise ValueError(f"Plan segment {index} is missing {missing}.")
+        values = tuple(float(raw_segment[field]) for field in required)
+        if not all(np.isfinite(value) for value in values):
+            raise ValueError(f"Plan segment {index} contains a non-finite value.")
+        if values[3] <= 0.0:
+            raise ValueError(f"Plan segment {index} duration_s must be positive.")
+        segments.append(values)
+    return segments, bool(payload.get("loop", True)), bool(payload.get("reset_on_end", False))
+
+
 def _apply_play_locomotion_command(env, args_cli) -> bool:
-    """Apply CLI locomotion: polar segments or direct vx/vy/wz twist."""
+    """Apply a JSON local-twist plan, polar segments, or one direct twist."""
+    plan_set = args_cli.locomotion_cmd_plan is not None
     polar_set = (
         args_cli.locomotion_cmd_speed is not None
         or args_cli.locomotion_cmd_heading is not None
@@ -1617,7 +1682,7 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
         args_cli.locomotion_cmd_wy,
         args_cli.locomotion_cmd_wz,
     )
-    if not polar_set and all(v is None for v in cartesian_fields):
+    if not plan_set and not polar_set and all(v is None for v in cartesian_fields):
         return False
 
     base_env = _resolve_base_env(env)
@@ -1625,6 +1690,32 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
     if not hasattr(cmd, "set_locomotion_manual_command"):
         print("[WARN] Task motion command has no manual locomotion API; --locomotion_cmd_* ignored.")
         return False
+
+    if plan_set:
+        if polar_set or any(value is not None for value in cartesian_fields):
+            raise ValueError(
+                "--locomotion_cmd_plan cannot be combined with any other --locomotion_cmd_* value."
+            )
+        if str(getattr(cmd.cfg, "locomotion_command_frame", "world")) != "pelvis_local":
+            raise ValueError("--locomotion_cmd_plan requires a pelvis-local locomotion task.")
+        if not hasattr(cmd, "set_locomotion_local_twist_sequence"):
+            raise RuntimeError("Task motion command does not support local-twist sequences.")
+        segments, loop, reset_on_end = _load_local_twist_command_plan(args_cli.locomotion_cmd_plan)
+        cmd.set_locomotion_local_twist_sequence(
+            segments,
+            hold_last=not loop,
+            reset_on_end=reset_on_end,
+        )
+        print(f"[INFO] Local-twist command plan: {args_cli.locomotion_cmd_plan}")
+        for index, (vx, vy, wz, duration_s) in enumerate(segments):
+            print(
+                f"  [{index + 1}] vx={vx:.3f} m/s  vy={vy:.3f} m/s  "
+                f"wz={wz:.3f} rad/s  duration={duration_s:.2f} s"
+            )
+        print("  final segment -> environment reset -> segment 1" if reset_on_end else (
+            "  looping: final segment -> first segment" if loop else "  holding: final segment remains active"
+        ))
+        return True
 
     if polar_set and hasattr(cmd, "set_locomotion_polar_command"):
         speeds = args_cli.locomotion_cmd_speed
@@ -1660,7 +1751,12 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
             raise ValueError(
                 f"--locomotion_task_state ({len(task_states)}) must match --locomotion_cmd_speed ({n})."
             )
-        if task_states is None:
+        is_local_twist = str(getattr(cmd.cfg, "locomotion_command_frame", "world")) == "pelvis_local"
+        if is_local_twist:
+            if task_states is not None:
+                print("[WARN] local-twist tasks ignore --locomotion_task_state and keep DRIBBLE compatibility state.")
+            task_states = ["dribble"] * n
+        elif task_states is None:
             task_states = ["dribble" if float(speed) > 0.05 else "stop" for speed in speeds]
 
         wz_raw = args_cli.locomotion_cmd_wz
@@ -1769,7 +1865,20 @@ def _get_play_overlay(env) -> str:
 
         t = int(cmd.time_steps[i].item())
         motion_len = int(cmd.motion_length[i].item())
-        lines.append(f"Motion frame: {t}/{max(motion_len - 1, 0)}")
+        if hasattr(cmd, "style_phase_reference_info"):
+            style_info = cmd.style_phase_reference_info()
+            cycle_len = int(style_info["cycle_length"][i].item())
+            source_first = int(style_info["source_first_frame"][i].item())
+            source_second = int(style_info["source_second_frame"][i].item())
+            seam_blend = float(style_info["seam_blend"][i].item())
+            if bool(style_info["in_seam_bridge"][i].item()):
+                lines.append(
+                    f"Style seam: {source_first}->{source_second}  blend={seam_blend:.2f}"
+                )
+            else:
+                lines.append(f"Style frame: {source_first}  phase {t}/{max(cycle_len - 1, 0)}")
+        else:
+            lines.append(f"Motion frame: {t}/{max(motion_len - 1, 0)}")
         if hasattr(cmd, "style_phase_wrap_count"):
             wraps = int(cmd.style_phase_wrap_count[i].item())
             lines.append(f"Style wraps: {wraps}")

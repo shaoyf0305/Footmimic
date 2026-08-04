@@ -1,0 +1,31 @@
+{
+  "frame": "pelvis_local",
+  "loop": true,
+  "reset_on_end": false,
+  "segments": [
+    {
+      "vx": 0.0,
+      "vy": 0.0,
+      "wz": 0.0,
+      "duration_s": 2.0
+    },
+    {
+      "vx": 0.9,
+      "vy": 0.2,
+      "wz": 0.35,
+      "duration_s": 4.0
+    },
+    {
+      "vx": 0.9,
+      "vy": -0.2,
+      "wz": -0.35,
+      "duration_s": 4.0
+    },
+    {
+      "vx": 0.0,
+      "vy": 0.0,
+      "wz": 0.0,
+      "duration_s": 4.0
+    }
+  ]
+}

@@ -109,6 +109,14 @@ def _dribbling_sim_contact(
     return fmag > contact_force_threshold
 
 
+def _dribbling_effective_cg_label_mask(command: MotionCommand, labeled: torch.Tensor) -> torch.Tensor:
+    """Disable CG-only objectives in an optional synthesized style seam."""
+    seam = getattr(command, "style_seam_bridge_mask", None)
+    if isinstance(seam, torch.Tensor) and seam.shape == labeled.shape:
+        return labeled & ~seam
+    return labeled
+
+
 def _dribbling_cg_gated_sim_contact(
     command: MotionCommand,
     sim_contact: torch.Tensor,
@@ -116,7 +124,7 @@ def _dribbling_cg_gated_sim_contact(
     """On CG-labeled clips, only count touches on annotated contact frames."""
     if not hasattr(command, "motion_has_dribble_cg_label"):
         return sim_contact
-    labeled = command.motion_has_dribble_cg_label
+    labeled = _dribbling_effective_cg_label_mask(command, command.motion_has_dribble_cg_label)
     if not torch.any(labeled):
         return sim_contact
     ref = command.dribble_cg_contact_ref
@@ -1470,7 +1478,7 @@ def dribbling_cg_contact_consistency(
 ) -> torch.Tensor:
     """1.0 when sim contact presence matches the annotated CG contact bit."""
     command: MotionCommand = env.command_manager.get_term(command_name)
-    labeled = command.motion_has_dribble_cg_label
+    labeled = _dribbling_effective_cg_label_mask(command, command.motion_has_dribble_cg_label)
     if not torch.any(labeled):
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
@@ -1489,7 +1497,7 @@ def dribbling_cg_premature_contact_penalty(
 ) -> torch.Tensor:
     """Penalize sensor contact on CG non-contact (approach) frames."""
     command: MotionCommand = env.command_manager.get_term(command_name)
-    labeled = command.motion_has_dribble_cg_label
+    labeled = _dribbling_effective_cg_label_mask(command, command.motion_has_dribble_cg_label)
     if not torch.any(labeled):
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
@@ -1604,7 +1612,7 @@ def dribbling_cg_foot_consistency(
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
     command: MotionCommand = env.command_manager.get_term(command_name)
-    labeled = command.motion_has_dribble_cg_label
+    labeled = _dribbling_effective_cg_label_mask(command, command.motion_has_dribble_cg_label)
     if not torch.any(labeled):
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
@@ -1663,7 +1671,7 @@ def dribbling_cg_foot_ball_distance_exp(
     - reward = ``exp(-(sim_dist - ref_dist)^2 / std^2)``.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
-    labeled = command.motion_has_dribble_cg_foot_ball_dist_label
+    labeled = _dribbling_effective_cg_label_mask(command, command.motion_has_dribble_cg_foot_ball_dist_label)
     if not torch.any(labeled):
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 

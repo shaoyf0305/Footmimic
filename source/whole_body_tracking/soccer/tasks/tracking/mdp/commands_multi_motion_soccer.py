@@ -411,6 +411,10 @@ class MotionCommand(CommandTerm):
         self.style_phase_wrap_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_length = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # True only for the final valid reference frame of a stage that uses
+        # clip-end termination.  The termination manager consumes this flag
+        # and the normal environment reset then resamples the next episode.
+        self._motion_clip_finished = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # Randomly assign initial motions (sequential playback starts at 0 and cycles).
         if self.motion.num_files > 1:
@@ -560,45 +564,181 @@ class MotionCommand(CommandTerm):
     def command(self) -> torch.Tensor:
         return torch.cat([self.joint_pos, self.joint_vel], dim=1)
 
+    def _cyclic_style_blend_frames(self) -> int:
+        """Return the configured same-clip seam-bridge length in source frames."""
+        if bool(getattr(self.cfg, "motion_clip_end_resample", True)):
+            return 0
+        return max(0, int(getattr(self.cfg, "motion_cyclic_blend_frames", 0)))
+
+    def _style_cycle_lengths(self) -> torch.Tensor:
+        """Per-environment virtual cycle lengths, accounting for a seam bridge."""
+        raw_lengths = self.motion_length.clamp(min=1)
+        bridge_frames = self._cyclic_style_blend_frames()
+        if bridge_frames < 2:
+            return raw_lengths
+        # The loop contains source frames [K, L-K), then K blended frames
+        # [L-K, L) -> [0, K).  It therefore has L-K virtual frames.
+        valid = raw_lengths > 2 * bridge_frames
+        return torch.where(valid, raw_lengths - bridge_frames, raw_lengths)
+
+    def _style_motion_frame_indices(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return source-frame pairs and blend weight for the virtual style phase.
+
+        For a bridge of ``K`` frames, the steady-state cycle is
+        ``[K, ..., L-K-1]`` followed by a smooth blend of
+        ``[L-K, ..., L-1]`` into ``[0, ..., K-1]``.  Its final sample is
+        source frame ``K-1`` and its next sample is ``K``, removing the raw
+        end-to-start discontinuity without another motion clip.
+        """
+        raw_lengths = self.motion_length.clamp(min=1)
+        phase = self.style_phase_steps.clamp(min=0)
+        bridge_frames = self._cyclic_style_blend_frames()
+        if bridge_frames < 2:
+            index = torch.minimum(phase, raw_lengths - 1)
+            zeros = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+            return index, index, zeros, torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+
+        valid = raw_lengths > 2 * bridge_frames
+        regular_length = (raw_lengths - 2 * bridge_frames).clamp(min=1)
+        in_bridge = valid & (phase >= regular_length)
+        bridge_offset = (phase - regular_length).clamp(min=0, max=bridge_frames - 1)
+
+        regular_index = torch.minimum(phase + bridge_frames, raw_lengths - 1)
+        tail_index = raw_lengths - bridge_frames + bridge_offset
+        head_index = bridge_offset
+        first_index = torch.where(in_bridge, tail_index, torch.where(valid, regular_index, phase))
+        first_index = torch.minimum(first_index, raw_lengths - 1)
+        second_index = torch.where(in_bridge, head_index, first_index)
+
+        blend = bridge_offset.to(torch.float32) / float(bridge_frames - 1)
+        # Quintic smootherstep has zero first and second derivative at both
+        # joins.  This keeps the synthesized reference velocity continuous.
+        blend = blend * blend * blend * (blend * (blend * 6.0 - 15.0) + 10.0)
+        blend = torch.where(in_bridge, blend, torch.zeros_like(blend))
+        return first_index, second_index, blend, in_bridge
+
+    @staticmethod
+    def _slerp_quat(first: torch.Tensor, second: torch.Tensor, blend: torch.Tensor) -> torch.Tensor:
+        """Shortest-arc quaternion interpolation for tensors using wxyz convention."""
+        view_shape = (blend.shape[0],) + (1,) * (first.ndim - 2) + (1,)
+        blend_expanded = blend.reshape(view_shape)
+        dot = torch.sum(first * second, dim=-1, keepdim=True)
+        second = torch.where(dot < 0.0, -second, second)
+        dot = torch.sum(first * second, dim=-1, keepdim=True).clamp(-1.0, 1.0)
+        theta = torch.acos(dot)
+        sin_theta = torch.sin(theta)
+        linear = first + blend_expanded * (second - first)
+        spherical = (
+            torch.sin((1.0 - blend_expanded) * theta) / sin_theta.clamp_min(1.0e-8) * first
+            + torch.sin(blend_expanded * theta) / sin_theta.clamp_min(1.0e-8) * second
+        )
+        result = torch.where(sin_theta.abs() > 1.0e-5, spherical, linear)
+        return result / torch.linalg.vector_norm(result, dim=-1, keepdim=True).clamp_min(1.0e-8)
+
+    def _style_motion_sample(self, values: torch.Tensor, *, quaternion: bool = False) -> torch.Tensor:
+        """Sample a loaded motion tensor at the possibly blended virtual phase."""
+        first_index, second_index, blend, in_bridge = self._style_motion_frame_indices()
+        first = values[self.motion_idx, first_index]
+        if not torch.any(in_bridge):
+            return first
+        second = values[self.motion_idx, second_index]
+        if quaternion:
+            return self._slerp_quat(first, second, blend)
+        view_shape = (blend.shape[0],) + (1,) * (first.ndim - 1)
+        return first + blend.reshape(view_shape) * (second - first)
+
+    def _style_motion_blend_rate_s(self) -> torch.Tensor:
+        """Time derivative of the quintic bridge weight in inverse seconds."""
+        bridge_frames = self._cyclic_style_blend_frames()
+        if bridge_frames < 2:
+            return torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        raw_lengths = self.motion_length.clamp(min=1)
+        phase = self.style_phase_steps.clamp(min=0)
+        valid = raw_lengths > 2 * bridge_frames
+        regular_length = (raw_lengths - 2 * bridge_frames).clamp(min=1)
+        in_bridge = valid & (phase >= regular_length)
+        offset = (phase - regular_length).clamp(min=0, max=bridge_frames - 1).to(torch.float32)
+        u = offset / float(bridge_frames - 1)
+        # d/du smootherstep(u) = 30 u^2 (u - 1)^2.
+        source_fps = float(np.asarray(self.motion.fps).reshape(-1)[0])
+        rate = 30.0 * u.square() * (u - 1.0).square() * source_fps / float(bridge_frames - 1)
+        return torch.where(in_bridge, rate, torch.zeros_like(rate))
+
+    def _style_motion_velocity_sample(self, positions: torch.Tensor, velocities: torch.Tensor) -> torch.Tensor:
+        """Sample a velocity field consistent with a blended position target."""
+        first_index, second_index, blend, in_bridge = self._style_motion_frame_indices()
+        first_vel = velocities[self.motion_idx, first_index]
+        if not torch.any(in_bridge):
+            return first_vel
+        second_vel = velocities[self.motion_idx, second_index]
+        first_pos = positions[self.motion_idx, first_index]
+        second_pos = positions[self.motion_idx, second_index]
+        view_shape = (blend.shape[0],) + (1,) * (first_vel.ndim - 1)
+        blended = first_vel + blend.reshape(view_shape) * (second_vel - first_vel)
+        return blended + self._style_motion_blend_rate_s().reshape(view_shape) * (second_pos - first_pos)
+
+    def _style_motion_labels(self, values: torch.Tensor, neutral_value: int | float) -> torch.Tensor:
+        """Sample discrete labels, neutralizing the synthetic seam bridge."""
+        first_index, _, _, in_bridge = self._style_motion_frame_indices()
+        result = values[self.motion_idx, first_index]
+        neutral = torch.as_tensor(neutral_value, device=self.device, dtype=result.dtype)
+        return torch.where(in_bridge, neutral, result)
+
+    @property
+    def style_seam_bridge_mask(self) -> torch.Tensor:
+        """Whether each environment currently consumes a synthesized seam frame."""
+        return self._style_motion_frame_indices()[-1]
+
+    def style_phase_reference_info(self) -> dict[str, torch.Tensor]:
+        """Expose virtual-cycle/source-frame mapping for diagnostics and HUDs."""
+        first, second, blend, in_bridge = self._style_motion_frame_indices()
+        return {
+            "cycle_length": self._style_cycle_lengths(),
+            "source_first_frame": first,
+            "source_second_frame": second,
+            "seam_blend": blend,
+            "in_seam_bridge": in_bridge,
+        }
+
     @property
     def joint_pos(self) -> torch.Tensor:
-        return self.motion.joint_pos[self.motion_idx, self.style_phase_steps]
+        return self._style_motion_sample(self.motion.joint_pos)
 
     @property
     def joint_vel(self) -> torch.Tensor:
-        return self.motion.joint_vel[self.motion_idx, self.style_phase_steps]
+        return self._style_motion_velocity_sample(self.motion.joint_pos, self.motion.joint_vel)
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        return self.motion.body_pos_w[self.motion_idx, self.style_phase_steps] + self._env.scene.env_origins[:, None, :]
+        return self._style_motion_sample(self.motion.body_pos_w) + self._env.scene.env_origins[:, None, :]
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        return self.motion.body_quat_w[self.motion_idx, self.style_phase_steps]
+        return self._style_motion_sample(self.motion.body_quat_w, quaternion=True)
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.body_lin_vel_w[self.motion_idx, self.style_phase_steps]
+        return self._style_motion_sample(self.motion.body_lin_vel_w)
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.body_ang_vel_w[self.motion_idx, self.style_phase_steps]
+        return self._style_motion_sample(self.motion.body_ang_vel_w)
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
-        return self.motion.body_pos_w[self.motion_idx, self.style_phase_steps, self.motion_anchor_body_index] + self._env.scene.env_origins
+        return self.body_pos_w[:, self.motion_anchor_body_index]
 
     @property
     def anchor_quat_w(self) -> torch.Tensor:
-        return self.motion.body_quat_w[self.motion_idx, self.style_phase_steps, self.motion_anchor_body_index]
+        return self.body_quat_w[:, self.motion_anchor_body_index]
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
-        return self.motion.body_lin_vel_w[self.motion_idx, self.style_phase_steps, self.motion_anchor_body_index]
+        return self.body_lin_vel_w[:, self.motion_anchor_body_index]
 
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
-        return self.motion.body_ang_vel_w[self.motion_idx, self.style_phase_steps, self.motion_anchor_body_index]
+        return self.body_ang_vel_w[:, self.motion_anchor_body_index]
 
     @property
     def locomotion_command_mode(self) -> str:
@@ -824,6 +964,14 @@ class MotionCommand(CommandTerm):
             vx = sample_uniform(vx_range[0], vx_range[1], (n,), device=self.device)
             vy = sample_uniform(vy_range[0], vy_range[1], (n,), device=self.device)
             wz = sample_uniform(wz_range[0], wz_range[1], (n,), device=self.device)
+            stationary_probability = min(
+                max(float(getattr(self.cfg, "locomotion_cmd_stationary_probability", 0.0)), 0.0), 1.0
+            )
+            if stationary_probability > 0.0:
+                stationary = torch.rand(n, device=self.device) < stationary_probability
+                vx = torch.where(stationary, torch.zeros_like(vx), vx)
+                vy = torch.where(stationary, torch.zeros_like(vy), vy)
+                wz = torch.where(stationary, torch.zeros_like(wz), wz)
             duration_s = sample_uniform(duration_range[0], duration_range[1], (n,), device=self.device)
             self._apply_local_twist_locomotion(env_ids, vx, vy, wz)
             self._locomotion_cmd_hold_steps_remaining[env_ids] = self._duration_s_to_steps(duration_s)
@@ -1164,6 +1312,42 @@ class MotionCommand(CommandTerm):
         self._locomotion_segment_reset_on_end = False
         self._locomotion_sequence_finished[env_ids_t] = False
 
+    def set_locomotion_local_twist_sequence(
+        self,
+        segments: Sequence[tuple[float, float, float, float]],
+        env_ids: torch.Tensor | Sequence[int] | None = None,
+        hold_last: bool = True,
+        reset_on_end: bool = False,
+    ) -> None:
+        """Queue pelvis-local ``(vx, vy, wz, duration_s)`` playback segments.
+
+        The shared sequence timer internally stores a speed/heading pair, but
+        that conversion happens only at plan-load time.  The policy/rewards
+        continue to receive the resulting Cartesian local twist and the
+        compatibility task state remains DRIBBLE for every segment.
+        """
+        if not segments:
+            raise ValueError("locomotion local-twist sequence must contain at least one segment")
+        polar_segments: list[tuple[float, float, float, float, int]] = []
+        for segment in segments:
+            if len(segment) != 4:
+                raise ValueError(
+                    "Each local-twist segment needs (vx, vy, wz, duration_s); "
+                    f"got {segment!r}"
+                )
+            vx, vy, wz, duration_s = (float(value) for value in segment)
+            if duration_s <= 0.0:
+                raise ValueError(f"Local-twist segment duration must be positive; got {duration_s}.")
+            speed = math.hypot(vx, vy)
+            heading = math.atan2(vy, vx) if speed > 1.0e-6 else 0.0
+            polar_segments.append((speed, heading, duration_s, wz, TASK_STATE_DRIBBLE))
+        self.set_locomotion_polar_sequence(
+            polar_segments,
+            env_ids=env_ids,
+            hold_last=hold_last,
+            reset_on_end=reset_on_end,
+        )
+
     def reference_locomotion_lin_vel_w(self) -> torch.Tensor:
         """Demo anchor linear velocity in task-aligned world frame (mimic yaw delta)."""
         delta_ori_w = mimic_anchor_yaw_delta_quat(
@@ -1352,27 +1536,27 @@ class MotionCommand(CommandTerm):
     @property
     def dribble_cg_contact_ref(self) -> torch.Tensor:
         """Annotated contact (0/1) at current motion time, shape ``(num_envs,)``."""
-        return self.motion.dribble_cg_contact[self.motion_idx, self.time_steps].to(torch.bool)
+        return self._style_motion_labels(self.motion.dribble_cg_contact, 0).to(torch.bool)
 
     @property
     def dribble_cg_foot_ref(self) -> torch.Tensor:
         """Annotated foot id (-1 none, 0 left, 1 right), shape ``(num_envs,)``."""
-        return self.motion.dribble_cg_foot[self.motion_idx, self.time_steps].to(torch.int64)
+        return self._style_motion_labels(self.motion.dribble_cg_foot, -1).to(torch.int64)
 
     @property
     def dribble_cg_surface_ref(self) -> torch.Tensor:
         """Contact surface id (-1 none, 0 inside instep, 1 outside instep)."""
-        return self.motion.dribble_cg_surface[self.motion_idx, self.time_steps].to(torch.int64)
+        return self._style_motion_labels(self.motion.dribble_cg_surface, -1).to(torch.int64)
 
     @property
     def dribble_cg_foot_ball_dist_ref(self) -> torch.Tensor:
         """Demo foot–ball distance at current frame (m); ``-1`` if unlabeled."""
-        return self.motion.dribble_cg_foot_ball_dist[self.motion_idx, self.time_steps]
+        return self._style_motion_labels(self.motion.dribble_cg_foot_ball_dist, -1.0)
 
     @property
     def dribble_cg_dist_foot_ref(self) -> torch.Tensor:
         """Foot id for distance reference at current frame; ``-1`` if unlabeled."""
-        return self.motion.dribble_cg_dist_foot[self.motion_idx, self.time_steps].to(torch.int64)
+        return self._style_motion_labels(self.motion.dribble_cg_dist_foot, -1).to(torch.int64)
 
     @property
     def motion_has_dribble_cg_foot_ball_dist_label(self) -> torch.Tensor:
@@ -1551,7 +1735,7 @@ class MotionCommand(CommandTerm):
         if ids.numel() == 0:
             return
         self.style_phase_steps[ids] = torch.remainder(
-            self.style_phase_steps[ids], self.motion_length[ids].clamp(min=1)
+            self.style_phase_steps[ids], self._style_cycle_lengths()[ids]
         )
         self.style_phase_wrap_count[ids] += 1
 
@@ -1768,6 +1952,8 @@ class MotionCommand(CommandTerm):
         if env_ids.numel() == 0:
             return
 
+        self._motion_clip_finished[env_ids] = False
+
         # Legacy manual diagnostics deliberately keep one global timeline
         # across ordinary failure resets.  There are two explicit exceptions:
         # stateful start/dribble/stop control restarts every reset, while a
@@ -1883,11 +2069,22 @@ class MotionCommand(CommandTerm):
         # external locomotion command remain continuous.
         self.style_phase_steps += 1
         self._locomotion_cmd_steps_since_change += 1
-        env_ids = torch.where(self.style_phase_steps >= self.motion_length)[0]
-        if bool(getattr(self.cfg, "motion_clip_end_resample", True)):
-            self._resample_command(env_ids)
+        if bool(getattr(self.cfg, "motion_clip_end_terminate", False)):
+            # Hold the final valid frame until the termination manager emits
+            # done.  Do not call _resample_command here: doing so would write
+            # the next episode's state while the recurrent policy still owns
+            # the previous episode's hidden state.
+            last_frame = (self.motion_length - 1).clamp(min=0)
+            env_ids = torch.where(self.style_phase_steps >= last_frame)[0]
+            if env_ids.numel() > 0:
+                self.style_phase_steps[env_ids] = last_frame[env_ids]
+                self._motion_clip_finished[env_ids] = True
         else:
-            self._wrap_style_phase(env_ids)
+            env_ids = torch.where(self.style_phase_steps >= self._style_cycle_lengths())[0]
+            if bool(getattr(self.cfg, "motion_clip_end_resample", True)):
+                self._resample_command(env_ids)
+            else:
+                self._wrap_style_phase(env_ids)
         
         # Update target point each step using current ball position.
         self._update_target_points_from_sim()
@@ -1991,6 +2188,13 @@ class MotionCommandCfg(CommandTermCfg):
     # Legacy behavior resamples the full command and scene when a demo clip
     # ends.  Control disables this so the clip becomes a looping style phase.
     motion_clip_end_resample: bool = True
+    # Strict-reference stages may turn the last valid source frame into a
+    # genuine time-limit termination.  This keeps recurrent memory aligned
+    # with episode resets instead of relying on a hidden mid-episode teleport.
+    motion_clip_end_terminate: bool = False
+    # Optional same-clip seam bridge for non-resampling style loops.  The
+    # final K source frames smoothly cross-fade into the first K frames.
+    motion_cyclic_blend_frames: int = 0
 
     # Locomotion velocity command for follow / control Stage-2 envs.
     # ``reference``: per-frame demo anchor root vel (follow).
@@ -2043,6 +2247,9 @@ class MotionCommandCfg(CommandTermCfg):
         "pitch": (0.0, 0.0),
         "yaw": (-0.35, 0.35),
     }
+    # Local resampled command probability for an exact standing command
+    # ``[0, 0, 0]``. Disabled by default to preserve all legacy tasks.
+    locomotion_cmd_stationary_probability: float = 0.0
 
     # Soccer ball spawn on motion resample (Stage-1 motion pretrain).
     # ``paid_original``: released PAiD Stage-I placement along the clip's planar displacement.

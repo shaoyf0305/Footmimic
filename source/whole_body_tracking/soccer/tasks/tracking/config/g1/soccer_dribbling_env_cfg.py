@@ -1503,6 +1503,17 @@ class G1FlatMotionCGPretrainUnifiedS1LocalStrictEnvCfg(G1FlatMotionStrictPretrai
     def __post_init__(self):
         super().__post_init__()
         _apply_local_twist_command_mode(self, "reference")
+        # S1 is raw strict imitation: preserve every demo frame and end the
+        # episode at the source boundary.  ``time_out=True`` resets LSTM
+        # memory while retaining normal value bootstrapping at a time limit.
+        self.commands.motion.motion_clip_end_resample = True
+        self.commands.motion.motion_clip_end_terminate = True
+        self.commands.motion.motion_cyclic_blend_frames = 0
+        self.terminations.motion_clip_end = DoneTerm(
+            func=mdp.motion_clip_finished,
+            params={"command_name": "motion"},
+            time_out=True,
+        )
         _apply_local_twist_velocity_rewards(self, lin_weight=5.0, lin_std=0.45, yaw_weight=2.0, yaw_std=0.80)
         _apply_unified_local_163_contract(self)
 
@@ -1517,6 +1528,17 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         _apply_local_twist_command_mode(self, "reference")
+        # S2 remains an exact demo/contact episode.  Ball, robot, and LSTM
+        # all reset together at the final reference frame; no synthetic
+        # bridge or unlabelled contact interval is introduced here.
+        self.commands.motion.motion_clip_end_resample = True
+        self.commands.motion.motion_clip_end_terminate = True
+        self.commands.motion.motion_cyclic_blend_frames = 0
+        self.terminations.motion_clip_end = DoneTerm(
+            func=mdp.motion_clip_finished,
+            params={"command_name": "motion"},
+            time_out=True,
+        )
         _apply_local_twist_velocity_rewards(self, lin_weight=5.0, lin_std=0.60, yaw_weight=1.0, yaw_std=1.50)
         _apply_unified_local_163_contract(self)
 
@@ -1538,8 +1560,10 @@ class G1FlatCGDribblingUnifiedS3LocalTaskEnvCfg(G1FlatCGDribblingEnvCfg):
         super().__post_init__()
         _apply_local_twist_command_mode(self, "resampled")
         self.commands.motion.motion_clip_end_resample = False
+        self.commands.motion.motion_clip_end_terminate = False
+        self.commands.motion.motion_cyclic_blend_frames = 25
         self.commands.motion.locomotion_cmd_lin_vel_range = {
-            "x": (0.25, 1.50),
+            "x": (0.0, 1.50),
             "y": (-0.50, 0.50),
             "z": (0.0, 0.0),
         }
@@ -1549,6 +1573,9 @@ class G1FlatCGDribblingUnifiedS3LocalTaskEnvCfg(G1FlatCGDribblingEnvCfg):
             "yaw": (-0.80, 0.80),
         }
         self.commands.motion.locomotion_cmd_duration_range = (1.5, 3.0)
+        # Exact rest commands are required for a playback plan to start/end
+        # cleanly without reintroducing the old IDLE/STOP state command.
+        self.commands.motion.locomotion_cmd_stationary_probability = 0.10
         # 24 env steps per rollout * 1000 PPO updates.  All local S3 reward
         # terms see the same blended command, preventing a hidden objective
         # change during the S2 -> S3 distribution transition.
@@ -1557,6 +1584,14 @@ class G1FlatCGDribblingUnifiedS3LocalTaskEnvCfg(G1FlatCGDribblingEnvCfg):
         _apply_unified_local_163_contract(self)
         _disable_reference_ball_contact_terms(self)
         _apply_local_task_ball_objectives(self)
+
+        # Playback command plans may request a full reset after their final
+        # segment.  The underlying flag is always false during resampled
+        # training, so this term is inert for PPO.
+        self.terminations.locomotion_manual_sequence_end = DoneTerm(
+            func=mdp.locomotion_manual_sequence_finished,
+            params={"command_name": "motion"},
+        )
 
         setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
         setattr(self.commands.motion, "dribble_cg_use_task_frame", True)
