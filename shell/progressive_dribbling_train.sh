@@ -7,7 +7,7 @@
 #   --cg-control       legacy continuous command baseline
 #   --cg-full-control  frozen IDLE/DRIBBLE/STOP baseline
 #   --cg-unified-control  polar-only unified interface, fixed right instep touch
-#   --cg-unified-3stage    reference mimic -> reference-contact dribble -> free task control
+#   --cg-unified-3stage    local strict -> local reference-contact -> local task control
 #
 # Usage:
 #   DRIBBLE_MOTION_PATH=motions/my_dribble \
@@ -69,9 +69,9 @@ case "${MODE}" in
         STAGE2_EXTRA_ARGS=("dribble_contact_surface=${CONTACT_SURFACE}")
         ;;
     cg-unified-3stage)
-        STAGE1_TASK="Tracking-CG-G1-Motion-RNN-unified-s1-mimic"
-        STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-unified-s2-reference"
-        STAGE3_TASK="Tracking-CG-G1-Dribbling-RNN-unified-s3-task"
+        STAGE1_TASK="Tracking-CG-G1-Motion-RNN-unified-s1-local-strict"
+        STAGE2_TASK="Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference"
+        STAGE3_TASK="Tracking-CG-G1-Dribbling-RNN-unified-s3-local-task"
         ;;
 esac
 

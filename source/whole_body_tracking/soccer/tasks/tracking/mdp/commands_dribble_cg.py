@@ -9,6 +9,7 @@ interaction trajectory. Optional ``dribble_cg_snap_mode``:
 - ``full`` (default): every step writes the demo ball pose into simulation.
 - ``non_contact_only``: only overwrite the ball when the CG label says
   non-contact, leaving physics during annotated contact segments.
+- ``never``: never overwrite the ball; use the labels/rewards only.
 
 Contact / foot / surface masks come from ``dribble_cg_contact``,
 ``dribble_cg_foot``, and ``dribble_cg_surface`` in ``.npz``.  The legacy
@@ -172,6 +173,8 @@ class DribbleCGMotionCommand(MotionCommand):
         mi = self.motion_idx[env_ids]
         has_demo = self.motion.motion_has_ball_demo[mi]
         mode = str(getattr(self.cfg, "dribble_cg_snap_mode", "full")).lower().strip()
+        if mode == "never":
+            return torch.zeros(env_ids.numel(), device=self.device, dtype=torch.bool)
         if mode == "non_contact_only":
             in_ref_contact = self.motion.dribble_cg_contact[mi, self.time_steps[env_ids]] > 0
             return has_demo & ~in_ref_contact

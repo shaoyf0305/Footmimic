@@ -5,7 +5,7 @@ import torch
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms, quat_apply, quat_inv
+from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms, quat_apply, quat_inv, yaw_quat
 
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import (
     TASK_STATE_DRIBBLE,
@@ -154,6 +154,42 @@ def motion_locomotion_polar_command(env: ManagerBasedEnv, command_name: str) -> 
         speed = torch.norm(lin[:, :2], dim=-1)
         heading = torch.atan2(lin[:, 1], lin[:, 0])
     return torch.stack([speed, torch.cos(heading), torch.sin(heading)], dim=-1)
+
+
+def motion_locomotion_twist_command_local(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Current-pelvis local locomotion command ``[vx, vy, wz]``.
+
+    This is the deployment command contract: forward/lateral linear velocity
+    and yaw rate, all relative to the robot's *current* pelvis yaw.  It does
+    not encode an absolute world heading or accumulated turn angle.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    if hasattr(command, "locomotion_twist_command_b"):
+        return command.locomotion_twist_command_b().view(env.num_envs, -1)
+    raise RuntimeError(f"motion command '{command_name}' does not expose a local twist command")
+
+
+def motion_locomotion_ang_vel_command_local(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Angular part of the local twist, padded as an angular-velocity vector.
+
+    Kept at three dimensions so the unified 163-D observation layout remains
+    stable while the legacy raw world-frame reference angular velocity is not
+    leaked into the local task policy.
+    """
+    twist = motion_locomotion_twist_command_local(env, command_name)
+    zeros = torch.zeros_like(twist[:, 2])
+    return torch.stack((zeros, zeros, twist[:, 2]), dim=-1)
+
+
+def robot_anchor_lin_vel_local(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Simulator-only anchor linear velocity in the current pelvis yaw frame.
+
+    This term is intended for the critic.  The actor must infer motion from
+    deployable proprioception and its command, rather than receiving this
+    privileged ground-truth linear velocity.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    return quat_apply(quat_inv(yaw_quat(command.robot_anchor_quat_w)), command.robot_anchor_lin_vel_w)
 
 
 def motion_locomotion_task_state(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

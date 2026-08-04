@@ -1391,6 +1391,179 @@ def _disable_reference_ball_contact_terms(cfg) -> None:
         cfg.rewards.dribbling_rapid_retouch_penalty.params["cg_gated"] = False
 
 
+def _apply_unified_local_twist_observations(cfg) -> None:
+    """Install the local-twist part of the 163-D unified input contract.
+
+    Layout is deliberately preserved as ``154-D proprioception + 3-D ball +
+    3-D compatibility state + 3-D twist``.  The final three policy values are
+    therefore always ``[vx_local, vy_local, wz]``.  The state field remains a
+    fixed DRIBBLE one-hot for S1/S2/S3; it avoids a checkpoint shape change but
+    does not encode a second, competing task command.
+    """
+    cfg.observations.policy.motion_ref_ang_vel = ObsTerm(
+        func=mdp.motion_locomotion_ang_vel_command_local,
+        params={"command_name": "motion"},
+    )
+    # Critic-only, simulator-derived pelvis-local linear velocity.  Do not add
+    # this observation to policy: it is privileged state unavailable on hardware.
+    cfg.observations.critic.base_lin_vel = ObsTerm(
+        func=mdp.robot_anchor_lin_vel_local,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.policy.motion_locomotion_polar_cmd = None
+    cfg.observations.critic.motion_locomotion_polar_cmd = None
+    cfg.observations.policy.motion_locomotion_task_state = ObsTerm(
+        func=mdp.motion_locomotion_task_state,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.critic.motion_locomotion_task_state = ObsTerm(
+        func=mdp.motion_locomotion_task_state,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.policy.motion_locomotion_twist_cmd = ObsTerm(
+        func=mdp.motion_locomotion_twist_command_local,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.critic.motion_locomotion_twist_cmd = ObsTerm(
+        func=mdp.motion_locomotion_twist_command_local,
+        params={"command_name": "motion"},
+    )
+
+
+def _apply_unified_local_163_contract(cfg) -> None:
+    """Shared 163-D/29-D deployment-oriented interface for local S1/S2/S3."""
+    _apply_cg_pretrain_obs(cfg)
+    cfg.observations.policy.anchor_ball_polar = ObsTerm(
+        func=obs_anchor.anchor_ball_pelvis_local_polar,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.critic.anchor_ball_polar = ObsTerm(
+        func=obs_anchor.anchor_ball_pelvis_local_polar,
+        params={"command_name": "motion"},
+    )
+    _remove_unified_kick_only_terms(cfg)
+    _apply_unified_control_action_contract(cfg)
+    _apply_unified_local_twist_observations(cfg)
+
+
+def _apply_local_twist_command_mode(cfg, mode: str) -> None:
+    """Make reference and task commands use one current-pelvis convention."""
+    cfg.commands.motion.locomotion_command_frame = "pelvis_local"
+    cfg.commands.motion.locomotion_command_mode = mode
+    cfg.commands.motion.locomotion_task_state_enabled = False
+    cfg.commands.motion.locomotion_task_state_sequence = ("dribble",)
+    cfg.commands.motion.mimic_align_task_frame = False
+    cfg.commands.motion.mimic_align_locomotion_heading = False
+
+
+def _apply_local_twist_velocity_rewards(cfg, *, lin_weight: float, lin_std: float, yaw_weight: float, yaw_std: float) -> None:
+    """Replace world/task-frame root tracking with the active pelvis-local twist."""
+    for reward_name in ("forward_velocity", "lateral_velocity_penalty", "task_heading_alignment"):
+        if hasattr(cfg.rewards, reward_name):
+            getattr(cfg.rewards, reward_name).weight = 0.0
+    if hasattr(cfg.rewards, "motion_global_anchor_pos"):
+        cfg.rewards.motion_global_anchor_pos.weight = 0.0
+    if hasattr(cfg.rewards, "motion_global_anchor_ori"):
+        cfg.rewards.motion_global_anchor_ori.weight = 0.0
+    cfg.rewards.motion_anchor_lin_vel = RewTerm(
+        func=mdp.motion_anchor_local_lin_vel_tracking_exp,
+        weight=lin_weight,
+        params={"command_name": "motion", "std": lin_std},
+    )
+    cfg.rewards.motion_anchor_ang_vel = RewTerm(
+        func=mdp.motion_anchor_local_ang_vel_tracking_exp,
+        weight=yaw_weight,
+        params={"command_name": "motion", "std": yaw_std},
+    )
+    if hasattr(cfg.rewards, "dribbling_velocity_tracking"):
+        cfg.rewards.dribbling_velocity_tracking.weight = 0.0
+
+
+def _apply_local_task_ball_objectives(cfg) -> None:
+    """Use pelvis-local possession geometry and command-local ball progress for S3."""
+    cfg.rewards.dribbling_dynamic_proximity.func = mdp.dribbling_pelvis_local_dynamic_proximity
+    cfg.rewards.dribbling_ball_forward_progress.func = mdp.dribbling_command_ball_progress_reward
+    cfg.rewards.dribbling_ball_trapped_penalty.func = mdp.dribbling_pelvis_local_ball_trapped_penalty
+    cfg.rewards.dribbling_chase_ball.func = mdp.dribbling_command_chase_ball_reward
+    cfg.rewards.dribbling_face_ball.func = mdp.dribbling_pelvis_local_face_ball
+    cfg.rewards.dribbling_legal_foot_touch.params["min_pelvis_heading"] = 0.0
+    if hasattr(cfg.rewards, "dribbling_pelvis_quat_tracking"):
+        cfg.rewards.dribbling_pelvis_quat_tracking.weight = 0.0
+
+
+@configclass
+class G1FlatMotionCGPretrainUnifiedS1LocalStrictEnvCfg(G1FlatMotionStrictPretrainEnvCfg):
+    """S1 local strict: exact demo local twist plus strict relative motion tracking.
+
+    The reset still starts from the exact sampled demonstration state and the
+    full pose/gait imitation prior remains active.  Root supervision is local
+    ``[vx, vy, wz]`` rather than a non-deployable absolute world path/yaw.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_local_twist_command_mode(self, "reference")
+        _apply_local_twist_velocity_rewards(self, lin_weight=5.0, lin_std=0.45, yaw_weight=2.0, yaw_std=0.80)
+        _apply_unified_local_163_contract(self)
+
+
+@configclass
+class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
+    """S2 local reference: physical ball plus reference foot--ball contact prior."""
+
+    dribble_contact_mode: str = "both"
+    dribble_contact_surface: str = "instep"
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_local_twist_command_mode(self, "reference")
+        _apply_local_twist_velocity_rewards(self, lin_weight=5.0, lin_std=0.60, yaw_weight=1.0, yaw_std=1.50)
+        _apply_unified_local_163_contract(self)
+
+        # The ball always follows physics.  CG position/contact rewards remain
+        # to teach the annotated reference touch placement and foot selection.
+        setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
+        setattr(self.commands.motion, "dribble_cg_use_task_frame", True)
+        setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
+
+
+@configclass
+class G1FlatCGDribblingUnifiedS3LocalTaskEnvCfg(G1FlatCGDribblingEnvCfg):
+    """S3 local task: sampled local twist and flexible physical instep control."""
+
+    dribble_contact_mode: str = "both"
+    dribble_contact_surface: str = "instep"
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_local_twist_command_mode(self, "resampled")
+        self.commands.motion.motion_clip_end_resample = False
+        self.commands.motion.locomotion_cmd_lin_vel_range = {
+            "x": (0.25, 1.50),
+            "y": (-0.50, 0.50),
+            "z": (0.0, 0.0),
+        }
+        self.commands.motion.locomotion_cmd_ang_vel_range = {
+            "roll": (0.0, 0.0),
+            "pitch": (0.0, 0.0),
+            "yaw": (-0.80, 0.80),
+        }
+        self.commands.motion.locomotion_cmd_duration_range = (1.5, 3.0)
+        # 24 env steps per rollout * 1000 PPO updates.  All local S3 reward
+        # terms see the same blended command, preventing a hidden objective
+        # change during the S2 -> S3 distribution transition.
+        self.commands.motion.locomotion_twist_reference_blend_env_steps = 24_000
+        _apply_local_twist_velocity_rewards(self, lin_weight=5.0, lin_std=0.65, yaw_weight=1.0, yaw_std=1.50)
+        _apply_unified_local_163_contract(self)
+        _disable_reference_ball_contact_terms(self)
+        _apply_local_task_ball_objectives(self)
+
+        setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
+        setattr(self.commands.motion, "dribble_cg_use_task_frame", True)
+        setattr(self.commands.motion, "dribble_cg_fixed_touch_foot", None)
+        setattr(self.commands.motion, "dribble_cg_fixed_touch_surface", None)
+
+
 @configclass
 class G1FlatMotionCGPretrainUnifiedS1MimicEnvCfg(G1FlatMotionPretrainEnvCfg):
     """S1: pure task-frame imitation conditioned on exact reference velocity.

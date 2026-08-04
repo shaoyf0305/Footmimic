@@ -59,13 +59,13 @@ parser.add_argument(
     "--locomotion_cmd_vx",
     type=float,
     default=None,
-    help="Manual locomotion cmd: task +X linear speed (m/s). Implies manual mode at play time.",
+    help="Manual locomotion cmd: forward linear speed (m/s); pelvis-local for local-twist tasks.",
 )
 parser.add_argument(
     "--locomotion_cmd_vy",
     type=float,
     default=None,
-    help="Manual locomotion cmd: task +Y lateral speed (m/s).",
+    help="Manual locomotion cmd: lateral speed (m/s); pelvis-local for local-twist tasks.",
 )
 parser.add_argument(
     "--locomotion_cmd_vz",
@@ -225,6 +225,7 @@ import glob
 import pathlib
 import numpy as np
 import torch
+from isaaclab.utils.math import quat_apply, quat_inv, yaw_quat
 
 from soccer.tasks.tracking.mdp.rewards_dribbling import (
     dribbling_contact_telemetry,
@@ -352,7 +353,7 @@ def get_motion_files(motion_path: str) -> list[str]:
 _BALL_SENSOR_NAME = "soccer_ball_contact"
 _CONTACT_FORCE_THRESHOLD = 1.0
 _LAST_TERM_REASON: str = "-"
-_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v2"
+_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v3"
 
 _ARM_DIAGNOSTIC_JOINT_NAMES = [
     "left_shoulder_pitch_joint",
@@ -546,6 +547,18 @@ def _active_locomotion_command(command) -> dict[str, torch.Tensor | str | bool]:
     else:
         ang_vel_w = command.anchor_ang_vel_w
 
+    is_local_twist = str(getattr(command.cfg, "locomotion_command_frame", "world")) == "pelvis_local"
+    if is_local_twist and hasattr(command, "locomotion_twist_command_b"):
+        twist_b = command.locomotion_twist_command_b()
+        reference_twist_b = command.reference_locomotion_twist_b()
+        blend_alpha = float(command.locomotion_twist_blend_alpha())
+    else:
+        # Legacy-only fallback.  These fields are retained for a uniform
+        # archive schema but are not a local-frame ground-truth comparison.
+        twist_b = torch.stack((lin_vel_w[:, 0], lin_vel_w[:, 1], ang_vel_w[:, 2]), dim=-1)
+        reference_twist_b = twist_b
+        blend_alpha = 1.0
+
     speed = torch.norm(lin_vel_w[:, :2], dim=-1)
     heading = torch.atan2(lin_vel_w[:, 1], lin_vel_w[:, 0])
     heading_valid = speed > 1.0e-6
@@ -565,6 +578,9 @@ def _active_locomotion_command(command) -> dict[str, torch.Tensor | str | bool]:
         "heading_valid": heading_valid,
         "target_speed": target_speed,
         "target_heading": target_heading,
+        "twist_b": twist_b,
+        "reference_twist_b": reference_twist_b,
+        "blend_alpha": blend_alpha,
     }
 
 
@@ -797,6 +813,9 @@ def _create_diagnostic(
         "waist_roll_damping_scale": float(waist_roll_stiffness_scale) ** 0.5,
         "contact_settings": contact_settings,
         "contact_region_frame": "pelvis_yaw",
+        "locomotion_command_frame": str(
+            getattr(command.cfg, "locomotion_command_frame", "world")
+        ),
         "contact_body_names": np.asarray(contact_settings["body_names"]),
         "contact_surface": contact_settings["contact_surface"],
         "contact_force_threshold": contact_settings["contact_force_threshold"],
@@ -812,6 +831,11 @@ def _create_diagnostic(
         "effective_command_heading": [],
         "active_command_lin_vel_w": [],
         "active_command_ang_vel_w": [],
+        "reference_twist_local": [],
+        "active_twist_local": [],
+        "actual_twist_local": [],
+        "twist_local_error": [],
+        "twist_blend_alpha": [],
         "command_heading_valid": [],
         "pelvis_yaw": [],
         "reference_joint_pos": [],
@@ -976,10 +1000,21 @@ def _append_diagnostic(
     diagnostic["effective_command_heading"].append(float(active_heading[0].item()))
     diagnostic["active_command_lin_vel_w"].append(_cpu(active_command["lin_vel_w"]))
     diagnostic["active_command_ang_vel_w"].append(_cpu(active_command["ang_vel_w"]))
+    diagnostic["reference_twist_local"].append(_cpu(active_command["reference_twist_b"]))
+    diagnostic["active_twist_local"].append(_cpu(active_command["twist_b"]))
+    diagnostic["twist_blend_alpha"].append(float(active_command["blend_alpha"]))
     diagnostic["command_heading_valid"].append(bool(heading_valid[0].item()))
 
     pelvis_id = robot.body_names.index("pelvis")
     pelvis_quat = robot.data.body_quat_w[0, pelvis_id]
+    pelvis_yaw_inv = quat_inv(yaw_quat(robot.data.body_quat_w[:, pelvis_id]))
+    pelvis_lin_vel_b = quat_apply(pelvis_yaw_inv, robot.data.body_lin_vel_w[:, pelvis_id])
+    pelvis_ang_vel_b = quat_apply(pelvis_yaw_inv, robot.data.body_ang_vel_w[:, pelvis_id])
+    actual_twist_b = torch.stack(
+        (pelvis_lin_vel_b[:, 0], pelvis_lin_vel_b[:, 1], pelvis_ang_vel_b[:, 2]), dim=-1
+    )
+    diagnostic["actual_twist_local"].append(_cpu(actual_twist_b))
+    diagnostic["twist_local_error"].append(_cpu(active_command["twist_b"] - actual_twist_b))
     diagnostic["pelvis_yaw"].append(float(torch.atan2(
         2.0 * (pelvis_quat[0] * pelvis_quat[3] + pelvis_quat[1] * pelvis_quat[2]),
         1.0 - 2.0 * (pelvis_quat[2].square() + pelvis_quat[3].square()),
@@ -1116,7 +1151,8 @@ def _append_diagnostic(
         command.robot_body_pos_w[0, foot_ref_ids] - command.body_pos_relative_w[0, foot_ref_ids], dim=-1
     ).mean()
     diagnostic["foot_reference_position_error"].append(float(foot_error.item()))
-    if bool(heading_valid[0].item()):
+    is_local_twist = str(getattr(command.cfg, "locomotion_command_frame", "world")) == "pelvis_local"
+    if bool(heading_valid[0].item()) and not is_local_twist:
         heading_error = torch.atan2(
             torch.sin(active_heading[0] - diagnostic["pelvis_yaw"][-1]),
             torch.cos(active_heading[0] - diagnostic["pelvis_yaw"][-1]),
@@ -1373,7 +1409,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         "constraint_margins", "waist_roll_stiffness_scale", "waist_roll_damping_scale",
         "direct_upper_body_latent", "schema_version", "sample_timing", "action_value_semantics",
         "contact_settings", "contact_region_frame", "contact_body_names", "contact_surface",
-        "contact_force_threshold", "contact_cg_gated",
+        "contact_force_threshold", "contact_cg_gated", "locomotion_command_frame",
     }
     arrays = {
         key: np.asarray(value)
@@ -1401,6 +1437,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["contact_surface"] = np.asarray(diagnostic["contact_surface"])
     arrays["contact_force_threshold"] = np.asarray(diagnostic["contact_force_threshold"])
     arrays["contact_cg_gated"] = np.asarray(diagnostic["contact_cg_gated"])
+    arrays["locomotion_command_frame"] = np.asarray(diagnostic["locomotion_command_frame"])
     np.savez_compressed(diagnostic["path"], **arrays)
 
     def _finite_mean(values: np.ndarray) -> float:
@@ -1414,6 +1451,11 @@ def _save_diagnostic(diagnostic: dict) -> None:
     pelvis_speed = float(np.mean(arrays["pelvis_xy_speed"]))
     foot_error = float(np.mean(arrays["foot_reference_position_error"]))
     heading_error = _finite_mean(np.abs(arrays["heading_error"]))
+    local_twist_abs_error = np.abs(arrays["twist_local_error"])
+    local_vx_error = _finite_mean(local_twist_abs_error[:, 0])
+    local_vy_error = _finite_mean(local_twist_abs_error[:, 1])
+    local_wz_error = _finite_mean(local_twist_abs_error[:, 2])
+    final_twist_blend_alpha = float(arrays["twist_blend_alpha"][-1])
     task_state_names = np.asarray(["idle", "dribble", "stop"])
     task_state_counts = np.bincount(arrays["task_state"].astype(np.int64), minlength=3)[:3]
     task_state_summary = ", ".join(
@@ -1533,6 +1575,8 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"cg_foot_match={cg_foot_match_rate:.3f}  "
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
         f"pelvis_xy_speed={pelvis_speed:.3f} m/s  "
+        f"local_twist_abs_err=(vx={local_vx_error:.3f}, vy={local_vy_error:.3f}, wz={local_wz_error:.3f})  "
+        f"twist_blend_alpha={final_twist_blend_alpha:.3f}  "
         f"task_states=({task_state_summary})  stop_settled={stop_settle_rate:.3f}  "
         f"stop_successes={stop_successes}  "
         f"stop_ball_speed={stop_ball_speed:.3f} m/s  stop_pelvis_speed={stop_pelvis_speed:.3f} m/s  "
@@ -1558,7 +1602,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
 
 
 def _apply_play_locomotion_command(env, args_cli) -> bool:
-    """Apply CLI locomotion: multi-segment polar sequence or legacy vx/vy/wz."""
+    """Apply CLI locomotion: polar segments or direct vx/vy/wz twist."""
     polar_set = (
         args_cli.locomotion_cmd_speed is not None
         or args_cli.locomotion_cmd_heading is not None
@@ -1571,6 +1615,7 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
         args_cli.locomotion_cmd_vz,
         args_cli.locomotion_cmd_wx,
         args_cli.locomotion_cmd_wy,
+        args_cli.locomotion_cmd_wz,
     )
     if not polar_set and all(v is None for v in cartesian_fields):
         return False
@@ -1675,19 +1720,34 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
         cur_lin[1] if args_cli.locomotion_cmd_vy is None else args_cli.locomotion_cmd_vy,
         cur_lin[2] if args_cli.locomotion_cmd_vz is None else args_cli.locomotion_cmd_vz,
     ]
+    wz_values = args_cli.locomotion_cmd_wz
+    if wz_values is None or len(wz_values) == 0:
+        wz = cur_ang[2]
+    elif len(wz_values) == 1:
+        wz = float(wz_values[0])
+    else:
+        raise ValueError("Cartesian manual control accepts at most one --locomotion_cmd_wz value.")
     ang = [
         cur_ang[0] if args_cli.locomotion_cmd_wx is None else args_cli.locomotion_cmd_wx,
         cur_ang[1] if args_cli.locomotion_cmd_wy is None else args_cli.locomotion_cmd_wy,
-        cur_ang[2],
+        wz,
     ]
     cartesian_task_state = None
     if args_cli.locomotion_task_state is not None:
         if len(args_cli.locomotion_task_state) != 1:
             raise ValueError("Cartesian manual control accepts exactly one --locomotion_task_state.")
         cartesian_task_state = args_cli.locomotion_task_state[0]
-    cmd.set_locomotion_manual_command(lin_vel=lin, ang_vel=ang, task_state=cartesian_task_state)
+    is_local_twist = str(getattr(cmd.cfg, "locomotion_command_frame", "world")) == "pelvis_local"
+    if is_local_twist and hasattr(cmd, "set_locomotion_local_twist_command"):
+        if cartesian_task_state is not None:
+            print("[WARN] local-twist tasks keep the compatibility state at DRIBBLE; --locomotion_task_state is ignored.")
+        cmd.set_locomotion_local_twist_command(vx=lin[0], vy=lin[1], wz=ang[2])
+        frame = "current pelvis local frame"
+    else:
+        cmd.set_locomotion_manual_command(lin_vel=lin, ang_vel=ang, task_state=cartesian_task_state)
+        frame = "task +X/+Y/+Z frame"
     print(
-        f"[INFO] Locomotion manual cmd: lin_vel={lin} m/s  ang_vel={ang} rad/s  (task +X/+Y/+Z)"
+        f"[INFO] Locomotion manual cmd: lin_vel={lin} m/s  ang_vel={ang} rad/s  ({frame})"
     )
     return True
 

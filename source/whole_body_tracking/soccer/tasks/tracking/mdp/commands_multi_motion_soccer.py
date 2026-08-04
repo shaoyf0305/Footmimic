@@ -648,6 +648,43 @@ class MotionCommand(CommandTerm):
             ids = env_ids[immediate]
             self._write_effective_polar_locomotion(ids, speed[immediate], heading[immediate], wz[immediate])
 
+    def _apply_local_twist_locomotion(
+        self,
+        env_ids: torch.Tensor,
+        vx: torch.Tensor,
+        vy: torch.Tensor,
+        wz: torch.Tensor,
+        task_state: torch.Tensor | None = None,
+    ) -> None:
+        """Set an immediate pelvis-local twist command.
+
+        Local-twist tasks deliberately do not reuse the polar smoother: their
+        command is a body-frame quantity, so interpolating a task/world-frame
+        heading would reintroduce the coordinate-system ambiguity this mode is
+        intended to remove.
+        """
+        if task_state is not None:
+            self.locomotion_task_state[env_ids] = task_state.to(
+                device=self.device, dtype=self.locomotion_task_state.dtype
+            )
+        speed = torch.sqrt(torch.square(vx) + torch.square(vy))
+        heading = torch.atan2(vy, vx)
+        prior_heading = self.locomotion_cmd_heading[env_ids]
+        heading = torch.where(speed > 0.05, heading, prior_heading)
+        self.locomotion_cmd_target_speed[env_ids] = speed
+        self.locomotion_cmd_target_heading[env_ids] = heading
+        self.locomotion_cmd_target_wz[env_ids] = wz
+        self._locomotion_cmd_steps_since_change[env_ids] = 0
+        self.locomotion_manual_lin_vel[env_ids, 0] = vx
+        self.locomotion_manual_lin_vel[env_ids, 1] = vy
+        self.locomotion_manual_lin_vel[env_ids, 2] = 0.0
+        self.locomotion_manual_ang_vel[env_ids, 0] = 0.0
+        self.locomotion_manual_ang_vel[env_ids, 1] = 0.0
+        self.locomotion_manual_ang_vel[env_ids, 2] = wz
+        self.locomotion_cmd_speed[env_ids] = speed
+        self.locomotion_cmd_heading[env_ids] = heading
+        self._locomotion_cmd_initialized[env_ids] = True
+
     def _write_effective_polar_locomotion(
         self,
         env_ids: torch.Tensor,
@@ -774,6 +811,22 @@ class MotionCommand(CommandTerm):
         else:
             env_ids = env_ids.to(device=self.device, dtype=torch.long)
         if env_ids.numel() == 0:
+            return
+
+        if str(getattr(self.cfg, "locomotion_command_frame", "world")) == "pelvis_local":
+            lin_range = getattr(self.cfg, "locomotion_cmd_lin_vel_range", {})
+            ang_range = getattr(self.cfg, "locomotion_cmd_ang_vel_range", {})
+            duration_range = getattr(self.cfg, "locomotion_cmd_duration_range", (1.5, 3.0))
+            n = env_ids.numel()
+            vx_range = lin_range.get("x", (0.25, 0.65))
+            vy_range = lin_range.get("y", (-0.25, 0.25))
+            wz_range = ang_range.get("yaw", (-0.35, 0.35))
+            vx = sample_uniform(vx_range[0], vx_range[1], (n,), device=self.device)
+            vy = sample_uniform(vy_range[0], vy_range[1], (n,), device=self.device)
+            wz = sample_uniform(wz_range[0], wz_range[1], (n,), device=self.device)
+            duration_s = sample_uniform(duration_range[0], duration_range[1], (n,), device=self.device)
+            self._apply_local_twist_locomotion(env_ids, vx, vy, wz)
+            self._locomotion_cmd_hold_steps_remaining[env_ids] = self._duration_s_to_steps(duration_s)
             return
 
         speed_range = getattr(self.cfg, "locomotion_cmd_speed_range", (0.25, 0.65))
@@ -1076,6 +1129,41 @@ class MotionCommand(CommandTerm):
             else:
                 self.locomotion_manual_ang_vel[env_ids] = ang_vel
 
+    def set_locomotion_local_twist_command(
+        self,
+        vx: float | torch.Tensor,
+        vy: float | torch.Tensor,
+        wz: float | torch.Tensor,
+        duration_s: float | torch.Tensor | None = None,
+        env_ids: torch.Tensor | slice | None = None,
+    ) -> None:
+        """Set ``[vx, vy, wz]`` in the current pelvis yaw frame for local-twist tasks."""
+        self.set_locomotion_command_mode("manual")
+        if env_ids is None:
+            env_ids_t = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        elif isinstance(env_ids, slice):
+            env_ids_t = torch.arange(self.num_envs, device=self.device, dtype=torch.long)[env_ids]
+        else:
+            env_ids_t = env_ids.to(device=self.device, dtype=torch.long)
+        n = env_ids_t.numel()
+        if n == 0:
+            return
+
+        def _as_command_tensor(value: float | torch.Tensor) -> torch.Tensor:
+            if isinstance(value, torch.Tensor):
+                return value.to(device=self.device, dtype=torch.float32).flatten().expand(n)
+            return torch.full((n,), float(value), device=self.device, dtype=torch.float32)
+
+        self._apply_local_twist_locomotion(
+            env_ids_t, _as_command_tensor(vx), _as_command_tensor(vy), _as_command_tensor(wz)
+        )
+        if duration_s is not None:
+            self._locomotion_cmd_hold_steps_remaining[env_ids_t] = self._duration_s_to_steps(duration_s)
+        for env_id in env_ids_t.tolist():
+            self._locomotion_segment_plans[env_id] = []
+        self._locomotion_segment_reset_on_end = False
+        self._locomotion_sequence_finished[env_ids_t] = False
+
     def reference_locomotion_lin_vel_w(self) -> torch.Tensor:
         """Demo anchor linear velocity in task-aligned world frame (mimic yaw delta)."""
         delta_ori_w = mimic_anchor_yaw_delta_quat(
@@ -1094,14 +1182,58 @@ class MotionCommand(CommandTerm):
         )
         return quat_apply(delta_ori_w, self.anchor_ang_vel_w)
 
+    def reference_locomotion_twist_b(self) -> torch.Tensor:
+        """Demo pelvis twist in the demo pelvis yaw frame: ``[vx, vy, wz]``.
+
+        The reference coordinate system is reconstructed per frame rather than
+        integrated in the world frame.  This is exactly the frame available on
+        hardware from the current base orientation and IMU angular velocity.
+        """
+        ref_yaw_inv = quat_inv(yaw_quat(self.anchor_quat_w))
+        ref_lin_b = quat_apply(ref_yaw_inv, self.anchor_lin_vel_w)
+        ref_ang_b = quat_apply(ref_yaw_inv, self.anchor_ang_vel_w)
+        return torch.stack((ref_lin_b[:, 0], ref_lin_b[:, 1], ref_ang_b[:, 2]), dim=-1)
+
+    def locomotion_twist_blend_alpha(self) -> float:
+        """Reference-to-task command interpolation factor for S3 warm start."""
+        transition_steps = int(getattr(self.cfg, "locomotion_twist_reference_blend_env_steps", 0))
+        if transition_steps <= 0 or self._locomotion_command_mode != "resampled":
+            return 1.0
+        elapsed_steps = int(getattr(self._env, "common_step_counter", 0))
+        return min(max(elapsed_steps / transition_steps, 0.0), 1.0)
+
+    def locomotion_twist_command_b(self) -> torch.Tensor:
+        """Active local command, always ordered ``[vx, vy, wz]``."""
+        reference_twist = self.reference_locomotion_twist_b()
+        if self._locomotion_command_mode == "reference":
+            return reference_twist
+        task_twist = torch.stack(
+            (
+                self.locomotion_manual_lin_vel[:, 0],
+                self.locomotion_manual_lin_vel[:, 1],
+                self.locomotion_manual_ang_vel[:, 2],
+            ),
+            dim=-1,
+        )
+        alpha = self.locomotion_twist_blend_alpha()
+        return (1.0 - alpha) * reference_twist + alpha * task_twist
+
     def locomotion_lin_vel_command_w(self) -> torch.Tensor:
         """Active locomotion linear-velocity command (reference, resampled, or manual)."""
+        if str(getattr(self.cfg, "locomotion_command_frame", "world")) == "pelvis_local":
+            local_twist = self.locomotion_twist_command_b()
+            return quat_apply(yaw_quat(self.robot_anchor_quat_w), torch.nn.functional.pad(local_twist[:, :2], (0, 1)))
         if self._locomotion_command_mode in {"manual", "resampled"}:
             return self.locomotion_manual_lin_vel
         return self.reference_locomotion_lin_vel_w()
 
     def locomotion_ang_vel_command_w(self) -> torch.Tensor:
         """Active locomotion angular-velocity command (reference, resampled, or manual)."""
+        if str(getattr(self.cfg, "locomotion_command_frame", "world")) == "pelvis_local":
+            local_twist = self.locomotion_twist_command_b()
+            return torch.stack(
+                (torch.zeros_like(local_twist[:, 2]), torch.zeros_like(local_twist[:, 2]), local_twist[:, 2]), dim=-1
+            )
         if self._locomotion_command_mode in {"manual", "resampled"}:
             return self.locomotion_manual_ang_vel
         return self.reference_locomotion_ang_vel_w()
@@ -1865,6 +1997,13 @@ class MotionCommandCfg(CommandTermCfg):
     # ``resampled``: random speed/heading/duration — independent of demo root vel (control).
     # ``manual``: fixed polar/xy command via ``set_locomotion_polar_command`` (play/debug).
     locomotion_command_mode: str = "reference"
+    # ``world`` preserves legacy polar/task-frame behavior.  ``pelvis_local``
+    # makes manual/resampled commands and the policy input a current-pelvis
+    # twist ``[vx, vy, wz]``; it is the sim2real-safe command convention.
+    locomotion_command_frame: str = "world"
+    # During the first N environment steps of a local resampled task, blend
+    # its sampled twist from the per-frame demo twist to reduce S2 -> S3 shift.
+    locomotion_twist_reference_blend_env_steps: int = 0
     locomotion_manual_lin_vel: tuple[float, float, float] = (0.55, 0.0, 0.0)
     locomotion_manual_ang_vel: tuple[float, float, float] = (0.0, 0.0, 0.0)
     # High-level task input.  Disabled by default so legacy follow/forward

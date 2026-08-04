@@ -522,6 +522,25 @@ def motion_anchor_lin_vel_tracking_exp(env: ManagerBasedRLEnv, command_name: str
     return torch.exp(-error / max(std, 1e-6) ** 2)
 
 
+def _robot_anchor_twist_b(command: MotionCommand) -> torch.Tensor:
+    """Current robot pelvis twist in its yaw-only local frame."""
+    robot_yaw_inv = quat_inv(yaw_quat(command.robot_anchor_quat_w))
+    lin_vel_b = quat_apply(robot_yaw_inv, command.robot_anchor_lin_vel_w)
+    ang_vel_b = quat_apply(robot_yaw_inv, command.robot_anchor_ang_vel_w)
+    return torch.stack((lin_vel_b[:, 0], lin_vel_b[:, 1], ang_vel_b[:, 2]), dim=-1)
+
+
+def motion_anchor_local_lin_vel_tracking_exp(
+    env: ManagerBasedRLEnv, command_name: str, std: float
+) -> torch.Tensor:
+    """Track the active command's forward/lateral velocity in current pelvis coordinates."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    if not hasattr(command, "locomotion_twist_command_b"):
+        raise RuntimeError(f"motion command '{command_name}' does not expose a local twist command")
+    error = torch.sum(torch.square(command.locomotion_twist_command_b()[:, :2] - _robot_anchor_twist_b(command)[:, :2]), dim=-1)
+    return torch.exp(-error / max(std, 1e-6) ** 2)
+
+
 def motion_anchor_xy_speed_excess_penalty(
     env: ManagerBasedRLEnv,
     command_name: str,
@@ -567,6 +586,17 @@ def motion_anchor_ang_vel_tracking_exp(env: ManagerBasedRLEnv, command_name: str
     command: MotionCommand = env.command_manager.get_term(command_name)
     ref_ang = _locomotion_ang_vel_command_w(command)
     error = torch.sum(torch.square(ref_ang - command.robot_anchor_ang_vel_w), dim=-1)
+    return torch.exp(-error / max(std, 1e-6) ** 2)
+
+
+def motion_anchor_local_ang_vel_tracking_exp(
+    env: ManagerBasedRLEnv, command_name: str, std: float
+) -> torch.Tensor:
+    """Track the active command's yaw rate in current pelvis coordinates."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    if not hasattr(command, "locomotion_twist_command_b"):
+        raise RuntimeError(f"motion command '{command_name}' does not expose a local twist command")
+    error = torch.square(command.locomotion_twist_command_b()[:, 2] - _robot_anchor_twist_b(command)[:, 2])
     return torch.exp(-error / max(std, 1e-6) ** 2)
 
 

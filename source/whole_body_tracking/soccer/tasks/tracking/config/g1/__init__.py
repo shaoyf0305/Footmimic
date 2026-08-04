@@ -102,3 +102,22 @@ _register(
     soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS3TaskEnvCfg,
     "G1DribblingRecurrentPPORunnerCfg",
 )
+
+# Deployment-oriented three-stage curriculum.  The legacy IDs above retain
+# their polar/task-frame semantics for experiment reproducibility; these new
+# IDs use the shared local ``[vx, vy, wz]`` command convention instead.
+_register(
+    "Tracking-CG-G1-Motion-RNN-unified-s1-local-strict",
+    soccer_dribbling_env_cfg.G1FlatMotionCGPretrainUnifiedS1LocalStrictEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
+    "Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference",
+    soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
+    "Tracking-CG-G1-Dribbling-RNN-unified-s3-local-task",
+    soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS3LocalTaskEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)

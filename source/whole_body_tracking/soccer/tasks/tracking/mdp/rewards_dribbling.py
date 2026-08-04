@@ -202,6 +202,11 @@ def _command_frame_components(vector_xy: torch.Tensor, direction_xy: torch.Tenso
     return forward, lateral
 
 
+def _pelvis_yaw_local_vector(command: MotionCommand, vector_w: torch.Tensor) -> torch.Tensor:
+    """Express a world vector in the current pelvis yaw frame."""
+    return quat_apply_inverse(yaw_quat(command.robot_pelvis_quat_w), vector_w)
+
+
 def dribbling_idle_stand_reward(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
@@ -496,6 +501,49 @@ def dribbling_command_dynamic_proximity(
         pelvis_speed = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
         reward = reward * torch.clamp(pelvis_speed / pelvis_speed_min, max=1.0)
 
+    if no_contact_zone_damping < 1.0 - 1.0e-6:
+        in_corridor = (
+            (forward_offset >= near_dist)
+            & (forward_offset <= far_dist)
+            & (torch.abs(lateral_offset) <= zone_lateral_abs_max)
+        )
+        no_touch = soccer_ball_contact_force_magnitude(env, ball_sensor_name) <= contact_force_threshold
+        reward = torch.where(in_corridor & no_touch, reward * no_contact_zone_damping, reward)
+    return reward
+
+
+def dribbling_pelvis_local_dynamic_proximity(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    near_dist: float = 0.2,
+    far_dist: float = 0.5,
+    penalty_std: float = 0.15,
+    pelvis_speed_min: float = 0.0,
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    no_contact_zone_damping: float = 1.0,
+    zone_lateral_abs_max: float = 0.18,
+) -> torch.Tensor:
+    """Keep the ball in front of the *current* pelvis, with no world axis.
+
+    Unlike the task/world-frame corridor, this stays meaningful after any
+    accumulated yaw drift and is therefore suitable for a local-twist policy.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+    offset_b = _pelvis_yaw_local_vector(
+        command, soccer_ball.data.root_pos_w[:, :3] - command.robot_pelvis_pos_w
+    )
+    forward_offset, lateral_offset = offset_b[:, 0], offset_b[:, 1]
+    forward_error = torch.where(
+        forward_offset < near_dist,
+        near_dist - forward_offset,
+        torch.where(forward_offset > far_dist, forward_offset - far_dist, torch.zeros_like(forward_offset)),
+    )
+    reward = torch.exp(-(forward_error.square() + lateral_offset.square()) / max(penalty_std, 1.0e-6) ** 2)
+    if pelvis_speed_min > 0.0:
+        pelvis_speed = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
+        reward = reward * torch.clamp(pelvis_speed / pelvis_speed_min, max=1.0)
     if no_contact_zone_damping < 1.0 - 1.0e-6:
         in_corridor = (
             (forward_offset >= near_dist)
@@ -1486,6 +1534,24 @@ def dribbling_command_ball_trapped_penalty(
     return (too_close | behind | popped).to(torch.float32)
 
 
+def dribbling_pelvis_local_ball_trapped_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    min_forward_x: float = 0.18,
+    max_ball_height: float = 0.20,
+) -> torch.Tensor:
+    """Penalize a ball under/behind the current pelvis in pelvis-local axes."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+    offset_b = _pelvis_yaw_local_vector(
+        command, soccer_ball.data.root_pos_w[:, :3] - command.robot_pelvis_pos_w
+    )
+    too_close = offset_b[:, 0] < min_forward_x
+    behind = offset_b[:, 0] < 0.0
+    popped = soccer_ball.data.root_pos_w[:, 2] > max_ball_height
+    return (too_close | behind | popped).to(torch.float32)
+
+
 def dribbling_sustained_contact_penalty(
     env: ManagerBasedRLEnv,
     ball_sensor_name: str = "soccer_ball_contact",
@@ -1842,3 +1908,22 @@ def dribbling_command_face_ball(
     pelvis_forward_xy = pelvis_forward_xy / torch.norm(pelvis_forward_xy, dim=-1, keepdim=True).clamp(min=1.0e-4)
     heading_alignment = torch.sum(pelvis_forward_xy * direction_xy, dim=-1).clamp(min=0.0, max=1.0)
     return ball_ahead * heading_alignment
+
+
+def dribbling_pelvis_local_face_ball(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    min_distance: float = 0.05,
+) -> torch.Tensor:
+    """Reward a ball ahead of the current pelvis, independent of world yaw."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+    offset_b = _pelvis_yaw_local_vector(
+        command, soccer_ball.data.root_pos_w[:, :3] - command.robot_pelvis_pos_w
+    )
+    distance = torch.norm(offset_b[:, :2], dim=-1)
+    return torch.where(
+        distance > float(min_distance),
+        (offset_b[:, 0] / distance.clamp(min=1.0e-4)).clamp(min=0.0, max=1.0),
+        torch.ones_like(distance),
+    )
