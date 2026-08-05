@@ -363,7 +363,7 @@ def get_motion_files(motion_path: str) -> list[str]:
 _BALL_SENSOR_NAME = "soccer_ball_contact"
 _CONTACT_FORCE_THRESHOLD = 1.0
 _LAST_TERM_REASON: str = "-"
-_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v4"
+_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v5"
 
 _ARM_DIAGNOSTIC_JOINT_NAMES = [
     "left_shoulder_pitch_joint",
@@ -531,11 +531,9 @@ def _diagnostic_contact_settings(base_env) -> dict:
         "num_ankle_links": int(params.get("num_ankle_links", 2)),
         "contact_surface": str(params.get("contact_surface", "any")),
         "medial_y_min": float(params.get("medial_y_min", 0.018)),
-        "instep_z_min": float(params.get("instep_z_min", 0.010)),
-        "instep_x_min": float(params.get("instep_x_min", -0.035)),
-        "instep_x_max": float(params.get("instep_x_max", 0.140)),
         "contact_force_threshold": float(params.get("force_threshold", 14.0)),
         "cg_gated": bool(params.get("cg_gated", False)),
+        "cg_surface_gated": bool(params.get("cg_surface_gated", False)),
         "body_names": tuple(getattr(all_body_cfg, "body_names", ()) or ()),
     }
 
@@ -823,7 +821,7 @@ def _create_diagnostic(
         "waist_roll_stiffness_scale": float(waist_roll_stiffness_scale),
         "waist_roll_damping_scale": float(waist_roll_stiffness_scale) ** 0.5,
         "contact_settings": contact_settings,
-        "contact_region_frame": "pelvis_yaw",
+        "contact_region_frame": "foot_yaw",
         "locomotion_command_frame": str(
             getattr(command.cfg, "locomotion_command_frame", "world")
         ),
@@ -831,6 +829,7 @@ def _create_diagnostic(
         "contact_surface": contact_settings["contact_surface"],
         "contact_force_threshold": contact_settings["contact_force_threshold"],
         "contact_cg_gated": contact_settings["cg_gated"],
+        "contact_cg_surface_gated": contact_settings["cg_surface_gated"],
         "step": [],
         "motion_idx": [],
         "ball_spawn_source": [],
@@ -913,7 +912,7 @@ def _create_diagnostic(
         "contact_legal_touch": [],
         "contact_cg_gate_pass": [],
         "contact_cg_eligible": [],
-        "contact_ball_offset_pelvis_yaw": [],
+        "contact_ball_offset_foot_yaw": [],
         "contact_medial_offset": [],
         "cg_label_available": [],
         "cg_reference_contact": [],
@@ -1141,9 +1140,7 @@ def _append_diagnostic(
         num_ankle_links=contact_settings["num_ankle_links"],
         contact_surface=contact_settings["contact_surface"],
         medial_y_min=contact_settings["medial_y_min"],
-        instep_z_min=contact_settings["instep_z_min"],
-        instep_x_min=contact_settings["instep_x_min"],
-        instep_x_max=contact_settings["instep_x_max"],
+        cg_surface_gated=contact_settings["cg_surface_gated"],
         contact_force_threshold=contact_settings["contact_force_threshold"],
     )
     diagnostic["ball_contact"].append(bool(contact["has_contact"][0].item()))
@@ -1157,7 +1154,7 @@ def _append_diagnostic(
     diagnostic["contact_requested_surface_match"].append(bool(contact["requested_surface_match"][0].item()))
     diagnostic["contact_gentle"].append(bool(contact["gentle"][0].item()))
     diagnostic["contact_legal_touch"].append(bool(contact["legal_touch"][0].item()))
-    diagnostic["contact_ball_offset_pelvis_yaw"].append(_cpu(contact["ball_offset_pelvis_yaw"]))
+    diagnostic["contact_ball_offset_foot_yaw"].append(_cpu(contact["ball_offset_foot_yaw"]))
     diagnostic["contact_medial_offset"].append(float(contact["medial_offset"][0].item()))
     cg_labeled = getattr(command, "motion_has_dribble_cg_label", None)
     cg_ref_contact = getattr(command, "dribble_cg_contact_ref", None)
@@ -1453,7 +1450,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         "constraint_margins", "waist_roll_stiffness_scale", "waist_roll_damping_scale",
         "direct_upper_body_latent", "schema_version", "sample_timing", "action_value_semantics",
         "contact_settings", "contact_region_frame", "contact_body_names", "contact_surface",
-        "contact_force_threshold", "contact_cg_gated", "locomotion_command_frame",
+        "contact_force_threshold", "contact_cg_gated", "contact_cg_surface_gated", "locomotion_command_frame",
     }
     arrays = {
         key: np.asarray(value)
@@ -1482,6 +1479,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["contact_surface"] = np.asarray(diagnostic["contact_surface"])
     arrays["contact_force_threshold"] = np.asarray(diagnostic["contact_force_threshold"])
     arrays["contact_cg_gated"] = np.asarray(diagnostic["contact_cg_gated"])
+    arrays["contact_cg_surface_gated"] = np.asarray(diagnostic["contact_cg_surface_gated"])
     arrays["locomotion_command_frame"] = np.asarray(diagnostic["locomotion_command_frame"])
     np.savez_compressed(diagnostic["path"], **arrays)
 
@@ -1974,20 +1972,6 @@ def _get_play_overlay(env) -> str:
                 f"{hold_str}"
             )
             lines.append(f"Task state         : {task_state_name}")
-            # Control smooths a requested endpoint into the effective command
-            # above.  Show both during a turn so speed reduction is observable.
-            target_speed_buf = getattr(cmd, "locomotion_cmd_target_speed", None)
-            target_heading_buf = getattr(cmd, "locomotion_cmd_target_heading", None)
-            if target_speed_buf is not None and target_heading_buf is not None:
-                target_spd = float(target_speed_buf[i].item())
-                target_hdg = float(target_heading_buf[i].item())
-                heading_gap = float(np.arctan2(np.sin(target_hdg - cmd_hdg), np.cos(target_hdg - cmd_hdg)))
-                if abs(target_spd - cmd_spd) > 0.01 or abs(heading_gap) > 0.01:
-                    lines.append(
-                        f"Requested endpoint :"
-                        f"  {target_spd:4.2f} m/s"
-                        f"  {_deg(target_hdg):+4.0f}deg {_arrow(target_hdg):<2s}"
-                    )
 
             # actual robot velocity vs command
             actual_hdg = float(np.arctan2(pelvis_vel[1], pelvis_vel[0]))

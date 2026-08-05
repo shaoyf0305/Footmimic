@@ -1,11 +1,12 @@
 """Dribbling-specific reward functions.
 
 Encourages close ball control without strike-the-ball objectives. Contact
-legality is **geometry-based**: the first ``num_ankle_links`` entries in
-``all_body_cfg.body_names`` are ankle links (typically both feet); knees/wrists
-listed after incur ``dribbling_undesired_contact_penalty`` when closest to the
-ball. Trapping between feet is handled by ``dribbling_ball_trapped_penalty`` /
-``dribbling_sustained_contact_penalty``. No ``kick_leg`` labels required.
+legality is **side-based**: the first ``num_ankle_links`` entries in
+``all_body_cfg.body_names`` are ankle links (typically both feet), and an
+instep is classified only as the inside or outside side in the contacted
+foot's yaw frame. Knees/wrists listed after incur
+``dribbling_undesired_contact_penalty`` when closest to the ball. No
+``kick_leg`` labels are required.
 """
 from __future__ import annotations
 
@@ -679,14 +680,10 @@ def _dribbling_contact_surface_geometry(
     all_body_cfg: SceneEntityCfg | None,
     closest_body_idx: torch.Tensor,
     *,
-    command_name: str,
     num_ankle_links: int,
     medial_y_min: float,
-    instep_z_min: float,
-    instep_x_min: float,
-    instep_x_max: float,
 ) -> dict[str, torch.Tensor]:
-    """Compute the shared pelvis-yaw contact-region geometry.
+    """Compute the shared foot-yaw inside/outside contact geometry.
 
     The reward and playback diagnostic both consume this helper. Keeping the
     coordinates and thresholds in one place makes a recorded ``instep`` match
@@ -696,7 +693,7 @@ def _dribbling_contact_surface_geometry(
     num_envs = env.num_envs
     dtype = torch.float32
     empty = {
-        "ball_offset_pelvis_yaw": torch.full((num_envs, 3), torch.nan, device=device, dtype=dtype),
+        "ball_offset_foot_yaw": torch.full((num_envs, 3), torch.nan, device=device, dtype=dtype),
         "medial_offset": torch.full((num_envs,), torch.nan, device=device, dtype=dtype),
         "medial_sign": torch.zeros(num_envs, device=device, dtype=dtype),
         "legal_ankle": torch.zeros(num_envs, dtype=torch.bool, device=device),
@@ -707,8 +704,8 @@ def _dribbling_contact_surface_geometry(
     }
     if all_body_cfg is None or num_ankle_links <= 0:
         return empty
-    if medial_y_min < 0.0 or instep_x_max <= instep_x_min:
-        raise ValueError("Invalid foot-contact surface bounds.")
+    if medial_y_min < 0.0:
+        raise ValueError("medial_y_min must be non-negative.")
 
     names = tuple(all_body_cfg.body_names)
     if not names:
@@ -730,13 +727,12 @@ def _dribbling_contact_surface_geometry(
     selected_body_idx = body_indices[selected_cfg_idx]
     batch_ids = torch.arange(num_envs, device=device)
     foot_pos_w = robot.data.body_pos_w[batch_ids, selected_body_idx]
+    foot_yaw_w = yaw_quat(robot.data.body_quat_w[batch_ids, selected_body_idx])
     ball_pos_w = env.scene["soccer_ball"].data.root_pos_w[:, :3]
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    pelvis_yaw_w = yaw_quat(command.robot_pelvis_quat_w)
-    ball_local = quat_apply_inverse(pelvis_yaw_w, ball_pos_w - foot_pos_w)
+    ball_local = quat_apply_inverse(foot_yaw_w, ball_pos_w - foot_pos_w)
 
-    # In the pelvis yaw frame +Y is body-left. Thus the right foot's medial
-    # side is +Y, while the left foot's medial side is -Y.
+    # In each foot yaw frame +Y is its local left side. Thus the right foot's
+    # medial direction is +Y while the left foot's medial direction is -Y.
     medial_sign = torch.zeros(num_envs, dtype=ball_local.dtype, device=device)
     for cfg_idx, body_name in enumerate(names):
         if "right_ankle" in body_name:
@@ -744,24 +740,41 @@ def _dribbling_contact_surface_geometry(
         elif "left_ankle" in body_name:
             medial_sign[selected_cfg_idx == cfg_idx] = -1.0
 
-    instep = (
-        (ball_local[:, 0] >= instep_x_min)
-        & (ball_local[:, 0] <= instep_x_max)
-        & (ball_local[:, 2] >= instep_z_min)
-    )
     medial_offset = ball_local[:, 1] * medial_sign
     known_foot = medial_sign != 0.0
     legal_ankle = _is_dribble_legal_ankle_contact(closest_body_idx, num_ankle_links)
+    inside_instep = medial_offset >= medial_y_min
+    outside_instep = medial_offset <= -medial_y_min
     return {
-        "ball_offset_pelvis_yaw": ball_local,
+        "ball_offset_foot_yaw": ball_local,
         "medial_offset": medial_offset,
         "medial_sign": medial_sign,
         "legal_ankle": legal_ankle,
         "known_foot": known_foot,
-        "instep": instep,
-        "inside_instep": instep & (medial_offset >= medial_y_min),
-        "outside_instep": instep & (medial_offset <= -medial_y_min),
+        "instep": inside_instep | outside_instep,
+        "inside_instep": inside_instep,
+        "outside_instep": outside_instep,
     }
+
+
+def _dribbling_cg_reference_surface_match(
+    command: MotionCommand,
+    geometry: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Match the current inside/outside region to the per-frame CG label.
+
+    ``dribble_cg_surface`` stores ``0=inside_instep`` and
+    ``1=outside_instep``. A missing label never silently becomes a legal
+    reference-surface touch: S2 must either supply the label or use a task
+    that does not request reference-surface gating.
+    """
+    reference_surface = getattr(command, "dribble_cg_surface_ref", None)
+    if not isinstance(reference_surface, torch.Tensor):
+        return torch.zeros_like(geometry["legal_ankle"])
+    return (
+        ((reference_surface == 0) & geometry["inside_instep"])
+        | ((reference_surface == 1) & geometry["outside_instep"])
+    )
 
 
 def _dribbling_contact_surface_match(
@@ -773,46 +786,45 @@ def _dribbling_contact_surface_match(
     contact_surface: str,
     num_ankle_links: int,
     medial_y_min: float = 0.018,
-    instep_z_min: float = 0.010,
-    instep_x_min: float = -0.035,
-    instep_x_max: float = 0.140,
+    cg_surface_gated: bool = False,
 ) -> torch.Tensor:
-    """Check whether the ball centre lies in a requested body-frame instep zone.
+    """Check a requested instep side in the contacted foot's yaw frame.
 
     Isaac's ball contact sensor reports the net force on the ball but not the
     individual collision capsule that produced it.  We therefore identify the
-    closest contacted ankle link and express the ankle-to-ball offset in the
-    pelvis yaw frame. ``+X`` is body forward, ``+Y`` is body left, and ``+Z``
-    is up. The right foot's medial direction is ``+Y`` and the left foot's is
-    ``-Y``. Restricting the frame to pelvis yaw keeps the region stable while
-    an ankle rolls, pitches, or yaws during a touch.
+    closest contacted ankle link and express the ankle-to-ball offset in that
+    foot's yaw frame. Only its signed lateral coordinate is used: right-foot
+    medial is ``+Y`` and left-foot medial is ``-Y``. There is deliberately no
+    fore/aft or height gate; the task distinguishes only inside from outside.
     """
     surface = str(contact_surface).lower().strip()
     if surface not in _DRIBBLE_CONTACT_SURFACES:
         raise ValueError(
             f"Unsupported contact_surface={contact_surface!r}; expected one of {_DRIBBLE_CONTACT_SURFACES}."
         )
-    if surface == "any":
+    if surface == "any" and not cg_surface_gated:
         return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
 
     geometry = _dribbling_contact_surface_geometry(
         env,
         all_body_cfg,
         closest_body_idx,
-        command_name=command_name,
         num_ankle_links=num_ankle_links,
         medial_y_min=medial_y_min,
-        instep_z_min=instep_z_min,
-        instep_x_min=instep_x_min,
-        instep_x_max=instep_x_max,
     )
-    if surface == "instep":
+    if surface == "any":
+        surface_geometry = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    elif surface == "instep":
         surface_geometry = geometry["instep"]
     elif surface == "inside_instep":
         surface_geometry = geometry["inside_instep"]
     else:
         surface_geometry = geometry["outside_instep"]
-    return geometry["legal_ankle"] & geometry["known_foot"] & surface_geometry
+    match = geometry["legal_ankle"] & geometry["known_foot"] & surface_geometry
+    if cg_surface_gated:
+        command: MotionCommand = env.command_manager.get_term(command_name)
+        match = match & _dribbling_cg_reference_surface_match(command, geometry)
+    return match
 
 
 def dribbling_contact_telemetry(
@@ -823,14 +835,12 @@ def dribbling_contact_telemetry(
     num_ankle_links: int = 2,
     contact_surface: str = "any",
     medial_y_min: float = 0.018,
-    instep_z_min: float = 0.010,
-    instep_x_min: float = -0.035,
-    instep_x_max: float = 0.140,
+    cg_surface_gated: bool = False,
     contact_force_threshold: float = 14.0,
 ) -> dict[str, torch.Tensor]:
     """Return contact-region telemetry using the exact reward geometry.
 
-    Values describe only a current sensor contact. ``ball_offset_pelvis_yaw``
+    Values describe only a current sensor contact. ``ball_offset_foot_yaw``
     is therefore NaN and ``contact_body_idx`` is -1 when the ball has no robot
     contact. Foot ids use the CG convention: left=0, right=1, unknown=-1.
     """
@@ -852,7 +862,7 @@ def dribbling_contact_telemetry(
             "requested_surface_match": false,
             "gentle": force_mag <= contact_force_threshold,
             "legal_touch": false,
-            "ball_offset_pelvis_yaw": torch.full((num_envs, 3), torch.nan, device=device),
+            "ball_offset_foot_yaw": torch.full((num_envs, 3), torch.nan, device=device),
             "medial_offset": torch.full((num_envs,), torch.nan, device=device),
         }
 
@@ -864,12 +874,8 @@ def dribbling_contact_telemetry(
         env,
         all_body_cfg,
         closest_body_idx,
-        command_name=command_name,
         num_ankle_links=num_ankle_links,
         medial_y_min=medial_y_min,
-        instep_z_min=instep_z_min,
-        instep_x_min=instep_x_min,
-        instep_x_max=instep_x_max,
     )
     requested_surface_match = _dribbling_contact_surface_match(
         env,
@@ -879,9 +885,7 @@ def dribbling_contact_telemetry(
         contact_surface=contact_surface,
         num_ankle_links=num_ankle_links,
         medial_y_min=medial_y_min,
-        instep_z_min=instep_z_min,
-        instep_x_min=instep_x_min,
-        instep_x_max=instep_x_max,
+        cg_surface_gated=cg_surface_gated,
     )
     contact_foot = torch.full((num_envs,), -1, dtype=torch.long, device=device)
     contact_foot[geometry["medial_sign"] < 0.0] = 0
@@ -893,8 +897,8 @@ def dribbling_contact_telemetry(
     )
     offset = torch.where(
         has_contact.unsqueeze(-1),
-        geometry["ball_offset_pelvis_yaw"],
-        torch.full_like(geometry["ball_offset_pelvis_yaw"], torch.nan),
+        geometry["ball_offset_foot_yaw"],
+        torch.full_like(geometry["ball_offset_foot_yaw"], torch.nan),
     )
     medial_offset = torch.where(
         has_contact,
@@ -914,7 +918,7 @@ def dribbling_contact_telemetry(
         "requested_surface_match": has_contact & requested_surface_match,
         "gentle": has_contact & gentle,
         "legal_touch": has_contact & geometry["legal_ankle"] & requested_surface_match & gentle,
-        "ball_offset_pelvis_yaw": offset,
+        "ball_offset_foot_yaw": offset,
         "medial_offset": medial_offset,
     }
 
@@ -1243,17 +1247,16 @@ def dribbling_legal_foot_touch(
     num_ankle_links: int = 2,
     contact_surface: str = "any",
     medial_y_min: float = 0.018,
-    instep_z_min: float = 0.010,
-    instep_x_min: float = -0.035,
-    instep_x_max: float = 0.140,
     cg_gated: bool = False,
+    cg_surface_gated: bool = False,
     min_pelvis_heading: float = 0.0,
 ) -> torch.Tensor:
-    """Reward a new gentle touch in the selected foot/instep region.
+    """Reward a new gentle touch in the selected foot/instep side.
 
-    ``contact_surface`` is ``any`` (legacy), ``inside_instep``, or
-    ``outside_instep``.  The latter two use the contacted foot's local frame,
-    so selecting one is stronger than merely selecting the left or right foot.
+    ``contact_surface`` is ``any`` (legacy), ``instep`` (either side),
+    ``inside_instep``, or ``outside_instep``. The instep variants use the
+    contacted foot's yaw frame, so selecting one is stronger than merely
+    selecting the left or right foot.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     has_contact, force_mag, closest_idx = _identify_contact_body(
@@ -1269,9 +1272,7 @@ def dribbling_legal_foot_touch(
         contact_surface=contact_surface,
         num_ankle_links=num_ankle_links,
         medial_y_min=medial_y_min,
-        instep_z_min=instep_z_min,
-        instep_x_min=instep_x_min,
-        instep_x_max=instep_x_max,
+        cg_surface_gated=cg_surface_gated,
     )
     gentle = force_mag <= force_threshold
     touch = has_contact & is_ankle & surface_match & gentle
@@ -1348,7 +1349,7 @@ def dribbling_micro_contact_filter(
 
 
 # ---------------------------------------------------------------------------
-# 3c) Undesired Contact Penalty — severe instant penalty for wrong body
+# 3c) Undesired Contact Penalty — wrong body or instep side
 # ---------------------------------------------------------------------------
 
 def dribbling_undesired_contact_penalty(
@@ -1359,11 +1360,19 @@ def dribbling_undesired_contact_penalty(
     num_ankle_links: int = 2,
     contact_surface: str = "any",
     medial_y_min: float = 0.018,
-    instep_z_min: float = 0.010,
-    instep_x_min: float = -0.035,
-    instep_x_max: float = 0.140,
+    cg_surface_gated: bool = False,
+    wrong_surface_penalty: float = 0.25,
 ) -> torch.Tensor:
-    """1.0 for a non-ankle contact or a touch outside the requested instep zone."""
+    """Penalize non-ankle contact fully and wrong instep side more gently.
+
+    The term is multiplied by its configured negative reward weight.  A
+    non-ankle contact returns ``1.0``; an ankle contact on the wrong
+    inside/outside instep returns ``wrong_surface_penalty``.  The latter is
+    intentionally smaller: timing is already supervised independently by
+    ``dribbling_cg_premature_contact_penalty``.
+    """
+    if not 0.0 <= wrong_surface_penalty <= 1.0:
+        raise ValueError("wrong_surface_penalty must be in [0, 1].")
     command: MotionCommand = env.command_manager.get_term(command_name)
     has_contact, force_mag, closest_idx = _identify_contact_body(
         env, command, ball_sensor_name, all_body_cfg,
@@ -1378,14 +1387,12 @@ def dribbling_undesired_contact_penalty(
         contact_surface=contact_surface,
         num_ankle_links=num_ankle_links,
         medial_y_min=medial_y_min,
-        instep_z_min=instep_z_min,
-        instep_x_min=instep_x_min,
-        instep_x_max=instep_x_max,
+        cg_surface_gated=cg_surface_gated,
     )
 
-    penalty = (has_contact & (~is_ankle | ~surface_match)).to(torch.float32)
-
-    return penalty
+    non_ankle = has_contact & ~is_ankle
+    wrong_surface = has_contact & is_ankle & ~surface_match
+    return non_ankle.to(torch.float32) + wrong_surface.to(torch.float32) * wrong_surface_penalty
 
 
 # ---------------------------------------------------------------------------
@@ -1451,22 +1458,6 @@ def dribbling_support_ankle_roll_tracking_exp(
     bounded_excess = torch.clamp(excess, max=error_cap)
     reward = torch.exp(-torch.square(bounded_excess) / (std**2))
     return reward * active.to(reward.dtype)
-
-
-def dribbling_cg_demo_ball_tracking_exp(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    std: float = 0.32,
-) -> torch.Tensor:
-    """Shaped tracking of the simulated ball toward the stitched demo trajectory."""
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    goal_w, mask = command.get_dribble_demo_ball_goal_world()
-    if goal_w is None or mask is None:
-        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
-    ball = env.scene["soccer_ball"].data.root_pos_w[:, :3]
-    err = torch.norm(ball - goal_w, dim=-1)
-    rew = torch.exp(-err / max(std, 1e-6))
-    return rew * mask.to(torch.float32)
 
 
 def dribbling_cg_contact_consistency(
@@ -1602,12 +1593,10 @@ def dribbling_cg_foot_consistency(
     right_ankle_body_name: str = "right_ankle_roll_link",
     contact_surface: str = "any",
     medial_y_min: float = 0.018,
-    instep_z_min: float = 0.010,
-    instep_x_min: float = -0.035,
-    instep_x_max: float = 0.140,
+    cg_surface_gated: bool = False,
     active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
-    """Reward a labeled-foot contact, optionally limited to one instep surface."""
+    """Reward a labeled-foot contact, optionally matching its CG instep side."""
     if all_body_cfg is None:
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
@@ -1640,9 +1629,7 @@ def dribbling_cg_foot_consistency(
         contact_surface=contact_surface,
         num_ankle_links=2,
         medial_y_min=medial_y_min,
-        instep_z_min=instep_z_min,
-        instep_x_min=instep_x_min,
-        instep_x_max=instep_x_max,
+        cg_surface_gated=cg_surface_gated,
     )
     match = (closest == expected) & surface_match & has_contact & active
     return match.to(torch.float32)

@@ -68,6 +68,7 @@ class DribbleCGMotionCommand(MotionCommand):
         """
         configured_foot = getattr(self.cfg, "dribble_cg_fixed_touch_foot", None)
         configured_surface = getattr(self.cfg, "dribble_cg_fixed_touch_surface", None)
+        require_surface_labels = bool(getattr(self.cfg, "dribble_cg_require_surface_labels", False))
 
         foot_to_id = {"left": 0, "right": 1}
         surface_to_id = {"inside_instep": 0, "outside_instep": 1}
@@ -91,7 +92,7 @@ class DribbleCGMotionCommand(MotionCommand):
                 f"got {configured_surface!r}."
             )
 
-        if foot_name is None and surface_name is None:
+        if foot_name is None and surface_name is None and not require_surface_labels:
             return
 
         expected_foot_id = foot_to_id[foot_name] if foot_name is not None else None
@@ -126,23 +127,18 @@ class DribbleCGMotionCommand(MotionCommand):
                     violations.append(f"{motion_name}: contact frames without an instep-surface label")
                 if bool(torch.any(wrong_contact_surface)):
                     violations.append(f"{motion_name}: contact labels include the other instep surface")
+            elif require_surface_labels:
+                missing_surface = contact & (contact_surface < 0)
+                if bool(torch.any(missing_surface)):
+                    violations.append(f"{motion_name}: contact frames without an instep-surface label")
         if violations:
             configured = " ".join(part for part in (foot_name, surface_name) if part is not None)
-            raise ValueError(
-                f"Fixed {configured} CG task received incompatible motions: " + "; ".join(violations)
+            task_description = (
+                f"Fixed {configured} CG task" if configured else "Surface-labelled CG task"
             )
-
-    def _use_demo_ball(self) -> bool:
-        return bool(getattr(self.cfg, "dribble_cg_use_demo_ball", True))
-
-    def get_dribble_demo_ball_goal_world(self) -> tuple[torch.Tensor, torch.Tensor]:
-        env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
-        if not self._use_demo_ball():
-            mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
-        else:
-            mask = self.motion.motion_has_ball_demo[self.motion_idx]
-        goal = self._demo_ball_world(env_ids)
-        return goal, mask
+            raise ValueError(
+                f"{task_description} received incompatible motions: " + "; ".join(violations)
+            )
 
     def _demo_ball_world(self, env_ids: torch.Tensor) -> torch.Tensor:
         """World-frame demo ball positions for env_ids (aligned to anchor tracking)."""
@@ -182,8 +178,6 @@ class DribbleCGMotionCommand(MotionCommand):
 
     def _should_snap_demo_ball(self, env_ids: torch.Tensor) -> torch.Tensor:
         """Per-env bool: write sim ball from demo this step."""
-        if not self._use_demo_ball():
-            return torch.zeros(env_ids.numel(), device=self.device, dtype=torch.bool)
         mi = self.motion_idx[env_ids]
         has_demo = self.motion.motion_has_ball_demo[mi]
         mode = str(getattr(self.cfg, "dribble_cg_snap_mode", "full")).lower().strip()
@@ -352,9 +346,8 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     class_type: type = DribbleCGMotionCommand
 
     dribble_cg_snap_mode: str = "full"
-    dribble_cg_use_demo_ball: bool = True
-    # Legacy compatibility switch for per-step demo-ball snapping only.  It
-    # does not select a reset spawn frame; unified local stages disable snaps.
+    # This does not select a reset spawn frame; unified local stages disable
+    # demo-ball snapping with ``dribble_cg_snap_mode = \"never\"``.
     dribble_cg_use_task_frame: bool = True
     # ``reference_first_contact`` places a physical reset ball at the first
     # labelled ``dribble_cg_contact`` point in ``ball_pos_w``.  ``legacy``
@@ -371,3 +364,6 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     # instep task requires ``dribble_cg_surface`` on every annotated contact
     # frame and validates it at environment creation.
     dribble_cg_fixed_touch_surface: str | None = None
+    # S2 uses per-frame inside/outside supervision. Fail early instead of
+    # silently treating a legacy foot-only motion as a surface-labelled one.
+    dribble_cg_require_surface_labels: bool = False

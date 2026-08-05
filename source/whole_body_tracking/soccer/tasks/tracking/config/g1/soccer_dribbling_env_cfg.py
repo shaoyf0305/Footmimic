@@ -56,9 +56,10 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
     # Optional override: "both" (default) allows either ankle; single-foot modes kept for ablations.
     dribble_contact_mode: str = "both"
-    # ``any`` preserves the old whole-foot rule. ``instep`` accepts the union
-    # of both body-frame dorsal instep regions. ``inside_instep`` and
-    # ``outside_instep`` require a dorsal/medial or dorsal/lateral contact.
+    # ``any`` preserves the old whole-foot rule. ``instep`` accepts either
+    # labelled side. ``inside_instep`` and ``outside_instep`` classify only
+    # the signed lateral offset in the contacted foot's yaw frame; no
+    # fore/aft or height box is part of the surface definition.
     dribble_contact_surface: str = "any"
 
     def __post_init__(self):
@@ -447,6 +448,10 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
                 "all_body_cfg": _contact_body_cfg,
                 "num_ankle_links": _num_ankle_links,
                 "contact_surface": surface,
+                # Preserve the strong -12 signal for knees/wrists, but an
+                # ankle touch on the wrong instep side is only -3.  Contact
+                # timing is separately penalized by CG premature-contact.
+                "wrong_surface_penalty": 0.25,
             },
         )
 
@@ -485,10 +490,11 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
         super().__post_init__()
 
         self.commands.motion.class_type = DribbleCGMotionCommand
-        # This CG variant uses contact labels to teach the touch timing/side, while
-        # keeping the ball task simple: spawn the ball in front and let physics move it.
-        setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
+        # This CG variant uses contact labels to teach the touch timing/side,
+        # while keeping the ball task simple: spawn the ball in front and let
+        # physics move it.
         setattr(self.commands.motion, "dribble_cg_use_task_frame", True)
+        setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
         setattr(self.commands.motion, "dribble_cg_fallback_ball_mode", "front")
         setattr(self.commands.motion, "dribble_cg_front_ball_distance", 0.45)
         setattr(self.commands.motion, "dribble_cg_front_ball_lateral_offset", 0.0)
@@ -526,11 +532,6 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
             ],
         )
 
-        self.rewards.dribbling_cg_demo_ball_tracking = RewTerm(
-            func=mdp.dribbling_cg_demo_ball_tracking_exp,
-            weight=4.0,
-            params={"command_name": "motion", "std": 0.32},
-        )
         # Continuous CG: demo foot–ball distance (from synthesized ball_pos_w).
         # Run scripts/dribble/synthesize_dribble_ball_traj.py on labeled motions first.
         self.rewards.dribbling_cg_foot_ball_distance = RewTerm(
@@ -1042,7 +1043,6 @@ def _apply_dribbling_full_control_velocity_terms(
         "dribbling_micro_contact_filter",
         "dribbling_undesired_contact_penalty",
         "dribbling_phase_graph_alignment",
-        "dribbling_cg_demo_ball_tracking",
         "dribbling_cg_foot_ball_distance",
         "dribbling_cg_contact_consistency",
         "dribbling_cg_premature_contact",
@@ -1367,10 +1367,27 @@ def _apply_unified_163_contract(cfg) -> None:
     _apply_unified_control_action_contract(cfg)
 
 
+def _require_reference_instep_side(cfg) -> None:
+    """Make S2 enforce the per-frame inside/outside label from its motion.
+
+    ``dribble_cg_surface`` is a contact-frame label: ``0`` means inside instep
+    and ``1`` means outside instep. The generic ``instep`` configuration keeps
+    both regions available, while this flag requires the region expected by
+    the reference frame. S3 deliberately does not call this helper because
+    its touches are task-owned rather than reference-timed.
+    """
+    for reward_name in (
+        "dribbling_legal_foot_touch",
+        "dribbling_undesired_contact_penalty",
+        "dribbling_cg_foot_consistency",
+    ):
+        if hasattr(cfg.rewards, reward_name):
+            getattr(cfg.rewards, reward_name).params["cg_surface_gated"] = True
+
+
 def _disable_reference_ball_contact_terms(cfg) -> None:
     """Remove reference-timed ball and contact-position objectives for S3."""
     for reward_name in (
-        "dribbling_cg_demo_ball_tracking",
         "dribbling_cg_foot_ball_distance",
         "dribbling_cg_contact_consistency",
         "dribbling_cg_premature_contact",
@@ -1533,6 +1550,20 @@ def _apply_local_reference_ball_objectives(cfg) -> None:
     _apply_local_ball_objectives(cfg, disable_pelvis_quat_tracking=False)
 
 
+def _disable_s2_unreliable_ball_penalties(cfg) -> None:
+    """Remove S2 penalties that conflict with reference-local dribbling.
+
+    ``ball_trapped`` is currently a pelvis-distance/height threshold, not a
+    two-foot trap detector, and therefore penalizes normal S2 reference poses.
+    ``orbiting`` also mistakes reference lateral/yaw motion for circling.
+    Keep their implementations for S3/task experiments, but exclude both
+    terms from every S2 reward manager.
+    """
+    for reward_name in ("dribbling_ball_trapped_penalty", "dribbling_orbiting_penalty"):
+        if hasattr(cfg.rewards, reward_name):
+            setattr(cfg.rewards, reward_name, None)
+
+
 @configclass
 class G1FlatMotionCGPretrainUnifiedS1LocalStrictEnvCfg(G1FlatMotionStrictPretrainEnvCfg):
     """S1 local strict: exact demo local twist plus strict relative motion tracking.
@@ -1548,7 +1579,6 @@ class G1FlatMotionCGPretrainUnifiedS1LocalStrictEnvCfg(G1FlatMotionStrictPretrai
         # The 163-D contract includes a ball-relative input.  Reuse the S2/S3
         # first-contact spawn without introducing any ball objective in S1.
         self.commands.motion.class_type = DribbleCGMotionCommand
-        setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
         setattr(self.commands.motion, "dribble_cg_use_task_frame", False)
         setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
         setattr(self.commands.motion, "dribble_cg_ball_spawn_mode", "reference_first_contact")
@@ -1592,15 +1622,17 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         _apply_local_twist_velocity_rewards(self, lin_weight=5.0, lin_std=0.60, yaw_weight=1.0, yaw_std=1.50)
         _apply_unified_local_163_contract(self)
         _apply_local_reference_ball_objectives(self)
+        _disable_s2_unreliable_ball_penalties(self)
+        _require_reference_instep_side(self)
 
         # The ball always follows physics.  CG position/contact rewards remain
         # to teach the annotated reference touch placement and foot selection.
         # Its reset location is the reference's first contact point, represented
         # in the reference pelvis-local frame rather than simulation task +X.
-        setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
         setattr(self.commands.motion, "dribble_cg_use_task_frame", False)
         setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
         setattr(self.commands.motion, "dribble_cg_ball_spawn_mode", "reference_first_contact")
+        setattr(self.commands.motion, "dribble_cg_require_surface_labels", True)
 
 
 @configclass
@@ -1648,7 +1680,6 @@ class G1FlatCGDribblingUnifiedS3LocalTaskEnvCfg(G1FlatCGDribblingEnvCfg):
             params={"command_name": "motion"},
         )
 
-        setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
         setattr(self.commands.motion, "dribble_cg_use_task_frame", False)
         setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
         setattr(self.commands.motion, "dribble_cg_ball_spawn_mode", "reference_first_contact")
@@ -1694,10 +1725,12 @@ class G1FlatCGDribblingUnifiedS2ReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         )
         _apply_unified_163_contract(self)
         _apply_unified_reference_command_inputs(self)
+        _disable_s2_unreliable_ball_penalties(self)
+        _require_reference_instep_side(self)
 
-        setattr(self.commands.motion, "dribble_cg_use_demo_ball", True)
         setattr(self.commands.motion, "dribble_cg_use_task_frame", False)
         setattr(self.commands.motion, "dribble_cg_snap_mode", "non_contact_only")
+        setattr(self.commands.motion, "dribble_cg_require_surface_labels", True)
         self.commands.motion.mimic_align_locomotion_heading = False
 
 
@@ -1725,7 +1758,6 @@ class G1FlatCGDribblingUnifiedS3TaskEnvCfg(G1FlatCGDribblingEnvCfg):
         _disable_reference_ball_contact_terms(self)
 
         # S3 always starts a task-owned physical ball ahead of the pelvis.
-        setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
         setattr(self.commands.motion, "dribble_cg_use_task_frame", True)
         setattr(self.commands.motion, "dribble_cg_fixed_touch_foot", None)
         setattr(self.commands.motion, "dribble_cg_fixed_touch_surface", None)
