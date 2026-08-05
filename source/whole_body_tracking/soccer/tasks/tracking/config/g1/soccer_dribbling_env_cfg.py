@@ -1456,7 +1456,39 @@ def _apply_local_twist_command_mode(cfg, mode: str) -> None:
     cfg.commands.motion.mimic_align_locomotion_heading = False
 
 
-def _apply_local_twist_velocity_rewards(cfg, *, lin_weight: float, lin_std: float, yaw_weight: float, yaw_std: float) -> None:
+def _apply_reference_local_reset(cfg) -> None:
+    """Reset a local-reference stage at the unmodified demo start state.
+
+    A local twist does not need a simulation-wide forward axis.  Keep the
+    reference yaw and velocities, and make any physical ball placement depend
+    only on the reference pelvis-local geometry.  Simulation domain
+    randomization events remain enabled; this only removes reset-state noise
+    that would otherwise desynchronise a strict reference episode.
+    """
+    cfg.commands.motion.reset_face_task_forward = False
+    cfg.commands.motion.reset_zero_velocity = False
+    cfg.commands.motion.pose_range = {
+        "x": (0.0, 0.0),
+        "y": (0.0, 0.0),
+        "z": (0.0, 0.0),
+        "roll": (0.0, 0.0),
+        "pitch": (0.0, 0.0),
+        "yaw": (0.0, 0.0),
+    }
+    cfg.commands.motion.velocity_range = {
+        "x": (0.0, 0.0),
+        "y": (0.0, 0.0),
+        "z": (0.0, 0.0),
+        "roll": (0.0, 0.0),
+        "pitch": (0.0, 0.0),
+        "yaw": (0.0, 0.0),
+    }
+    cfg.commands.motion.joint_position_range = (0.0, 0.0)
+
+
+def _apply_local_twist_velocity_rewards(
+    cfg, *, lin_weight: float, lin_std: float, yaw_weight: float, yaw_std: float
+) -> None:
     """Replace world/task-frame root tracking with the active pelvis-local twist."""
     for reward_name in ("forward_velocity", "lateral_velocity_penalty", "task_heading_alignment"):
         if hasattr(cfg.rewards, reward_name):
@@ -1479,16 +1511,26 @@ def _apply_local_twist_velocity_rewards(cfg, *, lin_weight: float, lin_std: floa
         cfg.rewards.dribbling_velocity_tracking.weight = 0.0
 
 
-def _apply_local_task_ball_objectives(cfg) -> None:
-    """Use pelvis-local possession geometry and command-local ball progress for S3."""
+def _apply_local_ball_objectives(cfg, *, disable_pelvis_quat_tracking: bool) -> None:
+    """Remove fixed-world-forward geometry from a local-twist dribbling stage."""
     cfg.rewards.dribbling_dynamic_proximity.func = mdp.dribbling_pelvis_local_dynamic_proximity
     cfg.rewards.dribbling_ball_forward_progress.func = mdp.dribbling_command_ball_progress_reward
     cfg.rewards.dribbling_ball_trapped_penalty.func = mdp.dribbling_pelvis_local_ball_trapped_penalty
     cfg.rewards.dribbling_chase_ball.func = mdp.dribbling_command_chase_ball_reward
     cfg.rewards.dribbling_face_ball.func = mdp.dribbling_pelvis_local_face_ball
     cfg.rewards.dribbling_legal_foot_touch.params["min_pelvis_heading"] = 0.0
-    if hasattr(cfg.rewards, "dribbling_pelvis_quat_tracking"):
+    if disable_pelvis_quat_tracking and hasattr(cfg.rewards, "dribbling_pelvis_quat_tracking"):
         cfg.rewards.dribbling_pelvis_quat_tracking.weight = 0.0
+
+
+def _apply_local_task_ball_objectives(cfg) -> None:
+    """S3 task version: local geometry with no reference-pelvis orientation prior."""
+    _apply_local_ball_objectives(cfg, disable_pelvis_quat_tracking=True)
+
+
+def _apply_local_reference_ball_objectives(cfg) -> None:
+    """S2 version: local geometry while retaining its reference-pose prior."""
+    _apply_local_ball_objectives(cfg, disable_pelvis_quat_tracking=False)
 
 
 @configclass
@@ -1503,6 +1545,13 @@ class G1FlatMotionCGPretrainUnifiedS1LocalStrictEnvCfg(G1FlatMotionStrictPretrai
     def __post_init__(self):
         super().__post_init__()
         _apply_local_twist_command_mode(self, "reference")
+        # The 163-D contract includes a ball-relative input.  Reuse the S2/S3
+        # first-contact spawn without introducing any ball objective in S1.
+        self.commands.motion.class_type = DribbleCGMotionCommand
+        setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
+        setattr(self.commands.motion, "dribble_cg_use_task_frame", False)
+        setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
+        setattr(self.commands.motion, "dribble_cg_ball_spawn_mode", "reference_first_contact")
         # S1 is raw strict imitation: preserve every demo frame and end the
         # episode at the source boundary.  ``time_out=True`` resets LSTM
         # memory while retaining normal value bootstrapping at a time limit.
@@ -1528,6 +1577,7 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         _apply_local_twist_command_mode(self, "reference")
+        _apply_reference_local_reset(self)
         # S2 remains an exact demo/contact episode.  Ball, robot, and LSTM
         # all reset together at the final reference frame; no synthetic
         # bridge or unlabelled contact interval is introduced here.
@@ -1541,12 +1591,16 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         )
         _apply_local_twist_velocity_rewards(self, lin_weight=5.0, lin_std=0.60, yaw_weight=1.0, yaw_std=1.50)
         _apply_unified_local_163_contract(self)
+        _apply_local_reference_ball_objectives(self)
 
         # The ball always follows physics.  CG position/contact rewards remain
         # to teach the annotated reference touch placement and foot selection.
+        # Its reset location is the reference's first contact point, represented
+        # in the reference pelvis-local frame rather than simulation task +X.
         setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
-        setattr(self.commands.motion, "dribble_cg_use_task_frame", True)
+        setattr(self.commands.motion, "dribble_cg_use_task_frame", False)
         setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
+        setattr(self.commands.motion, "dribble_cg_ball_spawn_mode", "reference_first_contact")
 
 
 @configclass
@@ -1559,6 +1613,7 @@ class G1FlatCGDribblingUnifiedS3LocalTaskEnvCfg(G1FlatCGDribblingEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         _apply_local_twist_command_mode(self, "resampled")
+        _apply_reference_local_reset(self)
         self.commands.motion.motion_clip_end_resample = False
         self.commands.motion.motion_clip_end_terminate = False
         self.commands.motion.motion_cyclic_blend_frames = 25
@@ -1594,7 +1649,9 @@ class G1FlatCGDribblingUnifiedS3LocalTaskEnvCfg(G1FlatCGDribblingEnvCfg):
         )
 
         setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
-        setattr(self.commands.motion, "dribble_cg_use_task_frame", True)
+        setattr(self.commands.motion, "dribble_cg_use_task_frame", False)
+        setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
+        setattr(self.commands.motion, "dribble_cg_ball_spawn_mode", "reference_first_contact")
         setattr(self.commands.motion, "dribble_cg_fixed_touch_foot", None)
         setattr(self.commands.motion, "dribble_cg_fixed_touch_surface", None)
 

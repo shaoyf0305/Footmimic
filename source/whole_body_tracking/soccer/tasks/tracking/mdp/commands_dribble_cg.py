@@ -1,10 +1,10 @@
 """Dribbling motion command with XGen-style demo ball stitching.
 
-Uses per-frame ``ball_pos_w`` from motion for labels; ball spawn / physics use the
-task frame (+X forward). Optional demo kinematic snap is disabled when
-``dribble_cg_use_task_frame`` is True. Legacy yaw-only
-anchor transform as body tracking targets so the ball follows the stitched
-interaction trajectory. Optional ``dribble_cg_snap_mode``:
+Uses per-frame ``ball_pos_w`` from motion for labels and, for unified local
+stages, reset placement at the first labelled contact.  The reset position is
+represented relative to the frame-0 pelvis yaw, never by a fixed simulation
+``+X`` direction. Optional demo kinematic snap is controlled separately by
+``dribble_cg_snap_mode``:
 
 - ``full`` (default): every step writes the demo ball pose into simulation.
 - ``non_contact_only``: only overwrite the ball when the CG label says
@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 import torch
 from isaaclab.managers import CommandTermCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import quat_apply, quat_inv, yaw_quat
 
 from soccer.tasks.tracking.mdp.task_frame import mimic_anchor_yaw_delta_quat, spawn_ball_ahead_env_local
 
@@ -40,6 +40,20 @@ class DribbleCGMotionCommand(MotionCommand):
     """Soccer motion command + demo ball sync for dribbling CG."""
 
     def __init__(self, cfg: DribbleCGMotionCommandCfg, env: ManagerBasedRLEnv):
+        # ``MotionCommand.__init__`` invokes ``_compute_soccer_ball_positions``.
+        # Allocate reset provenance first because dynamic dispatch reaches the
+        # overridden first-contact implementation during that base setup.
+        self.ball_spawn_reference_contact_frame = torch.full(
+            (env.num_envs,), -1, dtype=torch.long, device=env.device
+        )
+        # 1 = reference first-contact placement; 0 = explicit local-front
+        # fallback; -1 = legacy/unknown source.  Keep this state separate from
+        # the live ball pose so diagnostics retain reset provenance after the
+        # ball has moved under physics.
+        self.ball_spawn_source = torch.full(
+            (env.num_envs,), -1, dtype=torch.int8, device=env.device
+        )
+        self.ball_spawn_reference_local = torch.zeros(env.num_envs, 3, device=env.device)
         super().__init__(cfg, env)
         self._validate_fixed_touch_spec()
 
@@ -180,20 +194,98 @@ class DribbleCGMotionCommand(MotionCommand):
             return has_demo & ~in_ref_contact
         return has_demo
 
-    def _front_ball_positions(self, env_ids: torch.Tensor) -> torch.Tensor:
-        """Env-local ball on task +X ahead of the motion's starting anchor."""
+    def _anchor_local_front_ball_positions(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Fallback ball ahead of the frame-0 reference pelvis in pelvis-local axes."""
         mi = self.motion_idx[env_ids]
         first_anchor = self.motion._body_pos_w[mi, 0, self.motion_anchor_body_index]
+        first_anchor_yaw = yaw_quat(self.motion._body_quat_w[mi, 0, self.motion_anchor_body_index])
 
         distance = float(getattr(self.cfg, "dribble_cg_front_ball_distance", 0.45))
         lateral_offset = float(getattr(self.cfg, "dribble_cg_front_ball_lateral_offset", 0.0))
         height = float(getattr(self.cfg, "dribble_cg_front_ball_height", self._target_height))
 
+        local_offset = first_anchor.new_zeros((env_ids.numel(), 3))
+        local_offset[:, 0] = distance
+        local_offset[:, 1] = lateral_offset
+        ball_pos = first_anchor + quat_apply(first_anchor_yaw, local_offset)
+        ball_pos[:, 2] = height
+        return ball_pos
+
+    def _legacy_front_ball_positions(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Historical fallback: fixed env/task +X ahead of the start anchor."""
+        mi = self.motion_idx[env_ids]
+        first_anchor = self.motion._body_pos_w[mi, 0, self.motion_anchor_body_index]
+        distance = float(getattr(self.cfg, "dribble_cg_front_ball_distance", 0.45))
+        lateral_offset = float(getattr(self.cfg, "dribble_cg_front_ball_lateral_offset", 0.0))
+        height = float(getattr(self.cfg, "dribble_cg_front_ball_height", self._target_height))
         return spawn_ball_ahead_env_local(first_anchor, distance, lateral_offset, height)
+
+    def _reference_first_contact_ball_positions(
+        self, env_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return first-contact ball positions, validity, and source frame.
+
+        ``ball_pos_w`` is stored in the same reference coordinate system as
+        the pelvis.  Its selected point is therefore equivalent to mapping the
+        frame-0 pelvis-local offset back through that pelvis yaw; retaining the
+        direct value avoids introducing any simulation/world-forward axis.
+        """
+        mi = self.motion_idx[env_ids]
+        contact_frames = self.motion.first_dribble_contact_frame[mi]
+        valid = (contact_frames >= 0) & self.motion.motion_has_ball_demo[mi]
+        safe_frames = contact_frames.clamp(min=0)
+        positions = self.motion.ball_pos_w[mi, safe_frames].clone()
+        return positions, valid, contact_frames
+
+    def _record_ball_spawn(
+        self,
+        env_ids: torch.Tensor,
+        ball_positions: torch.Tensor,
+        contact_frames: torch.Tensor,
+        used_reference_contact: torch.Tensor,
+    ) -> None:
+        """Keep spawn provenance and frame-0 pelvis-local geometry for diagnostics."""
+        mi = self.motion_idx[env_ids]
+        first_anchor = self.motion._body_pos_w[mi, 0, self.motion_anchor_body_index]
+        first_anchor_yaw_inv = quat_inv(
+            yaw_quat(self.motion._body_quat_w[mi, 0, self.motion_anchor_body_index])
+        )
+        self.ball_spawn_reference_contact_frame[env_ids] = torch.where(
+            used_reference_contact,
+            contact_frames,
+            torch.full_like(contact_frames, -1),
+        )
+        self.ball_spawn_source[env_ids] = used_reference_contact.to(torch.int8)
+        self.ball_spawn_reference_local[env_ids] = quat_apply(
+            first_anchor_yaw_inv, ball_positions - first_anchor
+        )
+
+    def ball_spawn_reference_info(self) -> dict[str, torch.Tensor]:
+        """Reset-ball provenance for playback diagnostics.
+
+        ``reference_local`` is the ball position relative to the reference
+        frame-0 pelvis, expressed in that pelvis yaw frame.  A source value of
+        one means first labelled contact; zero means the explicit local-front
+        fallback for a clip missing the needed labels/data.
+        """
+        return {
+            "source": self.ball_spawn_source,
+            "reference_contact_frame": self.ball_spawn_reference_contact_frame,
+            "reference_local": self.ball_spawn_reference_local,
+        }
 
     def _compute_soccer_ball_positions(self, env_ids: Sequence[int] | torch.Tensor):
         ids = self._to_env_id_tensor(env_ids)
         if ids.numel() == 0:
+            return
+
+        spawn_mode = str(getattr(self.cfg, "dribble_cg_ball_spawn_mode", "legacy")).lower().strip()
+        if spawn_mode in {"reference_first_contact", "first_contact", "contact"}:
+            contact_positions, valid, contact_frames = self._reference_first_contact_ball_positions(ids)
+            fallback_positions = self._anchor_local_front_ball_positions(ids)
+            ball_positions = torch.where(valid.unsqueeze(-1), contact_positions, fallback_positions)
+            self.soccer_ball_pos[ids] = ball_positions
+            self._record_ball_spawn(ids, ball_positions, contact_frames, valid)
             return
 
         has_demo = self._should_snap_demo_ball(ids)
@@ -203,12 +295,12 @@ class DribbleCGMotionCommand(MotionCommand):
         if fallback_ids.numel() > 0:
             fallback_mode = str(getattr(self.cfg, "dribble_cg_fallback_ball_mode", "arc_endpoint")).lower().strip()
             if fallback_mode == "front":
-                self.soccer_ball_pos[fallback_ids] = self._front_ball_positions(fallback_ids)
+                self.soccer_ball_pos[fallback_ids] = self._legacy_front_ball_positions(fallback_ids)
             else:
                 super()._compute_soccer_ball_positions(fallback_ids)
         if demo_ids.numel() > 0:
-            # Spawn on task +X; per-step demo snap (_sync_demo_ball_after_step) may still move the ball.
-            self.soccer_ball_pos[demo_ids] = self._front_ball_positions(demo_ids)
+            # Historical +X placement is retained for legacy demo-snap tasks.
+            self.soccer_ball_pos[demo_ids] = self._legacy_front_ball_positions(demo_ids)
 
     def _sync_demo_ball_after_step(self):
         """Kinematic sync of sim ball to demo trajectory (subset of envs)."""
@@ -261,7 +353,13 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
 
     dribble_cg_snap_mode: str = "full"
     dribble_cg_use_demo_ball: bool = True
+    # Legacy compatibility switch for per-step demo-ball snapping only.  It
+    # does not select a reset spawn frame; unified local stages disable snaps.
     dribble_cg_use_task_frame: bool = True
+    # ``reference_first_contact`` places a physical reset ball at the first
+    # labelled ``dribble_cg_contact`` point in ``ball_pos_w``.  ``legacy``
+    # preserves the historical demo/fallback branching for older task IDs.
+    dribble_cg_ball_spawn_mode: str = "legacy"
     dribble_cg_fallback_ball_mode: str = "arc_endpoint"
     dribble_cg_front_ball_distance: float = 0.45
     dribble_cg_front_ball_lateral_offset: float = 0.0

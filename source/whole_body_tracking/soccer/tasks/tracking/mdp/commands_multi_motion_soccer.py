@@ -276,6 +276,15 @@ class MultiMotionLoader:
         self._dribble_cg_dist_foot = pad_1d_int8(dribble_cg_dist_foot_list, pad_value=-1)
         self.motion_has_ball_demo = torch.tensor(motion_has_ball_demo_list, dtype=torch.bool, device=self.device)
         self.motion_has_dribble_cg = torch.any(self._dribble_cg_contact > 0, dim=1)
+        # The first labelled contact is the reset-ball source for local
+        # dribbling stages.  Keep ``-1`` for clips without a valid contact
+        # rather than allowing ``argmax`` to silently return padded frame 0.
+        first_contact = torch.argmax((self._dribble_cg_contact > 0).to(torch.int64), dim=1)
+        self.first_dribble_cg_contact_frame = torch.where(
+            self.motion_has_dribble_cg,
+            first_contact,
+            torch.full_like(first_contact, -1),
+        )
         self.motion_has_dribble_cg_foot_ball_dist = torch.any(self._dribble_cg_foot_ball_dist >= 0.0, dim=1)
 
     @property
@@ -317,6 +326,11 @@ class MultiMotionLoader:
     def dribble_cg_contact(self) -> torch.Tensor:
         """Per-frame contact annotation ``[num_files, T]`` (0/1, padded with 0)."""
         return self._dribble_cg_contact
+
+    @property
+    def first_dribble_contact_frame(self) -> torch.Tensor:
+        """First labelled contact frame per motion, or ``-1`` when unavailable."""
+        return self.first_dribble_cg_contact_frame
 
     @property
     def dribble_cg_foot(self) -> torch.Tensor:

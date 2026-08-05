@@ -363,7 +363,7 @@ def get_motion_files(motion_path: str) -> list[str]:
 _BALL_SENSOR_NAME = "soccer_ball_contact"
 _CONTACT_FORCE_THRESHOLD = 1.0
 _LAST_TERM_REASON: str = "-"
-_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v3"
+_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v4"
 
 _ARM_DIAGNOSTIC_JOINT_NAMES = [
     "left_shoulder_pitch_joint",
@@ -814,6 +814,7 @@ def _create_diagnostic(
         "trunk_body_names": np.asarray(_TRUNK_DIAGNOSTIC_BODY_NAMES),
         "reward_term_names": reward_term_names,
         "task_state_names": np.asarray(["idle", "dribble", "stop"]),
+        "ball_spawn_source_names": np.asarray(["fallback_pelvis_local_front", "reference_first_contact"]),
         "constraint_group": "none" if not constraints else "+".join(constraint_groups.tolist()),
         "constraint_margin": float(constraint_margins[0]) if len(constraints) == 1 else np.nan,
         "constraint_joint_names": constraint_joint_names,
@@ -832,6 +833,9 @@ def _create_diagnostic(
         "contact_cg_gated": contact_settings["cg_gated"],
         "step": [],
         "motion_idx": [],
+        "ball_spawn_source": [],
+        "ball_spawn_reference_contact_frame": [],
+        "ball_spawn_reference_local": [],
         "style_phase": [],
         "style_cycle_length": [],
         "style_source_first_frame": [],
@@ -999,6 +1003,17 @@ def _append_diagnostic(
 
     diagnostic["step"].append(int(step))
     diagnostic["motion_idx"].append(int(command.motion_idx[0].item()))
+    if hasattr(command, "ball_spawn_reference_info"):
+        spawn_info = command.ball_spawn_reference_info()
+        diagnostic["ball_spawn_source"].append(int(spawn_info["source"][0].item()))
+        diagnostic["ball_spawn_reference_contact_frame"].append(
+            int(spawn_info["reference_contact_frame"][0].item())
+        )
+        diagnostic["ball_spawn_reference_local"].append(_cpu(spawn_info["reference_local"]))
+    else:
+        diagnostic["ball_spawn_source"].append(-1)
+        diagnostic["ball_spawn_reference_contact_frame"].append(-1)
+        diagnostic["ball_spawn_reference_local"].append(np.full(3, np.nan, dtype=np.float32))
     diagnostic["style_phase"].append(int(command.style_phase_steps[0].item()))
     if hasattr(command, "style_phase_reference_info"):
         style_info = command.style_phase_reference_info()
@@ -1431,6 +1446,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         return
     metadata_keys = {
         "path", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names", "task_state_names",
+        "ball_spawn_source_names",
         "trunk_joint_ids", "trunk_joint_names", "trunk_action_ids", "trunk_full_action_ids", "trunk_body_ids",
         "trunk_reference_body_ids", "trunk_body_names",
         "constraint_group", "constraint_margin", "constraint_joint_names", "constraint_groups",
@@ -1449,6 +1465,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["trunk_body_names"] = diagnostic["trunk_body_names"]
     arrays["reward_term_names"] = diagnostic["reward_term_names"]
     arrays["task_state_names"] = diagnostic["task_state_names"]
+    arrays["ball_spawn_source_names"] = diagnostic["ball_spawn_source_names"]
     arrays["constraint_group"] = np.asarray(diagnostic["constraint_group"])
     arrays["constraint_margin"] = np.asarray(diagnostic["constraint_margin"])
     arrays["constraint_joint_names"] = diagnostic["constraint_joint_names"]

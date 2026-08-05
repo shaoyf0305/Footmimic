@@ -23,6 +23,16 @@ ball, and LSTM state together. S3 instead loops the same master clip through a
 25-frame (0.5 s at 50 Hz) quintic bridge, blending its tail into its start
 without resetting the ongoing task scene.
 
+At reset, all three stages retain the reference frame-0 pelvis pose, yaw, and
+velocity; they do not canonicalize the robot to a simulation/world `+X` axis.
+The physical ball is initialized at the first labelled
+`dribble_cg_contact` position from that reference. Internally this point is
+stored as a frame-0 pelvis-local offset, so the same reset geometry remains
+valid under any simulator yaw. If a motion lacks either a contact label or
+`ball_pos_w`, the explicit fallback is 0.45 m ahead in the frame-0 pelvis
+local frame. S1 applies no ball reward; it retains this identical spawn only
+because the unified 163-D observation contains the ball-relative input.
+
 S3 samples `vx∈[0,1.50] m/s`, `vy∈[-0.50,0.50] m/s`, and
 `wz∈[-0.80,0.80] rad/s`, with 10% exact `[0,0,0]` standing commands. For its
 first 24,000 environment steps (1,000 PPO updates at 24 rollout steps), the
@@ -58,12 +68,14 @@ and consecutive same-side touches feasible when the task requires them.
 
 ## Diagnostic
 
-Run playback with `--diagnostic --diagnostic_stride 1`.  The `dribble-v3`
+Run playback with `--diagnostic --diagnostic_stride 1`.  The `dribble-v4`
 archive records `reference_twist_local`, `active_twist_local`,
 `actual_twist_local`, `twist_local_error`, and `twist_blend_alpha` alongside
 contact and action traces. It also records the virtual style phase, its source
 frame pair, and the seam blend factor; these seam fields are active only in
-S3. For S1/S2, check local twist error and reference
+S3. `ball_spawn_source`, `ball_spawn_reference_contact_frame`, and
+`ball_spawn_reference_local` record whether reset used the labelled first
+contact point or the deliberate local-front fallback. For S1/S2, check local twist error and reference
 foot/contact agreement.  For S3, judge local twist tracking, possession,
 generic legal instep touches, and ball progress; do not score CG-foot match as
 an S3 requirement.
