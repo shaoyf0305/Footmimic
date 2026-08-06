@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synthesize ``ball_pos_w`` and per-frame foot–ball distance from CG 0/1 labels.
+"""Synthesize contact geometry and contact-to-contact ball-flow labels from CG data.
 
 Pipeline (XGen-style, football simplification):
 
@@ -21,12 +21,18 @@ Pipeline (XGen-style, football simplification):
    ``foot_follow``: ball tracks a stepping foot every frame. ``lerp``: legacy gaps +
    anchor spawn (avoid for master data).
 
-4. **``dribble_cg_foot_ball_dist[t]``** = XY distance from the reference foot to the
+4. **Contact-to-contact flow**: for adjacent contact anchors ``k`` and ``k+1``,
+   store the outgoing XY direction in the pelvis-yaw frame at anchor ``k``, plus
+   the anchor distance and duration. The label is held on ``[k, k+1)``; the
+   final contact has no outgoing target. Stage 2 uses these event labels instead
+   of treating the interpolated ball path as ground truth.
+
+5. **``dribble_cg_foot_ball_dist[t]``** = XY distance from the reference foot to the
    synthesized ball at frame ``t`` (meters). Computed on **every** frame where a
    stitched ball trajectory exists (contact + approach gaps + tail), not only on
    annotated contact frames.
 
-5. **``dribble_cg_dist_foot[t]``** = which foot the ball was placed against (0 left,
+6. **``dribble_cg_dist_foot[t]``** = which foot the ball was placed against (0 left,
    1 right). ``dribble_cg_foot`` (contact annotation) is left unchanged.
 
 **Foot body indices:** ``pkl_to_npz`` stores all ~30 G1 bodies. Indices 3/6 match the
@@ -34,9 +40,9 @@ Pipeline (XGen-style, football simplification):
 pelvis. Use ``--auto_foot_indices`` (default) to pick the lowest, most mobile foot
 links (``LL_FOOT`` / ``LR_FOOT`` class).
 
-Writes ``ball_pos_w``, ``dribble_cg_foot_ball_dist``,
-``dribble_cg_dist_foot``, and the rising-edge mask
-``dribble_contact_anchor`` into each ``.npz``.
+Writes ``ball_pos_w`` and the legacy distance arrays for replay/debugging, the
+rising-edge mask ``dribble_contact_anchor``, and ``dribble_cg_flow_*`` arrays
+for Stage-2 reward supervision into each ``.npz``.
 """
 
 from __future__ import annotations
@@ -595,6 +601,64 @@ def synthesize_ball_trajectory(
     return ball, dist, dist_foot, left_foot_index, right_foot_index
 
 
+def synthesize_contact_flow_labels(
+    ball_pos_w: np.ndarray,
+    body_quat_w: np.ndarray,
+    contact_anchor: np.ndarray,
+    *,
+    anchor_body_index: int,
+    fps: float,
+    min_anchor_distance: float = 1.0e-4,
+) -> dict[str, np.ndarray]:
+    """Build causal outgoing-ball labels between adjacent contact anchors.
+
+    Absolute world heading is intentionally not stored. Each outgoing direction
+    is expressed in the reference pelvis-yaw frame at the source touch. At
+    training time it is rotated once by the simulated pelvis yaw at the actual
+    touch and then latched for that segment. This makes the target invariant to
+    episode spawn heading and prevents it from drifting as the pelvis turns.
+    """
+    T = int(ball_pos_w.shape[0])
+    direction_local = np.zeros((T, 2), dtype=np.float32)
+    distance = np.full(T, -1.0, dtype=np.float32)
+    duration = np.full(T, -1.0, dtype=np.float32)
+    anchor_frame = np.full(T, -1, dtype=np.int32)
+    valid = np.zeros(T, dtype=np.int8)
+
+    def _result() -> dict[str, np.ndarray]:
+        return {
+            "dribble_cg_flow_dir_local": direction_local,
+            "dribble_cg_flow_distance": distance,
+            "dribble_cg_flow_duration": duration,
+            "dribble_cg_flow_anchor_frame": anchor_frame,
+            "dribble_cg_flow_valid": valid,
+        }
+
+    if T == 0 or not np.isfinite(fps) or fps <= 0.0:
+        return _result()
+
+    anchor_idx = np.flatnonzero(np.asarray(contact_anchor).reshape(-1)[:T] > 0)
+    pelvis_idx = _resolve_anchor_body_index(int(body_quat_w.shape[1]), anchor_body_index)
+    for t0, t1 in zip(anchor_idx[:-1], anchor_idx[1:]):
+        delta_world = np.asarray(ball_pos_w[t1, :2] - ball_pos_w[t0, :2], dtype=np.float64)
+        segment_distance = float(np.linalg.norm(delta_world))
+        segment_duration = float(t1 - t0) / float(fps)
+        if segment_distance < min_anchor_distance or segment_duration <= 0.0:
+            continue
+
+        pelvis_yaw = float(_yaw_from_quat_wxyz(body_quat_w[t0, pelvis_idx]))
+        delta_local = _yaw_rotate_xy(np.asarray([-pelvis_yaw]), delta_world)[0]
+        unit_local = delta_local / segment_distance
+        segment_slice = slice(int(t0), int(t1))
+        direction_local[segment_slice] = unit_local.astype(np.float32)
+        distance[segment_slice] = np.float32(segment_distance)
+        duration[segment_slice] = np.float32(segment_duration)
+        anchor_frame[segment_slice] = np.int32(t0)
+        valid[segment_slice] = np.int8(1)
+
+    return _result()
+
+
 def _npz_replace(npz_path: Path, updates: dict[str, np.ndarray]) -> None:
     with np.load(npz_path, allow_pickle=True) as old:
         payload = {k: old[k] for k in old.files}
@@ -603,7 +667,9 @@ def _npz_replace(npz_path: Path, updates: dict[str, np.ndarray]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Synthesize ball_pos_w + foot-ball distance from CG labels")
+    parser = argparse.ArgumentParser(
+        description="Synthesize contact geometry and contact-to-contact ball-flow labels"
+    )
     parser.add_argument("--motion_path", type=str, required=True, help="Directory or single .npz")
     parser.add_argument(
         "--output_dir",
@@ -724,6 +790,7 @@ def main() -> None:
                 cg_surface = np.asarray(d["dribble_cg_surface"], dtype=np.int8).reshape(-1)[:T]
             else:
                 cg_surface = None
+            fps = float(np.asarray(d["fps"] if "fps" in d.files else 50.0).reshape(-1)[0])
 
         li = 3 if args.no_auto_foot_indices and args.left_foot_index < 0 else args.left_foot_index
         ri = 6 if args.no_auto_foot_indices and args.right_foot_index < 0 else args.right_foot_index
@@ -758,6 +825,14 @@ def main() -> None:
         if T > 1:
             contact_anchor[1:] = ((cg_contact[1:] > 0) & (cg_contact[:-1] <= 0)).astype(np.int8)
 
+        flow_labels = synthesize_contact_flow_labels(
+            ball,
+            body_quat,
+            contact_anchor,
+            anchor_body_index=args.anchor_body_index,
+            fps=fps,
+        )
+
         _npz_replace(
             target,
             {
@@ -765,14 +840,20 @@ def main() -> None:
                 "dribble_cg_foot_ball_dist": dist.astype(np.float32),
                 "dribble_cg_dist_foot": dist_foot.astype(np.int8),
                 "dribble_contact_anchor": contact_anchor,
+                **flow_labels,
             },
         )
         n_labeled = int(np.sum(dist >= 0))
         n_contact = int(np.sum(cg_contact > 0))
         d_med = float(np.median(dist[dist >= 0])) if n_labeled > 0 else float("nan")
+        valid_flow = flow_labels["dribble_cg_flow_valid"] > 0
+        n_flow_segments = int(
+            np.unique(flow_labels["dribble_cg_flow_anchor_frame"][valid_flow]).size
+        )
         print(
             f"[OK] {target.name}: feet L/R={li}/{ri} ball {ball.shape}, "
-            f"dist_frames={n_labeled} (contact={n_contact}), median={d_med:.3f}m"
+            f"dist_frames={n_labeled} (contact={n_contact}), median={d_med:.3f}m, "
+            f"flow_segments={n_flow_segments}"
         )
         updated += 1
 

@@ -104,6 +104,11 @@ class MultiMotionLoader:
         dribble_cg_surface_list: list[torch.Tensor] = []
         dribble_cg_foot_ball_dist_list: list[torch.Tensor] = []
         dribble_cg_dist_foot_list: list[torch.Tensor] = []
+        dribble_cg_flow_dir_local_list: list[torch.Tensor] = []
+        dribble_cg_flow_distance_list: list[torch.Tensor] = []
+        dribble_cg_flow_duration_list: list[torch.Tensor] = []
+        dribble_cg_flow_anchor_frame_list: list[torch.Tensor] = []
+        dribble_cg_flow_valid_list: list[torch.Tensor] = []
         motion_has_ball_demo_list: list[bool] = []
 
         self.fps_list = []
@@ -211,11 +216,90 @@ class MultiMotionLoader:
                 df = np.asarray(data["dribble_cg_dist_foot"], dtype=np.int8).reshape(-1)[:T]
                 cg_dist_foot[: df.shape[0]] = torch.as_tensor(df, device=device, dtype=torch.int8)
 
+            flow_keys = {
+                "dribble_cg_flow_dir_local",
+                "dribble_cg_flow_distance",
+                "dribble_cg_flow_duration",
+                "dribble_cg_flow_anchor_frame",
+                "dribble_cg_flow_valid",
+            }
+            present_flow_keys = flow_keys.intersection(data.files)
+            if present_flow_keys and present_flow_keys != flow_keys:
+                missing = sorted(flow_keys - present_flow_keys)
+                raise ValueError(f"{motion_file}: incomplete dribble CG flow labels; missing {missing}")
+
+            cg_flow_dir_local = torch.zeros((T, 2), dtype=torch.float32, device=device)
+            cg_flow_distance = torch.full((T,), -1.0, dtype=torch.float32, device=device)
+            cg_flow_duration = torch.full((T,), -1.0, dtype=torch.float32, device=device)
+            cg_flow_anchor_frame = torch.full((T,), -1, dtype=torch.long, device=device)
+            cg_flow_valid = torch.zeros(T, dtype=torch.int8, device=device)
+            if present_flow_keys:
+                flow_dir = np.asarray(data["dribble_cg_flow_dir_local"], dtype=np.float32)
+                flow_distance = np.asarray(data["dribble_cg_flow_distance"], dtype=np.float32).reshape(-1)
+                flow_duration = np.asarray(data["dribble_cg_flow_duration"], dtype=np.float32).reshape(-1)
+                flow_anchor = np.asarray(data["dribble_cg_flow_anchor_frame"], dtype=np.int64).reshape(-1)
+                flow_valid = np.asarray(data["dribble_cg_flow_valid"], dtype=np.int8).reshape(-1)
+                if flow_dir.shape != (T, 2):
+                    raise ValueError(
+                        f"{motion_file}: dribble_cg_flow_dir_local shape {flow_dir.shape} != {(T, 2)}"
+                    )
+                for key, value in (
+                    ("dribble_cg_flow_distance", flow_distance),
+                    ("dribble_cg_flow_duration", flow_duration),
+                    ("dribble_cg_flow_anchor_frame", flow_anchor),
+                    ("dribble_cg_flow_valid", flow_valid),
+                ):
+                    if value.shape[0] != T:
+                        raise ValueError(f"{motion_file}: {key} length {value.shape[0]} != {T}")
+
+                contact_np = cg_contact.detach().cpu().numpy() > 0
+                starts = np.flatnonzero(contact_np & np.concatenate(([True], ~contact_np[:-1])))
+                valid_mask = flow_valid > 0
+                if np.any(valid_mask):
+                    valid_norm = np.linalg.norm(flow_dir[valid_mask], axis=1)
+                    valid_numeric = (
+                        np.all(np.isfinite(flow_dir[valid_mask]))
+                        and np.all(np.isfinite(flow_distance[valid_mask]))
+                        and np.all(np.isfinite(flow_duration[valid_mask]))
+                        and np.all(flow_distance[valid_mask] > 0.0)
+                        and np.all(flow_duration[valid_mask] > 0.0)
+                        and np.all(flow_anchor[valid_mask] >= 0)
+                        and np.allclose(valid_norm, 1.0, atol=1.0e-3)
+                    )
+                    if not valid_numeric:
+                        raise ValueError(f"{motion_file}: invalid numeric values in dribble CG flow labels")
+                if starts.size == 0 and np.any(valid_mask):
+                    raise ValueError(f"{motion_file}: flow labels exist without CG contact anchors")
+                if starts.size > 1:
+                    for source_start, next_start in zip(starts[:-1], starts[1:]):
+                        segment = slice(int(source_start), int(next_start))
+                        if not np.all(valid_mask[segment]):
+                            raise ValueError(f"{motion_file}: incomplete flow segment at frame {source_start}")
+                        if not np.all(flow_anchor[segment] == source_start):
+                            raise ValueError(
+                                f"{motion_file}: flow anchor-frame ids disagree in segment {source_start}"
+                            )
+                if starts.size > 0 and np.any(valid_mask[: starts[0]]):
+                    raise ValueError(f"{motion_file}: flow labels must start at the first contact anchor")
+                if starts.size > 0 and np.any(valid_mask[starts[-1] :]):
+                    raise ValueError(f"{motion_file}: final contact must not have an outgoing flow segment")
+
+                cg_flow_dir_local[:] = torch.as_tensor(flow_dir, device=device, dtype=torch.float32)
+                cg_flow_distance[:] = torch.as_tensor(flow_distance, device=device, dtype=torch.float32)
+                cg_flow_duration[:] = torch.as_tensor(flow_duration, device=device, dtype=torch.float32)
+                cg_flow_anchor_frame[:] = torch.as_tensor(flow_anchor, device=device, dtype=torch.long)
+                cg_flow_valid[:] = torch.as_tensor(flow_valid, device=device, dtype=torch.int8)
+
             dribble_cg_contact_list.append(cg_contact)
             dribble_cg_foot_list.append(cg_foot)
             dribble_cg_surface_list.append(cg_surface)
             dribble_cg_foot_ball_dist_list.append(cg_foot_ball_dist)
             dribble_cg_dist_foot_list.append(cg_dist_foot)
+            dribble_cg_flow_dir_local_list.append(cg_flow_dir_local)
+            dribble_cg_flow_distance_list.append(cg_flow_distance)
+            dribble_cg_flow_duration_list.append(cg_flow_duration)
+            dribble_cg_flow_anchor_frame_list.append(cg_flow_anchor_frame)
+            dribble_cg_flow_valid_list.append(cg_flow_valid)
 
             max_T = max(max_T, jp.shape[0])
 
@@ -252,6 +336,17 @@ class MultiMotionLoader:
                 padded.append(pad_tensor)
             return torch.stack(padded, dim=0)
 
+        def pad_1d_long(tensor_list: list[torch.Tensor], pad_value: int) -> torch.Tensor:
+            padded = []
+            for t in tensor_list:
+                T = int(t.shape[0])
+                pad_size = max_T - T
+                pad_tensor = torch.cat(
+                    [t, torch.full((pad_size,), pad_value, device=self.device, dtype=torch.long)], dim=0
+                )
+                padded.append(pad_tensor)
+            return torch.stack(padded, dim=0)
+
         self.joint_pos = pad_tensor_list(joint_pos_list)
         self.joint_vel = pad_tensor_list(joint_vel_list)
         self._body_pos_w = pad_tensor_list(body_pos_w_list)
@@ -274,6 +369,11 @@ class MultiMotionLoader:
         self._dribble_cg_surface = pad_1d_int8(dribble_cg_surface_list, pad_value=-1)
         self._dribble_cg_foot_ball_dist = pad_1d_float(dribble_cg_foot_ball_dist_list, pad_value=-1.0)
         self._dribble_cg_dist_foot = pad_1d_int8(dribble_cg_dist_foot_list, pad_value=-1)
+        self._dribble_cg_flow_dir_local = pad_tensor_list(dribble_cg_flow_dir_local_list, pad_value=0.0)
+        self._dribble_cg_flow_distance = pad_1d_float(dribble_cg_flow_distance_list, pad_value=-1.0)
+        self._dribble_cg_flow_duration = pad_1d_float(dribble_cg_flow_duration_list, pad_value=-1.0)
+        self._dribble_cg_flow_anchor_frame = pad_1d_long(dribble_cg_flow_anchor_frame_list, pad_value=-1)
+        self._dribble_cg_flow_valid = pad_1d_int8(dribble_cg_flow_valid_list, pad_value=0)
         self.motion_has_ball_demo = torch.tensor(motion_has_ball_demo_list, dtype=torch.bool, device=self.device)
         self.motion_has_dribble_cg = torch.any(self._dribble_cg_contact > 0, dim=1)
         # The first labelled contact is the reset-ball source for local
@@ -286,6 +386,7 @@ class MultiMotionLoader:
             torch.full_like(first_contact, -1),
         )
         self.motion_has_dribble_cg_foot_ball_dist = torch.any(self._dribble_cg_foot_ball_dist >= 0.0, dim=1)
+        self.motion_has_dribble_cg_flow = torch.any(self._dribble_cg_flow_valid > 0, dim=1)
 
     @property
     def body_pos_w(self) -> torch.Tensor:
@@ -351,6 +452,31 @@ class MultiMotionLoader:
     def dribble_cg_dist_foot(self) -> torch.Tensor:
         """Per-frame foot id used for distance reference: -1 none, 0 left, 1 right."""
         return self._dribble_cg_dist_foot
+
+    @property
+    def dribble_cg_flow_dir_local(self) -> torch.Tensor:
+        """Outgoing unit XY direction in the source-touch pelvis-yaw frame."""
+        return self._dribble_cg_flow_dir_local
+
+    @property
+    def dribble_cg_flow_distance(self) -> torch.Tensor:
+        """Source-to-next-contact anchor distance in meters; ``-1`` if invalid."""
+        return self._dribble_cg_flow_distance
+
+    @property
+    def dribble_cg_flow_duration(self) -> torch.Tensor:
+        """Source-to-next-contact duration in seconds; ``-1`` if invalid."""
+        return self._dribble_cg_flow_duration
+
+    @property
+    def dribble_cg_flow_anchor_frame(self) -> torch.Tensor:
+        """Source contact frame held over each outgoing flow segment."""
+        return self._dribble_cg_flow_anchor_frame
+
+    @property
+    def dribble_cg_flow_valid(self) -> torch.Tensor:
+        """Whether each frame belongs to a non-final outgoing flow segment."""
+        return self._dribble_cg_flow_valid
 
     def get_last_frame_anchor_pos(self, motion_idx: int, anchor_body_idx: int, motion_length: int) -> torch.Tensor:
         """Get the anchor position at the last frame of the specified motion."""
@@ -696,7 +822,8 @@ class MotionCommand(CommandTerm):
         first_index, _, _, in_bridge = self._style_motion_frame_indices()
         result = values[self.motion_idx, first_index]
         neutral = torch.as_tensor(neutral_value, device=self.device, dtype=result.dtype)
-        return torch.where(in_bridge, neutral, result)
+        condition = in_bridge.reshape((in_bridge.shape[0],) + (1,) * (result.ndim - 1))
+        return torch.where(condition, neutral, result)
 
     @property
     def style_seam_bridge_mask(self) -> torch.Tensor:
@@ -1576,6 +1703,36 @@ class MotionCommand(CommandTerm):
     def motion_has_dribble_cg_foot_ball_dist_label(self) -> torch.Tensor:
         """Whether the motion clip has synthesized foot–ball distance labels."""
         return self.motion.motion_has_dribble_cg_foot_ball_dist[self.motion_idx]
+
+    @property
+    def dribble_cg_flow_dir_local_ref(self) -> torch.Tensor:
+        """Outgoing unit XY direction in the reference source-touch pelvis frame."""
+        return self._style_motion_labels(self.motion.dribble_cg_flow_dir_local, 0.0)
+
+    @property
+    def dribble_cg_flow_distance_ref(self) -> torch.Tensor:
+        """Current contact-to-contact target distance in meters."""
+        return self._style_motion_labels(self.motion.dribble_cg_flow_distance, -1.0)
+
+    @property
+    def dribble_cg_flow_duration_ref(self) -> torch.Tensor:
+        """Current contact-to-contact target duration in seconds."""
+        return self._style_motion_labels(self.motion.dribble_cg_flow_duration, -1.0)
+
+    @property
+    def dribble_cg_flow_anchor_frame_ref(self) -> torch.Tensor:
+        """Current segment's source contact frame, or ``-1`` when invalid."""
+        return self._style_motion_labels(self.motion.dribble_cg_flow_anchor_frame, -1).to(torch.int64)
+
+    @property
+    def dribble_cg_flow_valid_ref(self) -> torch.Tensor:
+        """Whether the current reference frame has an outgoing flow target."""
+        return self._style_motion_labels(self.motion.dribble_cg_flow_valid, 0).to(torch.bool)
+
+    @property
+    def motion_has_dribble_cg_flow_label(self) -> torch.Tensor:
+        """Whether the selected motion contains any contact-to-contact flow label."""
+        return self.motion.motion_has_dribble_cg_flow[self.motion_idx]
 
     @property
     def motion_has_dribble_cg_label(self) -> torch.Tensor:

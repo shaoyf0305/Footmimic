@@ -363,7 +363,7 @@ def get_motion_files(motion_path: str) -> list[str]:
 _BALL_SENSOR_NAME = "soccer_ball_contact"
 _CONTACT_FORCE_THRESHOLD = 1.0
 _LAST_TERM_REASON: str = "-"
-_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v5"
+_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v6"
 
 _ARM_DIAGNOSTIC_JOINT_NAMES = [
     "left_shoulder_pitch_joint",
@@ -919,6 +919,23 @@ def _create_diagnostic(
         "cg_reference_foot": [],
         "cg_reference_surface": [],
         "cg_contact_foot_match": [],
+        "cg_flow_label_available": [],
+        "cg_flow_valid": [],
+        "cg_flow_anchor_frame": [],
+        "cg_flow_direction_local": [],
+        "cg_flow_distance": [],
+        "cg_flow_duration": [],
+        "cg_flow_nominal_speed": [],
+        "cg_flow_latched": [],
+        "cg_flow_release_active": [],
+        "cg_flow_target_direction_world": [],
+        "cg_flow_parallel_speed": [],
+        "cg_flow_lateral_speed": [],
+        "cg_flow_release_reward": [],
+        "cg_flow_progress": [],
+        "cg_flow_progress_rate": [],
+        "cg_flow_lateral_offset": [],
+        "cg_flow_progress_reward": [],
         "ball_xy_speed": [],
         "ball_command_forward_speed": [],
         "pelvis_xy_speed": [],
@@ -1172,6 +1189,39 @@ def _append_diagnostic(
     diagnostic["cg_contact_foot_match"].append(
         bool(contact["has_contact"][0].item()) and has_cg_label and ref_contact and actual_foot == ref_foot
     )
+    flow_available = getattr(command, "motion_has_dribble_cg_flow_label", None)
+    flow_valid = getattr(command, "dribble_cg_flow_valid_ref", None)
+    flow_anchor = getattr(command, "dribble_cg_flow_anchor_frame_ref", None)
+    flow_direction = getattr(command, "dribble_cg_flow_dir_local_ref", None)
+    flow_distance = getattr(command, "dribble_cg_flow_distance_ref", None)
+    flow_duration = getattr(command, "dribble_cg_flow_duration_ref", None)
+    flow_available_0 = isinstance(flow_available, torch.Tensor) and bool(flow_available[0].item())
+    flow_valid_0 = isinstance(flow_valid, torch.Tensor) and bool(flow_valid[0].item())
+    flow_distance_0 = float(flow_distance[0].item()) if isinstance(flow_distance, torch.Tensor) else -1.0
+    flow_duration_0 = float(flow_duration[0].item()) if isinstance(flow_duration, torch.Tensor) else -1.0
+    diagnostic["cg_flow_label_available"].append(flow_available_0)
+    diagnostic["cg_flow_valid"].append(flow_valid_0)
+    diagnostic["cg_flow_anchor_frame"].append(
+        int(flow_anchor[0].item()) if isinstance(flow_anchor, torch.Tensor) else -1
+    )
+    diagnostic["cg_flow_direction_local"].append(
+        _cpu(flow_direction) if isinstance(flow_direction, torch.Tensor) else np.full(2, np.nan, dtype=np.float32)
+    )
+    diagnostic["cg_flow_distance"].append(flow_distance_0)
+    diagnostic["cg_flow_duration"].append(flow_duration_0)
+    diagnostic["cg_flow_nominal_speed"].append(
+        flow_distance_0 / flow_duration_0 if flow_valid_0 and flow_duration_0 > 0.0 else np.nan
+    )
+    diagnostic["cg_flow_latched"].append(False)
+    diagnostic["cg_flow_release_active"].append(False)
+    diagnostic["cg_flow_target_direction_world"].append(np.full(2, np.nan, dtype=np.float32))
+    diagnostic["cg_flow_parallel_speed"].append(np.nan)
+    diagnostic["cg_flow_lateral_speed"].append(np.nan)
+    diagnostic["cg_flow_release_reward"].append(np.nan)
+    diagnostic["cg_flow_progress"].append(np.nan)
+    diagnostic["cg_flow_progress_rate"].append(np.nan)
+    diagnostic["cg_flow_lateral_offset"].append(np.nan)
+    diagnostic["cg_flow_progress_reward"].append(np.nan)
     cg_gate_pass = not (contact_settings["cg_gated"] and has_cg_label) or ref_contact
     diagnostic["contact_cg_gate_pass"].append(cg_gate_pass)
     diagnostic["contact_cg_eligible"].append(
@@ -1434,6 +1484,39 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env, dones: torch.T
         else torch.full_like(effort_utilization, torch.nan)
     )
     diagnostic["trunk_effort_saturated"].append(_trunk_cpu(effort_saturated))
+
+
+def _complete_cg_flow_diagnostic(diagnostic: dict, env) -> None:
+    """Attach flow-reward telemetry produced by the just-completed transition."""
+    base_env = _resolve_base_env(env)
+    telemetry = getattr(base_env, "_dribbling_cg_flow_telemetry", None)
+    if not isinstance(telemetry, dict):
+        return
+
+    def _scalar(name: str) -> float:
+        value = telemetry.get(name)
+        if not isinstance(value, torch.Tensor) or value.numel() == 0:
+            return np.nan
+        return float(value[0].item())
+
+    def _boolean(name: str) -> bool:
+        value = telemetry.get(name)
+        return isinstance(value, torch.Tensor) and value.numel() > 0 and bool(value[0].item())
+
+    direction = telemetry.get("target_direction_world")
+    diagnostic["cg_flow_latched"][-1] = _boolean("latched")
+    diagnostic["cg_flow_release_active"][-1] = _boolean("release_active")
+    if isinstance(direction, torch.Tensor) and direction.numel() >= 2:
+        diagnostic["cg_flow_target_direction_world"][-1] = (
+            direction[0].detach().cpu().numpy().copy()
+        )
+    diagnostic["cg_flow_parallel_speed"][-1] = _scalar("parallel_speed")
+    diagnostic["cg_flow_lateral_speed"][-1] = _scalar("lateral_speed")
+    diagnostic["cg_flow_release_reward"][-1] = _scalar("release_reward")
+    diagnostic["cg_flow_progress"][-1] = _scalar("progress")
+    diagnostic["cg_flow_progress_rate"][-1] = _scalar("progress_rate")
+    diagnostic["cg_flow_lateral_offset"][-1] = _scalar("lateral_offset")
+    diagnostic["cg_flow_progress_reward"][-1] = _scalar("progress_reward")
 
 
 def _save_diagnostic(diagnostic: dict) -> None:
@@ -2311,6 +2394,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obs, reward, dones, _ = env.step(actions)
             if recorded_diagnostic_sample:
                 _append_upper_body_manifold_diagnostic(diagnostic, env, dones)
+                _complete_cg_flow_diagnostic(diagnostic, env)
                 diagnostic["step_reward"][-1] = float(reward[0].item())
                 diagnostic["done"].append(bool(dones[0].item()))
                 diagnostic["reward_terms"].append(_reward_term_values(base_env))

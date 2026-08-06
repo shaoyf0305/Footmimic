@@ -478,7 +478,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
 
 @configclass
 class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
-    """Dribbling with annotated contact graph + stitched demo ``ball_pos_w``.
+    """Dribbling with annotated contacts and causal contact-to-contact ball flow.
 
     Uses :class:`~soccer.tasks.tracking.mdp.commands_dribble_cg.DribbleCGMotionCommand`
     to optionally drive the sim ball along the demo trajectory (anchor-relative),
@@ -532,16 +532,35 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
             ],
         )
 
-        # Continuous CG: demo foot–ball distance (from synthesized ball_pos_w).
+        # Event-based CG flow: a correct touch latches its outgoing direction
+        # once, then earns a short velocity-band reward and capped progress.
         # Run scripts/dribble/synthesize_dribble_ball_traj.py on labeled motions first.
-        self.rewards.dribbling_cg_foot_ball_distance = RewTerm(
-            func=mdp.dribbling_cg_foot_ball_distance_exp,
-            weight=3.5,
-            params={
-                "command_name": "motion",
-                "std": 0.22,
-                "use_xy_only": True,
-            },
+        cg_flow_params = {
+            "command_name": "motion",
+            "ball_sensor_name": "soccer_ball_contact",
+            "all_body_cfg": cg_body_cfg,
+            "num_ankle_links": 2,
+            "contact_surface": surface,
+            "medial_y_min": 0.018,
+            "contact_force_threshold": 1.0,
+            "max_touch_force": 20.0,
+            "release_window_steps": 8,
+            "speed_lower_ratio": 0.7,
+            "speed_upper_ratio": 1.6,
+            "lateral_speed_std": 0.35,
+            "overspeed_std": 0.5,
+            "lateral_corridor_std": 0.18,
+            "max_progress_rate": 6.0,
+        }
+        self.rewards.dribbling_cg_flow_release = RewTerm(
+            func=mdp.dribbling_cg_flow_release_reward,
+            weight=2.0,
+            params=dict(cg_flow_params),
+        )
+        self.rewards.dribbling_cg_flow_progress = RewTerm(
+            func=mdp.dribbling_cg_flow_progress_reward,
+            weight=0.5,
+            params=dict(cg_flow_params),
         )
         self.rewards.dribbling_cg_contact_consistency = RewTerm(
             func=mdp.dribbling_cg_contact_consistency,
@@ -959,8 +978,9 @@ def _apply_dribbling_full_control_velocity_terms(
         cfg.rewards.dribbling_gait_foot_tracking.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
     if hasattr(cfg.rewards, "dribbling_stall_no_touch_penalty"):
         cfg.rewards.dribbling_stall_no_touch_penalty.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
-    if hasattr(cfg.rewards, "dribbling_cg_foot_ball_distance"):
-        cfg.rewards.dribbling_cg_foot_ball_distance.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
+    for reward_name in ("dribbling_cg_flow_release", "dribbling_cg_flow_progress"):
+        if hasattr(cfg.rewards, reward_name):
+            getattr(cfg.rewards, reward_name).params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
     if hasattr(cfg.rewards, "dribbling_cg_contact_consistency"):
         cfg.rewards.dribbling_cg_contact_consistency.params["active_task_states"] = (mdp.TASK_STATE_DRIBBLE,)
     if hasattr(cfg.rewards, "dribbling_cg_foot_consistency"):
@@ -1043,7 +1063,8 @@ def _apply_dribbling_full_control_velocity_terms(
         "dribbling_micro_contact_filter",
         "dribbling_undesired_contact_penalty",
         "dribbling_phase_graph_alignment",
-        "dribbling_cg_foot_ball_distance",
+        "dribbling_cg_flow_release",
+        "dribbling_cg_flow_progress",
         "dribbling_cg_contact_consistency",
         "dribbling_cg_premature_contact",
         "dribbling_cg_foot_consistency",
@@ -1388,7 +1409,8 @@ def _require_reference_instep_side(cfg) -> None:
 def _disable_reference_ball_contact_terms(cfg) -> None:
     """Remove reference-timed ball and contact-position objectives for S3."""
     for reward_name in (
-        "dribbling_cg_foot_ball_distance",
+        "dribbling_cg_flow_release",
+        "dribbling_cg_flow_progress",
         "dribbling_cg_contact_consistency",
         "dribbling_cg_premature_contact",
         "dribbling_cg_foot_consistency",
@@ -1633,6 +1655,7 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
         setattr(self.commands.motion, "dribble_cg_ball_spawn_mode", "reference_first_contact")
         setattr(self.commands.motion, "dribble_cg_require_surface_labels", True)
+        setattr(self.commands.motion, "dribble_cg_require_flow_labels", True)
 
 
 @configclass
@@ -1729,8 +1752,10 @@ class G1FlatCGDribblingUnifiedS2ReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         _require_reference_instep_side(self)
 
         setattr(self.commands.motion, "dribble_cg_use_task_frame", False)
-        setattr(self.commands.motion, "dribble_cg_snap_mode", "non_contact_only")
+        setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
+        setattr(self.commands.motion, "dribble_cg_ball_spawn_mode", "reference_first_contact")
         setattr(self.commands.motion, "dribble_cg_require_surface_labels", True)
+        setattr(self.commands.motion, "dribble_cg_require_flow_labels", True)
         self.commands.motion.mimic_align_locomotion_heading = False
 
 

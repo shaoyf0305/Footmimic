@@ -15,7 +15,8 @@ Contact / foot / surface masks come from ``dribble_cg_contact``,
 ``dribble_cg_foot``, and ``dribble_cg_surface`` in ``.npz``.  The legacy
 ``kick_frame`` / ``kick_end_frame`` / ``kick_leg`` metadata remains a fallback
 for contact timing and foot side, but cannot describe an instep surface (see
-:class:`MultiMotionLoader`).
+:class:`MultiMotionLoader`). ``dribble_cg_flow_*`` stores the outgoing
+contact-to-contact direction, distance, and duration used by Stage 2.
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ class DribbleCGMotionCommand(MotionCommand):
         configured_foot = getattr(self.cfg, "dribble_cg_fixed_touch_foot", None)
         configured_surface = getattr(self.cfg, "dribble_cg_fixed_touch_surface", None)
         require_surface_labels = bool(getattr(self.cfg, "dribble_cg_require_surface_labels", False))
+        require_flow_labels = bool(getattr(self.cfg, "dribble_cg_require_flow_labels", False))
 
         foot_to_id = {"left": 0, "right": 1}
         surface_to_id = {"inside_instep": 0, "outside_instep": 1}
@@ -92,7 +94,7 @@ class DribbleCGMotionCommand(MotionCommand):
                 f"got {configured_surface!r}."
             )
 
-        if foot_name is None and surface_name is None and not require_surface_labels:
+        if foot_name is None and surface_name is None and not require_surface_labels and not require_flow_labels:
             return
 
         expected_foot_id = foot_to_id[foot_name] if foot_name is not None else None
@@ -104,6 +106,11 @@ class DribbleCGMotionCommand(MotionCommand):
             contact_surface = self.motion.dribble_cg_surface[motion_idx]
             distance_foot = self.motion.dribble_cg_dist_foot[motion_idx]
             kick_leg_id = int(self.motion_kick_leg[motion_idx].item())
+            if require_flow_labels:
+                if not bool(self.motion.motion_has_dribble_cg[motion_idx]):
+                    violations.append(f"{motion_name}: missing CG contact labels")
+                elif not bool(self.motion.motion_has_dribble_cg_flow[motion_idx]):
+                    violations.append(f"{motion_name}: missing contact-to-contact flow labels")
             if expected_foot_id is not None:
                 unknown_contact_foot = contact & (contact_foot < 0)
                 wrong_contact_foot = contact & (contact_foot >= 0) & (contact_foot != expected_foot_id)
@@ -134,7 +141,7 @@ class DribbleCGMotionCommand(MotionCommand):
         if violations:
             configured = " ".join(part for part in (foot_name, surface_name) if part is not None)
             task_description = (
-                f"Fixed {configured} CG task" if configured else "Surface-labelled CG task"
+                f"Fixed {configured} CG task" if configured else "Labelled CG task"
             )
             raise ValueError(
                 f"{task_description} received incompatible motions: " + "; ".join(violations)
@@ -367,3 +374,6 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     # S2 uses per-frame inside/outside supervision. Fail early instead of
     # silently treating a legacy foot-only motion as a surface-labelled one.
     dribble_cg_require_surface_labels: bool = False
+    # S2 also requires causal contact-to-contact flow labels. The final contact
+    # is intentionally unlabeled because it has no known outgoing destination.
+    dribble_cg_require_flow_labels: bool = False

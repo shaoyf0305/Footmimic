@@ -1635,6 +1635,354 @@ def dribbling_cg_foot_consistency(
     return match.to(torch.float32)
 
 
+def _dribbling_cg_flow_metrics(
+    env: ManagerBasedRLEnv,
+    *,
+    command_name: str,
+    ball_sensor_name: str,
+    all_body_cfg: SceneEntityCfg | None,
+    num_ankle_links: int,
+    contact_surface: str,
+    medial_y_min: float,
+    contact_force_threshold: float,
+    max_touch_force: float,
+    release_window_steps: int,
+    speed_lower_ratio: float,
+    speed_upper_ratio: float,
+    lateral_speed_std: float,
+    overspeed_std: float,
+    lateral_corridor_std: float,
+    max_progress_rate: float,
+    active_task_states: tuple[int, ...] | None,
+) -> dict[str, torch.Tensor]:
+    """Update and return the shared causal contact-flow reward state once per step."""
+    if release_window_steps <= 0:
+        raise ValueError("release_window_steps must be positive.")
+    if not 0.0 < speed_lower_ratio <= speed_upper_ratio:
+        raise ValueError("Expected 0 < speed_lower_ratio <= speed_upper_ratio.")
+
+    step_counter = int(getattr(env, "common_step_counter", -1))
+    episode_step = getattr(env, "episode_length_buf", None)
+    if episode_step is None:
+        episode_step = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    signature = (
+        command_name,
+        ball_sensor_name,
+        tuple(all_body_cfg.body_names) if all_body_cfg is not None else (),
+        num_ankle_links,
+        contact_surface,
+        medial_y_min,
+        contact_force_threshold,
+        max_touch_force,
+        release_window_steps,
+        speed_lower_ratio,
+        speed_upper_ratio,
+        lateral_speed_std,
+        overspeed_std,
+        lateral_corridor_std,
+        max_progress_rate,
+        active_task_states,
+    )
+    cache = getattr(env, "_dribbling_cg_flow_cache", None)
+    if isinstance(cache, dict) and cache.get("signature") == signature:
+        same_step = step_counter >= 0 and cache.get("step_counter") == step_counter
+        if step_counter < 0:
+            cached_episode_step = cache.get("episode_step")
+            same_step = isinstance(cached_episode_step, torch.Tensor) and torch.equal(
+                cached_episode_step, episode_step
+            )
+        if same_step:
+            return cache["metrics"]
+
+    device = env.device
+    zeros = torch.zeros(env.num_envs, device=device, dtype=torch.float32)
+    false = torch.zeros(env.num_envs, device=device, dtype=torch.bool)
+    minus_one = torch.full((env.num_envs,), -1, device=device, dtype=torch.long)
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+
+    has_flow = getattr(command, "motion_has_dribble_cg_flow_label", false)
+    if not isinstance(has_flow, torch.Tensor):
+        has_flow = false
+    label_valid = getattr(command, "dribble_cg_flow_valid_ref", false)
+    if not isinstance(label_valid, torch.Tensor):
+        label_valid = false
+    task_active = locomotion_task_state_mask(command, active_task_states)
+    flow_state_enabled = _dribbling_effective_cg_label_mask(command, has_flow) & task_active
+    label_valid = _dribbling_effective_cg_label_mask(command, has_flow & label_valid) & task_active
+    flow_dir_local = getattr(command, "dribble_cg_flow_dir_local_ref", None)
+    flow_distance = getattr(command, "dribble_cg_flow_distance_ref", None)
+    flow_duration = getattr(command, "dribble_cg_flow_duration_ref", None)
+    flow_anchor = getattr(command, "dribble_cg_flow_anchor_frame_ref", None)
+    if not isinstance(flow_dir_local, torch.Tensor):
+        flow_dir_local = torch.zeros(env.num_envs, 2, device=device)
+    if not isinstance(flow_distance, torch.Tensor):
+        flow_distance = torch.full_like(zeros, -1.0)
+    if not isinstance(flow_duration, torch.Tensor):
+        flow_duration = torch.full_like(zeros, -1.0)
+    if not isinstance(flow_anchor, torch.Tensor):
+        flow_anchor = minus_one
+
+    state = getattr(env, "_dribbling_cg_flow_state", None)
+    if not isinstance(state, dict) or state.get("num_envs") != env.num_envs:
+        state = {
+            "num_envs": env.num_envs,
+            "active": false.clone(),
+            "anchor_frame": minus_one.clone(),
+            "target_direction_world": torch.zeros(env.num_envs, 2, device=device),
+            "touch_ball_position": torch.zeros(env.num_envs, 2, device=device),
+            "target_distance": zeros.clone(),
+            "target_duration": zeros.clone(),
+            "age_steps": torch.zeros(env.num_envs, device=device, dtype=torch.long),
+            "best_progress": zeros.clone(),
+            "previous_contact": false.clone(),
+        }
+
+    reset = episode_step == 0
+    state["active"] = state["active"] & ~reset
+    state["anchor_frame"] = torch.where(reset, minus_one, state["anchor_frame"])
+    state["age_steps"] = torch.where(reset, torch.zeros_like(state["age_steps"]), state["age_steps"])
+    state["best_progress"] = torch.where(reset, zeros, state["best_progress"])
+    state["previous_contact"] = state["previous_contact"] & ~reset
+
+    if all_body_cfg is None:
+        has_contact = false
+        force_mag = zeros
+        closest = torch.zeros(env.num_envs, device=device, dtype=torch.long)
+        surface_match = false
+        actual_foot = minus_one
+    else:
+        has_contact, force_mag, closest = _identify_contact_body(
+            env, command, ball_sensor_name, all_body_cfg
+        )
+        has_contact = has_contact & (force_mag >= contact_force_threshold)
+        surface_match = _dribbling_contact_surface_match(
+            env,
+            all_body_cfg,
+            closest,
+            command_name=command_name,
+            contact_surface=contact_surface,
+            num_ankle_links=num_ankle_links,
+            medial_y_min=medial_y_min,
+            cg_surface_gated=True,
+        )
+        actual_foot = minus_one.clone()
+        for body_idx, body_name in enumerate(all_body_cfg.body_names):
+            if body_idx >= num_ankle_links:
+                break
+            if "left_ankle" in body_name:
+                actual_foot[closest == body_idx] = 0
+            elif "right_ankle" in body_name:
+                actual_foot[closest == body_idx] = 1
+
+    new_contact = has_contact & ~state["previous_contact"]
+    state["previous_contact"] = has_contact.detach().clone()
+    ref_contact = getattr(command, "dribble_cg_contact_ref", false)
+    ref_foot = getattr(command, "dribble_cg_foot_ref", minus_one)
+    direction_norm = torch.norm(flow_dir_local, dim=-1)
+    label_ready = (
+        label_valid
+        & ref_contact
+        & (flow_anchor >= 0)
+        & (flow_distance > 1.0e-4)
+        & (flow_duration > 1.0e-4)
+        & (direction_norm > 1.0e-4)
+    )
+    correct_arrival_touch = (
+        new_contact
+        & (actual_foot == ref_foot)
+        & surface_match
+        & (force_mag <= max_touch_force)
+        & ref_contact
+    )
+    correct_new_touch = (
+        correct_arrival_touch
+        & label_ready
+        & (flow_anchor != state["anchor_frame"])
+    )
+
+    direction_local_unit = flow_dir_local / direction_norm.unsqueeze(-1).clamp(min=1.0e-6)
+    direction_local_3d = torch.cat(
+        (direction_local_unit, torch.zeros(env.num_envs, 1, device=device)), dim=-1
+    )
+    direction_world = quat_apply(yaw_quat(command.robot_pelvis_quat_w), direction_local_3d)[:, :2]
+    direction_world = direction_world / torch.norm(direction_world, dim=-1, keepdim=True).clamp(min=1.0e-6)
+    ball_position = soccer_ball.data.root_pos_w[:, :2]
+
+    latch_2d = correct_new_touch.unsqueeze(-1)
+    # A correct touch is the arrival condition for the previous segment. A
+    # non-final anchor immediately latches the next outgoing segment; the final
+    # anchor only clears the previous one because it has no flow label.
+    state["active"] = torch.where(correct_arrival_touch, torch.zeros_like(state["active"]), state["active"])
+    state["target_direction_world"] = torch.where(
+        latch_2d, direction_world, state["target_direction_world"]
+    )
+    state["touch_ball_position"] = torch.where(
+        latch_2d, ball_position, state["touch_ball_position"]
+    )
+    state["target_distance"] = torch.where(correct_new_touch, flow_distance, state["target_distance"])
+    state["target_duration"] = torch.where(correct_new_touch, flow_duration, state["target_duration"])
+    state["anchor_frame"] = torch.where(correct_new_touch, flow_anchor, state["anchor_frame"])
+    state["age_steps"] = torch.where(correct_new_touch, torch.zeros_like(state["age_steps"]), state["age_steps"])
+    state["best_progress"] = torch.where(correct_new_touch, zeros, state["best_progress"])
+    state["active"] = torch.where(correct_new_touch, torch.ones_like(state["active"]), state["active"])
+
+    segment_active = state["active"] & flow_state_enabled
+    state["active"] = segment_active
+    target_direction = state["target_direction_world"]
+    lateral_axis = torch.stack((-target_direction[:, 1], target_direction[:, 0]), dim=-1)
+    ball_velocity = soccer_ball.data.root_lin_vel_w[:, :2]
+    parallel_speed = torch.sum(ball_velocity * target_direction, dim=-1)
+    lateral_speed = torch.abs(torch.sum(ball_velocity * lateral_axis, dim=-1))
+    nominal_speed = state["target_distance"] / state["target_duration"].clamp(min=1.0e-4)
+
+    lower_speed = speed_lower_ratio * nominal_speed
+    upper_speed = speed_upper_ratio * nominal_speed
+    underspeed_score = torch.clamp(parallel_speed / lower_speed.clamp(min=1.0e-4), min=0.0, max=1.0)
+    overspeed_score = torch.where(
+        parallel_speed <= upper_speed,
+        torch.ones_like(parallel_speed),
+        torch.exp(-torch.square((parallel_speed - upper_speed) / max(overspeed_std, 1.0e-6))),
+    )
+    direction_score = torch.exp(-torch.square(lateral_speed / max(lateral_speed_std, 1.0e-6)))
+    release_active = segment_active & (state["age_steps"] < int(release_window_steps))
+    release_reward = underspeed_score * overspeed_score * direction_score * release_active.to(torch.float32)
+
+    displacement = ball_position - state["touch_ball_position"]
+    longitudinal = torch.sum(displacement * target_direction, dim=-1)
+    lateral_offset = torch.abs(torch.sum(displacement * lateral_axis, dim=-1))
+    raw_progress = torch.clamp(
+        longitudinal / state["target_distance"].clamp(min=1.0e-4), min=0.0, max=1.0
+    )
+    next_best_progress = torch.where(
+        segment_active, torch.maximum(state["best_progress"], raw_progress), state["best_progress"]
+    )
+    progress_delta = torch.clamp(next_best_progress - state["best_progress"], min=0.0)
+    state["best_progress"] = next_best_progress
+    step_dt = max(float(getattr(env, "step_dt", 0.02)), 1.0e-6)
+    progress_rate = torch.clamp(progress_delta / step_dt, max=max_progress_rate)
+    corridor_score = torch.exp(-torch.square(lateral_offset / max(lateral_corridor_std, 1.0e-6)))
+    progress_reward = progress_rate * corridor_score * segment_active.to(torch.float32)
+    state["age_steps"] = torch.where(
+        segment_active, state["age_steps"] + 1, state["age_steps"]
+    )
+    setattr(env, "_dribbling_cg_flow_state", state)
+
+    metrics = {
+        "label_available": has_flow.to(torch.bool),
+        "label_valid": label_valid,
+        "label_anchor_frame": flow_anchor,
+        "label_direction_local": flow_dir_local,
+        "label_distance": flow_distance,
+        "label_duration": flow_duration,
+        "latched": state["active"],
+        "release_active": release_active,
+        "target_direction_world": target_direction,
+        "nominal_speed": nominal_speed,
+        "parallel_speed": parallel_speed,
+        "lateral_speed": lateral_speed,
+        "release_reward": release_reward,
+        "progress": state["best_progress"],
+        "progress_rate": progress_rate,
+        "lateral_offset": lateral_offset,
+        "progress_reward": progress_reward,
+    }
+    setattr(env, "_dribbling_cg_flow_telemetry", metrics)
+    setattr(
+        env,
+        "_dribbling_cg_flow_cache",
+        {
+            "signature": signature,
+            "step_counter": step_counter,
+            "episode_step": episode_step.detach().clone(),
+            "metrics": metrics,
+        },
+    )
+    return metrics
+
+
+def dribbling_cg_flow_release_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    all_body_cfg: SceneEntityCfg | None = None,
+    num_ankle_links: int = 2,
+    contact_surface: str = "instep",
+    medial_y_min: float = 0.018,
+    contact_force_threshold: float = 1.0,
+    max_touch_force: float = 20.0,
+    release_window_steps: int = 8,
+    speed_lower_ratio: float = 0.7,
+    speed_upper_ratio: float = 1.6,
+    lateral_speed_std: float = 0.35,
+    overspeed_std: float = 0.5,
+    lateral_corridor_std: float = 0.18,
+    max_progress_rate: float = 6.0,
+    active_task_states: tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    """Reward outgoing ball direction and a broad speed band after a correct touch."""
+    return _dribbling_cg_flow_metrics(
+        env,
+        command_name=command_name,
+        ball_sensor_name=ball_sensor_name,
+        all_body_cfg=all_body_cfg,
+        num_ankle_links=num_ankle_links,
+        contact_surface=contact_surface,
+        medial_y_min=medial_y_min,
+        contact_force_threshold=contact_force_threshold,
+        max_touch_force=max_touch_force,
+        release_window_steps=release_window_steps,
+        speed_lower_ratio=speed_lower_ratio,
+        speed_upper_ratio=speed_upper_ratio,
+        lateral_speed_std=lateral_speed_std,
+        overspeed_std=overspeed_std,
+        lateral_corridor_std=lateral_corridor_std,
+        max_progress_rate=max_progress_rate,
+        active_task_states=active_task_states,
+    )["release_reward"]
+
+
+def dribbling_cg_flow_progress_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    all_body_cfg: SceneEntityCfg | None = None,
+    num_ankle_links: int = 2,
+    contact_surface: str = "instep",
+    medial_y_min: float = 0.018,
+    contact_force_threshold: float = 1.0,
+    max_touch_force: float = 20.0,
+    release_window_steps: int = 8,
+    speed_lower_ratio: float = 0.7,
+    speed_upper_ratio: float = 1.6,
+    lateral_speed_std: float = 0.35,
+    overspeed_std: float = 0.5,
+    lateral_corridor_std: float = 0.18,
+    max_progress_rate: float = 6.0,
+    active_task_states: tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    """Reward one-way progress toward the next contact without tracking a full path."""
+    return _dribbling_cg_flow_metrics(
+        env,
+        command_name=command_name,
+        ball_sensor_name=ball_sensor_name,
+        all_body_cfg=all_body_cfg,
+        num_ankle_links=num_ankle_links,
+        contact_surface=contact_surface,
+        medial_y_min=medial_y_min,
+        contact_force_threshold=contact_force_threshold,
+        max_touch_force=max_touch_force,
+        release_window_steps=release_window_steps,
+        speed_lower_ratio=speed_lower_ratio,
+        speed_upper_ratio=speed_upper_ratio,
+        lateral_speed_std=lateral_speed_std,
+        overspeed_std=overspeed_std,
+        lateral_corridor_std=lateral_corridor_std,
+        max_progress_rate=max_progress_rate,
+        active_task_states=active_task_states,
+    )["progress_reward"]
+
+
 def dribbling_cg_foot_ball_distance_exp(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
