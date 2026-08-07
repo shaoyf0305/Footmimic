@@ -170,6 +170,15 @@ parser.add_argument(
     help="Record every N simulator steps with --diagnostic (default: 1).",
 )
 parser.add_argument(
+    "--show_s2_contact_regions",
+    action="store_true",
+    default=False,
+    help=(
+        "Show the active S2 reference-foot frame and the inner/outer boundaries "
+        "of its expected left/right ball region."
+    ),
+)
+parser.add_argument(
     "--upper_body_reference_margin",
     type=float,
     default=None,
@@ -235,7 +244,7 @@ import json
 import pathlib
 import numpy as np
 import torch
-from isaaclab.utils.math import quat_apply, quat_inv, yaw_quat
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_inv, yaw_quat
 
 from soccer.tasks.tracking.mdp.rewards_dribbling import (
     dribbling_contact_telemetry,
@@ -523,6 +532,8 @@ def _diagnostic_reward_params(base_env, reward_name: str) -> dict:
 def _diagnostic_contact_settings(base_env) -> dict:
     """Resolve the exact legal-touch geometry configured for this task."""
     params = _diagnostic_reward_params(base_env, "dribbling_legal_foot_touch")
+    if not params:
+        params = _diagnostic_reward_params(base_env, "s2_new_touch")
     all_body_cfg = params.get("all_body_cfg")
     return {
         "command_name": str(params.get("command_name", "motion")),
@@ -531,7 +542,9 @@ def _diagnostic_contact_settings(base_env) -> dict:
         "num_ankle_links": int(params.get("num_ankle_links", 2)),
         "contact_surface": str(params.get("contact_surface", "any")),
         "medial_y_min": float(params.get("medial_y_min", 0.018)),
-        "contact_force_threshold": float(params.get("force_threshold", 14.0)),
+        "contact_force_threshold": float(
+            params.get("force_threshold", params.get("max_touch_force", 14.0))
+        ),
         "cg_gated": bool(params.get("cg_gated", False)),
         "cg_surface_gated": bool(params.get("cg_surface_gated", False)),
         "body_names": tuple(getattr(all_body_cfg, "body_names", ()) or ()),
@@ -919,6 +932,15 @@ def _create_diagnostic(
         "cg_reference_foot": [],
         "cg_reference_surface": [],
         "cg_contact_foot_match": [],
+        "s2_contact_window": [],
+        "s2_contact_event_id": [],
+        "s2_contact_event_frame": [],
+        "s2_expected_foot": [],
+        "s2_expected_side": [],
+        "s2_reference_foot_pos_w": [],
+        "s2_reference_foot_yaw": [],
+        "s2_ball_offset_reference_foot": [],
+        "s2_target_region_distance": [],
         "cg_flow_label_available": [],
         "cg_flow_valid": [],
         "cg_flow_anchor_frame": [],
@@ -1189,6 +1211,46 @@ def _append_diagnostic(
     diagnostic["cg_contact_foot_match"].append(
         bool(contact["has_contact"][0].item()) and has_cg_label and ref_contact and actual_foot == ref_foot
     )
+    s2_event_id = getattr(command, "s2_contact_event_id_ref", None)
+    s2_event_frame = getattr(command, "s2_contact_event_frame_ref", None)
+    s2_expected_foot = getattr(command, "s2_contact_event_foot_ref", None)
+    s2_expected_side = getattr(command, "s2_contact_event_side_ref", None)
+    s2_window = getattr(command, "s2_contact_window_ref", None)
+    if isinstance(s2_event_id, torch.Tensor) and hasattr(command, "s2_contact_reference_foot_pose_w"):
+        reference_foot_pos, reference_foot_yaw = command.s2_contact_reference_foot_pose_w()
+        ball_offset_reference_foot = quat_apply_inverse(
+            reference_foot_yaw,
+            soccer_ball.data.root_pos_w[:, :3] - reference_foot_pos,
+        )
+        side_deadzone = 0.04
+        side_max = 0.16
+        forward = ball_offset_reference_foot[:, 0]
+        lateral = ball_offset_reference_foot[:, 1]
+        forward_error = torch.relu(-0.06 - forward) + torch.relu(forward - 0.14)
+        left_error = torch.relu(side_deadzone - lateral) + torch.relu(lateral - side_max)
+        right_error = torch.relu(-side_max - lateral) + torch.relu(lateral + side_deadzone)
+        side_error = torch.where(s2_expected_side == 0, left_error, right_error)
+        region_distance = torch.sqrt(forward_error.square() + side_error.square())
+        diagnostic["s2_contact_window"].append(bool(s2_window[0].item()))
+        diagnostic["s2_contact_event_id"].append(int(s2_event_id[0].item()))
+        diagnostic["s2_contact_event_frame"].append(int(s2_event_frame[0].item()))
+        diagnostic["s2_expected_foot"].append(int(s2_expected_foot[0].item()))
+        diagnostic["s2_expected_side"].append(int(s2_expected_side[0].item()))
+        diagnostic["s2_reference_foot_pos_w"].append(_cpu(reference_foot_pos))
+        reference_yaw = _world_quat_to_rpy(reference_foot_yaw)[:, 2]
+        diagnostic["s2_reference_foot_yaw"].append(float(reference_yaw[0].item()))
+        diagnostic["s2_ball_offset_reference_foot"].append(_cpu(ball_offset_reference_foot))
+        diagnostic["s2_target_region_distance"].append(float(region_distance[0].item()))
+    else:
+        diagnostic["s2_contact_window"].append(False)
+        diagnostic["s2_contact_event_id"].append(-1)
+        diagnostic["s2_contact_event_frame"].append(-1)
+        diagnostic["s2_expected_foot"].append(-1)
+        diagnostic["s2_expected_side"].append(-1)
+        diagnostic["s2_reference_foot_pos_w"].append(np.full(3, np.nan, dtype=np.float32))
+        diagnostic["s2_reference_foot_yaw"].append(np.nan)
+        diagnostic["s2_ball_offset_reference_foot"].append(np.full(3, np.nan, dtype=np.float32))
+        diagnostic["s2_target_region_distance"].append(np.nan)
     flow_available = getattr(command, "motion_has_dribble_cg_flow_label", None)
     flow_valid = getattr(command, "dribble_cg_flow_valid_ref", None)
     flow_anchor = getattr(command, "dribble_cg_flow_anchor_frame_ref", None)
@@ -1629,6 +1691,12 @@ def _save_diagnostic(diagnostic: dict) -> None:
         if np.any(cg_expected_touch_mask)
         else np.nan
     )
+    s2_window_mask = arrays["s2_contact_window"].astype(bool)
+    s2_region_distance = (
+        _finite_mean(arrays["s2_target_region_distance"][s2_window_mask])
+        if np.any(s2_window_mask)
+        else np.nan
+    )
     torso_rel_tilt = float(
         np.mean(np.linalg.norm(arrays["torso_minus_pelvis_rpy"][:, :2], axis=1))
     )
@@ -1725,6 +1793,13 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"waist_limit_margin_p05={limit_margin_p05:.3f} rad  "
         f"latent_clip={latent_clip:.3f}  terminations={terminations} ({reason_summary})"
     )
+    if np.any(s2_window_mask):
+        print(
+            "[INFO] S2 contact labels: "
+            f"window_samples={int(np.count_nonzero(s2_window_mask))}  "
+            f"mean_target_region_distance={s2_region_distance:.3f} m  "
+            "side_ids=(left=0, right=1, dead/unknown=-1)"
+        )
 
 
 def _load_local_twist_command_plan(plan_path: str) -> tuple[list[tuple[float, float, float, float]], bool, bool]:
@@ -2120,6 +2195,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     """Play with RSL-RL agent."""
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    if args_cli.show_s2_contact_regions and hasattr(env_cfg.commands, "motion"):
+        env_cfg.commands.motion.debug_vis = True
+        setattr(env_cfg.commands.motion, "dribble_cg_s2_debug_regions_only", True)
 
     env_cfg.viewer.origin_type = None
     env_cfg.viewer.asset_name = None

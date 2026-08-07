@@ -117,6 +117,46 @@ _register(
     "G1DribblingRecurrentPPORunnerCfg",
 )
 _register(
+    "Tracking-CG-G1-Dribbling-RNN-unified-s2-two-contact",
+    soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2TwoContactEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
+    "Tracking-CG-G1-Dribbling-RNN-unified-s2-four-contact",
+    soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2FourContactEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
+    "Tracking-CG-G1-Dribbling-RNN-unified-s2-eight-contact",
+    soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2EightContactEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
+    "Tracking-CG-G1-Dribbling-RNN-unified-s2-full-contact",
+    soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2FullContactEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
+    "Tracking-CG-G1-Dribbling-RNN-unified-s2-ablation-motion",
+    soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2AblationMotionEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
+    "Tracking-CG-G1-Dribbling-RNN-unified-s2-ablation-time",
+    soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2AblationTimeEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
+    "Tracking-CG-G1-Dribbling-RNN-unified-s2-ablation-foot",
+    soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2AblationFootEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
+    "Tracking-CG-G1-Dribbling-RNN-unified-s2-ablation-side",
+    soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2AblationSideEnvCfg,
+    "G1DribblingRecurrentPPORunnerCfg",
+)
+_register(
     "Tracking-CG-G1-Dribbling-RNN-unified-s3-local-task",
     soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS3LocalTaskEnvCfg,
     "G1DribblingRecurrentPPORunnerCfg",

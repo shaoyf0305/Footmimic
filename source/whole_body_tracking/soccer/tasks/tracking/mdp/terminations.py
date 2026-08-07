@@ -13,6 +13,7 @@ from isaaclab.managers import SceneEntityCfg
 
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand, locomotion_task_state_mask
 from soccer.tasks.tracking.mdp.rewards_dribbling import (
+    dribbling_s2_contact_event_state,
     dribbling_stop_settle_state,
     soccer_ball_contact_force_magnitude,
 )
@@ -110,17 +111,18 @@ def ball_lost_dribbling(
     max_distance: float = 1.0,
     max_vel_divergence: float = 2.0,
     grace_steps: int = 50,
+    max_consecutive_steps: int = 1,
     active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Terminate the episode if the ball is lost during dribbling.
 
     The ball is considered "lost" when EITHER:
     - The XY distance between ball and pelvis exceeds ``max_distance`` (m), OR
-    - The XY velocity difference between ball and pelvis exceeds
-      ``max_vel_divergence`` (m/s).
+    - The XY velocity difference exceeds a positive ``max_vel_divergence``.
 
-    A ``grace_steps`` warm-up period is provided at the start of each episode
-    so the robot has time to approach the ball before termination kicks in.
+    The condition must persist for ``max_consecutive_steps``.  Setting
+    ``max_vel_divergence <= 0`` disables the velocity branch, which is the S2
+    behavior; legacy callers retain their old defaults.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     active_task_state = locomotion_task_state_mask(command, active_task_states)
@@ -140,9 +142,59 @@ def ball_lost_dribbling(
     step_buf = getattr(env, "episode_length_buf", torch.zeros(env.num_envs, device=env.device))
     past_grace = step_buf > grace_steps
 
-    lost = active_task_state & past_grace & ((dist_xy > max_distance) | (vel_diff > max_vel_divergence))
+    velocity_lost = (
+        vel_diff > max_vel_divergence
+        if max_vel_divergence > 0.0
+        else torch.zeros_like(dist_xy, dtype=torch.bool)
+    )
+    lost_now = active_task_state & past_grace & ((dist_xy > max_distance) | velocity_lost)
+    count = getattr(env, "_dribbling_ball_lost_consecutive_steps", None)
+    if not isinstance(count, torch.Tensor) or count.shape[0] != env.num_envs:
+        count = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    reset = step_buf == 0
+    count = torch.where(reset | ~lost_now, torch.zeros_like(count), count + 1)
+    setattr(env, "_dribbling_ball_lost_consecutive_steps", count)
+    lost = lost_now & (count >= max(1, int(max_consecutive_steps)))
     setattr(env, "_dribbling_ball_lost_task_active", active_task_state)
+    setattr(env, "_dribbling_ball_lost_distance", dist_xy)
+    setattr(env, "_dribbling_ball_lost_velocity_difference", vel_diff)
     return lost
+
+
+def dribbling_missed_contact(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    all_body_cfg: SceneEntityCfg | None = None,
+    num_ankle_links: int = 2,
+    require_expected_foot: bool = True,
+    target_side_enabled: bool = True,
+    max_touch_force: float = 22.0,
+    side_deadzone: float = 0.04,
+    target_forward_min: float = -0.06,
+    target_forward_max: float = 0.14,
+    target_side_max: float = 0.16,
+    target_region_std: float = 0.12,
+    missed_contact_grace_steps: int = 3,
+) -> torch.Tensor:
+    """Terminate on the first completed S2 window without a valid touch."""
+    state = dribbling_s2_contact_event_state(
+        env,
+        command_name=command_name,
+        ball_sensor_name=ball_sensor_name,
+        all_body_cfg=all_body_cfg,
+        num_ankle_links=num_ankle_links,
+        require_expected_foot=require_expected_foot,
+        target_side_enabled=target_side_enabled,
+        max_touch_force=max_touch_force,
+        side_deadzone=side_deadzone,
+        target_forward_min=target_forward_min,
+        target_forward_max=target_forward_max,
+        target_side_max=target_side_max,
+        target_region_std=target_region_std,
+        missed_contact_grace_steps=missed_contact_grace_steps,
+    )
+    return state["missed_contact"]
 
 
 def dribbling_no_ball_contact_timeout(

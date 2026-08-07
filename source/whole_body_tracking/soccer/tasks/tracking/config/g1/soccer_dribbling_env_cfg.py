@@ -1621,10 +1621,12 @@ class G1FlatMotionCGPretrainUnifiedS1LocalStrictEnvCfg(G1FlatMotionStrictPretrai
 
 @configclass
 class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
-    """S2 local reference: physical ball plus reference foot--ball contact prior."""
+    """S2-A: one reference-timed physical touch from an S1 checkpoint."""
 
     dribble_contact_mode: str = "both"
     dribble_contact_surface: str = "instep"
+    s2_curriculum_mix: tuple[tuple[int, float], ...] = ((1, 1.0),)
+    s2_missed_contact_terminate: bool = True
 
     def __post_init__(self):
         super().__post_init__()
@@ -1645,17 +1647,258 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         _apply_unified_local_163_contract(self)
         _apply_local_reference_ball_objectives(self)
         _disable_s2_unreliable_ball_penalties(self)
-        _require_reference_instep_side(self)
 
-        # The ball always follows physics.  CG position/contact rewards remain
-        # to teach the annotated reference touch placement and foot selection.
-        # Its reset location is the reference's first contact point, represented
-        # in the reference pelvis-local frame rather than simulation task +X.
+        # S2 keeps one foot imitation objective: normal reference tracking
+        # outside contact windows and a soft 0.3 multiplier inside them.
+        self.rewards.motion_foot_pos = None
+        self.rewards.dribbling_gait_foot_tracking = None
+        if hasattr(self.rewards, "foot_distance"):
+            self.rewards.foot_distance = None
+        self.rewards.s2_windowed_foot_tracking = RewTerm(
+            func=mdp.dribbling_s2_windowed_foot_tracking_exp,
+            weight=1.0,
+            params={
+                "command_name": "motion",
+                "std": 0.30,
+                "foot_body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
+                "contact_window_scale": 0.30,
+            },
+        )
+
+        # The contact detector is shared by the three positive terms, the
+        # undesired-contact penalty, diagnostics, and missed-contact done.
+        legacy_touch = self.rewards.dribbling_legal_foot_touch
+        legacy_body_cfg = legacy_touch.params["all_body_cfg"]
+        num_ankle_links = int(legacy_touch.params["num_ankle_links"])
+        ankle_names = list(legacy_body_cfg.body_names[:num_ankle_links])
+        s2_contact_body_cfg = SceneEntityCfg(
+            "robot",
+            body_names=[
+                *ankle_names,
+                *(
+                    body_name
+                    for body_name in self.commands.motion.body_names
+                    if body_name not in ankle_names
+                ),
+            ],
+        )
+        event_params = {
+            "command_name": "motion",
+            "ball_sensor_name": "soccer_ball_contact",
+            "all_body_cfg": s2_contact_body_cfg,
+            "num_ankle_links": num_ankle_links,
+            "require_expected_foot": True,
+            "target_side_enabled": True,
+            "max_touch_force": 22.0,
+            "side_deadzone": 0.04,
+            "target_forward_min": -0.06,
+            "target_forward_max": 0.14,
+            "target_side_max": 0.16,
+            "target_region_std": 0.12,
+            "missed_contact_grace_steps": 3,
+        }
+        self.rewards.s2_contact_proximity = RewTerm(
+            func=mdp.dribbling_s2_contact_proximity,
+            weight=2.0,
+            params=dict(event_params),
+        )
+        self.rewards.s2_new_touch = RewTerm(
+            func=mdp.dribbling_s2_new_touch_reward,
+            weight=5.0,
+            params=dict(event_params),
+        )
+        self.rewards.s2_correct_side = RewTerm(
+            func=mdp.dribbling_s2_correct_side_reward,
+            weight=2.0,
+            params=dict(event_params),
+        )
+        self.rewards.s2_undesired_ball_contact = RewTerm(
+            func=mdp.dribbling_s2_undesired_ball_contact_penalty,
+            weight=-6.0,
+            params=dict(event_params),
+        )
+
+        # First S2 pass: all other ball shaping is removed.  Motion imitation,
+        # local reference twist, action/waist regularization, joint limits,
+        # upright pelvis, ordinary body contacts, and upper-body priors remain.
+        disabled_ball_rewards = (
+            "dribbling_face_ball",
+            "dribbling_velocity_tracking",
+            "dribbling_dynamic_proximity",
+            "dribbling_stall_no_touch_penalty",
+            "dribbling_approach_foot_ball",
+            "dribbling_ball_speed_excess",
+            "dribbling_ball_coast_penalty",
+            "dribbling_sustained_contact_penalty",
+            "dribbling_ball_bounce_penalty",
+            "dribbling_ball_forward_progress",
+            "dribbling_chase_ball",
+            "dribbling_rapid_retouch_penalty",
+            "dribbling_legal_foot_touch",
+            "dribbling_micro_contact_filter",
+            "dribbling_undesired_contact_penalty",
+            "dribbling_phase_graph_alignment",
+            "dribbling_cg_flow_release",
+            "dribbling_cg_flow_progress",
+            "dribbling_cg_contact_consistency",
+            "dribbling_cg_premature_contact",
+            "dribbling_cg_foot_consistency",
+            "dribbling_support_ankle_roll",
+        )
+        for reward_name in disabled_ball_rewards:
+            if hasattr(self.rewards, reward_name):
+                setattr(self.rewards, reward_name, None)
+
+        # Ball-lost is distance-only and debounced for 0.2 s.  Reference
+        # ankle/wrist height and fixed no-touch terminations are removed.
+        self.terminations.ball_lost.params.update(
+            {
+                "max_distance": 1.10,
+                "max_vel_divergence": 0.0,
+                "grace_steps": 10,
+                "max_consecutive_steps": 10,
+            }
+        )
+        self.terminations.dribbling_no_contact = None
+        if hasattr(self.terminations, "ee_body_pos"):
+            self.terminations.ee_body_pos = None
+        if self.s2_missed_contact_terminate:
+            self.terminations.missed_contact = DoneTerm(
+                func=mdp.dribbling_missed_contact,
+                params=dict(event_params),
+            )
+
+        # The ball always follows physics.  Only the event region, new-touch,
+        # side bonus, and undesired-contact terms above supervise it.  Its
+        # reset location is the selected first event's reference target,
+        # represented in the reference pelvis-local frame rather than task +X.
         setattr(self.commands.motion, "dribble_cg_use_task_frame", False)
         setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
         setattr(self.commands.motion, "dribble_cg_ball_spawn_mode", "reference_first_contact")
+        setattr(self.commands.motion, "dribble_cg_curriculum_mix", self.s2_curriculum_mix)
+        setattr(self.commands.motion, "dribble_cg_pre_contact_seconds_range", (0.3, 0.6))
+        setattr(self.commands.motion, "dribble_cg_contact_window_seconds", 0.10)
+        setattr(self.commands.motion, "dribble_cg_missed_contact_grace_steps", 3)
+        setattr(self.commands.motion, "dribble_cg_ball_spawn_jitter_min", 0.05)
+        setattr(self.commands.motion, "dribble_cg_ball_spawn_jitter_max", 0.08)
         setattr(self.commands.motion, "dribble_cg_require_surface_labels", True)
-        setattr(self.commands.motion, "dribble_cg_require_flow_labels", True)
+        setattr(self.commands.motion, "dribble_cg_require_flow_labels", False)
+
+
+@configclass
+class G1FlatCGDribblingUnifiedS2TwoContactEnvCfg(G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg):
+    """S2-B: 30% single-touch and 70% adjacent two-touch episodes."""
+
+    s2_curriculum_mix: tuple[tuple[int, float], ...] = ((1, 0.30), (2, 0.70))
+
+
+@configclass
+class G1FlatCGDribblingUnifiedS2FourContactEnvCfg(G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg):
+    """S2-C4: mixed one/two/four-contact episodes; misses are logged only."""
+
+    s2_curriculum_mix: tuple[tuple[int, float], ...] = ((1, 0.20), (2, 0.30), (4, 0.50))
+    s2_missed_contact_terminate: bool = False
+
+
+@configclass
+class G1FlatCGDribblingUnifiedS2EightContactEnvCfg(G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg):
+    """S2-C8: mixed curriculum with eight-touch sequences as the longest sample."""
+
+    s2_curriculum_mix: tuple[tuple[int, float], ...] = (
+        (1, 0.10), (2, 0.20), (4, 0.30), (8, 0.40)
+    )
+    s2_missed_contact_terminate: bool = False
+
+
+@configclass
+class G1FlatCGDribblingUnifiedS2FullContactEnvCfg(G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg):
+    """Final S2 mix: short sequences plus complete reference clips."""
+
+    s2_curriculum_mix: tuple[tuple[int, float], ...] = (
+        (1, 0.10), (2, 0.20), (4, 0.30), (0, 0.40)
+    )
+    s2_missed_contact_terminate: bool = False
+
+
+def _apply_s2_contact_ablation(cfg, level: str) -> None:
+    """Configure cumulative motion/time/foot/side S2 ablations."""
+    event_term_names = (
+        "s2_contact_proximity",
+        "s2_new_touch",
+        "s2_correct_side",
+        "s2_undesired_ball_contact",
+    )
+    if level == "motion":
+        for name in event_term_names:
+            if hasattr(cfg.rewards, name):
+                setattr(cfg.rewards, name, None)
+        if hasattr(cfg.rewards, "s2_windowed_foot_tracking"):
+            cfg.rewards.s2_windowed_foot_tracking.params["contact_window_scale"] = 1.0
+        if hasattr(cfg.terminations, "missed_contact"):
+            cfg.terminations.missed_contact = None
+        if hasattr(cfg.terminations, "ball_lost"):
+            cfg.terminations.ball_lost = None
+        return
+
+    if level == "time":
+        cfg.rewards.s2_contact_proximity = None
+        cfg.rewards.s2_correct_side = None
+        require_expected_foot = False
+        target_side_enabled = False
+    elif level == "foot":
+        cfg.rewards.s2_correct_side = None
+        require_expected_foot = True
+        target_side_enabled = False
+    elif level == "side":
+        return
+    else:
+        raise ValueError(f"Unsupported S2 ablation level: {level}")
+
+    for name in event_term_names:
+        term = getattr(cfg.rewards, name, None)
+        if term is not None:
+            term.params["require_expected_foot"] = require_expected_foot
+            term.params["target_side_enabled"] = target_side_enabled
+    missed = getattr(cfg.terminations, "missed_contact", None)
+    if missed is not None:
+        missed.params["require_expected_foot"] = require_expected_foot
+        missed.params["target_side_enabled"] = target_side_enabled
+
+
+@configclass
+class G1FlatCGDribblingUnifiedS2AblationMotionEnvCfg(G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg):
+    """Ablation 1: motion/reference-twist objectives only."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_s2_contact_ablation(self, "motion")
+
+
+@configclass
+class G1FlatCGDribblingUnifiedS2AblationTimeEnvCfg(G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg):
+    """Ablation 2: motion plus event timing, accepting either ankle."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_s2_contact_ablation(self, "time")
+
+
+@configclass
+class G1FlatCGDribblingUnifiedS2AblationFootEnvCfg(G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg):
+    """Ablation 3: add expected-foot identity but not left/right side."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_s2_contact_ablation(self, "foot")
+
+
+@configclass
+class G1FlatCGDribblingUnifiedS2AblationSideEnvCfg(G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg):
+    """Ablation 4: complete timing + foot + side S2 objective."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_s2_contact_ablation(self, "side")
 
 
 @configclass

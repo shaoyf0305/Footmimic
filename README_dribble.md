@@ -14,21 +14,27 @@ bash shell/progressive_dribbling_train.sh my_run --cg-unified-3stage
 | Stage | Task ID | Objective |
 | --- | --- | --- |
 | S1 | `Tracking-CG-G1-Motion-RNN-unified-s1-local-strict` | Strict relative motion/gait imitation and exact reference local twist; no ball objective. |
-| S2 | `Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference` | Same reference local twist with a physical ball, reference foot--ball distance, and CG contact prior. |
+| S2-A | `Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference` | One physical touch in a ±0.1 s reference event window. |
+| S2-B | `Tracking-CG-G1-Dribbling-RNN-unified-s2-two-contact` | 30% one-touch and 70% adjacent two-touch episodes. |
+| S2-C4 | `Tracking-CG-G1-Dribbling-RNN-unified-s2-four-contact` | 20/30/50% one/two/four-touch mixture. |
+| S2-C8 | `Tracking-CG-G1-Dribbling-RNN-unified-s2-eight-contact` | 10/20/30/40% one/two/four/eight-touch mixture. |
+| S2-full | `Tracking-CG-G1-Dribbling-RNN-unified-s2-full-contact` | 10/20/30/40% one/two/four/full-clip mixture. |
 | S3 | `Tracking-CG-G1-Dribbling-RNN-unified-s3-local-task` | Sampled local task twist with generic physical `instep` contacts; no reference ball position, contact time, contact foot, or foot--ball distance reward. |
 
-S1/S2 preserve the raw 331-frame master clip exactly and emit a time-limit
-`done` on its final frame; the normal environment reset then resets robot,
-ball, and LSTM state together. S3 instead loops the same master clip through a
+S1 preserves the raw clip and emits a time-limit `done` on its final frame.
+S2 contact-count tasks start 0.3--0.6 s before their first selected event and
+end after the last selected contact window; S2-full retains complete-clip
+samples. The normal environment reset resets robot, ball, and LSTM state
+together. S3 instead loops the same master clip through a
 25-frame (0.5 s at 50 Hz) quintic bridge, blending its tail into its start
 without resetting the ongoing task scene.
 
-At reset, all three stages retain the reference frame-0 pelvis pose, yaw, and
+At reset, all three stages retain the selected reference pelvis pose, yaw, and
 velocity; they do not canonicalize the robot to a simulation/world `+X` axis.
-The physical ball is initialized at the first labelled
-`dribble_cg_contact` position from that reference. Internally this point is
-stored as a frame-0 pelvis-local offset, so the same reset geometry remains
-valid under any simulator yaw. If a motion lacks either a contact label or
+For S2 the physical ball is initialized at the selected first contact target
+with a 5--8 cm planar perturbation. Internally this point is stored as a
+pelvis-local offset, so the same reset geometry remains valid under any
+simulator yaw. If a motion lacks either a contact label or
 `ball_pos_w`, the explicit fallback is 0.45 m ahead in the frame-0 pelvis
 local frame. S1 applies no ball reward; it retains this identical spawn only
 because the unified 163-D observation contains the ball-relative input.
@@ -61,10 +67,33 @@ segment; it never exposes a polar command or IDLE/STOP state to the policy.
 
 ## Contact semantics
 
-`instep` means a dorsal contact region on either foot.  `inside_instep` and
-`outside_instep` are available for dataset-labelled ablations, but S3 does not
-force either side or a reference left/right alternation.  This keeps recovery
-and consecutive same-side touches feasible when the task requires them.
+S2 converts each labelled inside/outside event to foot-yaw-local left/right.
+Its target region uses forward `[-0.06, 0.14] m`, lateral magnitude
+`[0.04, 0.16] m`, and a 4 cm side dead zone. The only S2 ball terms are contact
+proximity, one new correct-foot touch, correct-side bonus, and wrong-foot/body
+contact penalty. Between events no ball trajectory or velocity is supervised.
+
+Use `--show_s2_contact_regions` during playback to display the frozen reference
+foot frame and the inner/outer side boundaries. Combine it with
+`--diagnostic --diagnostic_stride 1` to save event id/frame, expected foot,
+expected side, reference foot pose, ball offset, and target-region distance.
+
+The cumulative ablation task IDs are
+`unified-s2-ablation-motion`, `unified-s2-ablation-time`,
+`unified-s2-ablation-foot`, and `unified-s2-ablation-side` (all prefixed by
+`Tracking-CG-G1-Dribbling-RNN-`). They respectively add contact timing,
+specified-foot gating, and foot-local side gating while keeping the same
+single-contact initialization distribution.
+
+All S2 contact-curriculum tasks require valid `dribble_cg_contact`,
+`dribble_cg_foot`, `dribble_cg_surface`, and `ball_pos_w` arrays. At this
+revision the compatible checked-in bank is `motions/master-single`; passing a
+legacy mixed bank fails during environment creation instead of training with
+unknown side labels.
+
+`instep` means a dorsal contact region on either foot. S3 does not force either
+side or a reference left/right alternation, keeping recovery and consecutive
+same-side touches feasible when the task requires them.
 
 ## Diagnostic
 
