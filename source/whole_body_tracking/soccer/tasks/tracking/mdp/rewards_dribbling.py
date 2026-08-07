@@ -844,7 +844,7 @@ def dribbling_s2_contact_event_state(
     num_ankle_links: int = 2,
     require_expected_foot: bool = True,
     target_side_enabled: bool = True,
-    max_touch_force: float = 22.0,
+    max_touch_force: float = 100.0,
     side_deadzone: float = 0.04,
     target_forward_min: float = -0.06,
     target_forward_max: float = 0.14,
@@ -888,6 +888,9 @@ def dribbling_s2_contact_event_state(
     ).to(torch.long)
     frame = command.time_steps.to(torch.long)
     motion_idx = command.motion_idx.to(torch.long)
+    generation = getattr(command, "s2_episode_generation", None)
+    if not isinstance(generation, torch.Tensor) or generation.shape[0] != env.num_envs:
+        generation = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     cached = getattr(env, "_dribbling_s2_contact_event_cache", None)
     if (
         isinstance(cached, dict)
@@ -897,10 +900,17 @@ def dribbling_s2_contact_event_state(
         and torch.equal(cached["frame"], frame)
         and isinstance(cached.get("motion_idx"), torch.Tensor)
         and torch.equal(cached["motion_idx"], motion_idx)
+        and isinstance(cached.get("generation"), torch.Tensor)
+        and torch.equal(cached["generation"], generation)
     ):
         return cached["state"]
 
-    reset = step == 0
+    previous_generation = getattr(env, "_dribbling_s2_episode_generation", None)
+    if not isinstance(previous_generation, torch.Tensor) or previous_generation.shape[0] != env.num_envs:
+        reset = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    else:
+        reset = generation != previous_generation
+    setattr(env, "_dribbling_s2_episode_generation", generation.detach().clone())
     event_id = command.s2_contact_event_id_ref
     event_frame = command.s2_contact_event_frame_ref
     expected_foot = command.s2_contact_event_foot_ref
@@ -1152,6 +1162,7 @@ def dribbling_s2_contact_event_state(
         "step": step.detach().clone(),
         "frame": frame.detach().clone(),
         "motion_idx": motion_idx.detach().clone(),
+        "generation": generation.detach().clone(),
         "state": state,
     })
     return state
@@ -1165,7 +1176,7 @@ def dribbling_s2_contact_proximity(
     num_ankle_links: int = 2,
     require_expected_foot: bool = True,
     target_side_enabled: bool = True,
-    max_touch_force: float = 22.0,
+    max_touch_force: float = 100.0,
     side_deadzone: float = 0.04,
     target_forward_min: float = -0.06,
     target_forward_max: float = 0.14,
@@ -1190,7 +1201,7 @@ def dribbling_s2_new_touch_reward(
     num_ankle_links: int = 2,
     require_expected_foot: bool = True,
     target_side_enabled: bool = True,
-    max_touch_force: float = 22.0,
+    max_touch_force: float = 100.0,
     side_deadzone: float = 0.04,
     target_forward_min: float = -0.06,
     target_forward_max: float = 0.14,
@@ -1215,7 +1226,7 @@ def dribbling_s2_correct_side_reward(
     num_ankle_links: int = 2,
     require_expected_foot: bool = True,
     target_side_enabled: bool = True,
-    max_touch_force: float = 22.0,
+    max_touch_force: float = 100.0,
     side_deadzone: float = 0.04,
     target_forward_min: float = -0.06,
     target_forward_max: float = 0.14,
@@ -1240,7 +1251,7 @@ def dribbling_s2_undesired_ball_contact_penalty(
     num_ankle_links: int = 2,
     require_expected_foot: bool = True,
     target_side_enabled: bool = True,
-    max_touch_force: float = 22.0,
+    max_touch_force: float = 100.0,
     side_deadzone: float = 0.04,
     target_forward_min: float = -0.06,
     target_forward_max: float = 0.14,

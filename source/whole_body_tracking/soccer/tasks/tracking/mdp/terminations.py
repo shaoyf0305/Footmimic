@@ -169,15 +169,16 @@ def dribbling_missed_contact(
     num_ankle_links: int = 2,
     require_expected_foot: bool = True,
     target_side_enabled: bool = True,
-    max_touch_force: float = 22.0,
+    max_touch_force: float = 100.0,
     side_deadzone: float = 0.04,
     target_forward_min: float = -0.06,
     target_forward_max: float = 0.14,
     target_side_max: float = 0.16,
     target_region_std: float = 0.12,
     missed_contact_grace_steps: int = 3,
+    max_curriculum_level: int | None = None,
 ) -> torch.Tensor:
-    """Terminate on the first completed S2 window without a valid touch."""
+    """Terminate an early-level S2 episode after a missed selected event."""
     state = dribbling_s2_contact_event_state(
         env,
         command_name=command_name,
@@ -194,7 +195,14 @@ def dribbling_missed_contact(
         target_region_std=target_region_std,
         missed_contact_grace_steps=missed_contact_grace_steps,
     )
-    return state["missed_contact"]
+    missed = state["missed_contact"]
+    if max_curriculum_level is None:
+        return missed
+    command = env.command_manager.get_term(command_name)
+    episode_level = getattr(command, "s2_episode_curriculum_level", None)
+    if not isinstance(episode_level, torch.Tensor) or episode_level.shape[0] != env.num_envs:
+        return missed
+    return missed & (episode_level <= int(max_curriculum_level))
 
 
 def dribbling_no_ball_contact_timeout(

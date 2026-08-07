@@ -15,6 +15,7 @@ Inherits proximity-level tracking and adds dribbling-specific rewards:
 """
 
 import isaaclab.sim as sim_utils
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
@@ -1621,12 +1622,17 @@ class G1FlatMotionCGPretrainUnifiedS1LocalStrictEnvCfg(G1FlatMotionStrictPretrai
 
 @configclass
 class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
-    """S2-A: one reference-timed physical touch from an S1 checkpoint."""
+    """S2: one task with automatic 1/2/4/8/full contact curriculum."""
 
     dribble_contact_mode: str = "both"
     dribble_contact_surface: str = "instep"
-    s2_curriculum_mix: tuple[tuple[int, float], ...] = ((1, 1.0),)
-    s2_missed_contact_terminate: bool = True
+    s2_curriculum_levels: tuple[tuple[tuple[int, float], ...], ...] = (
+        ((1, 1.0),),
+        ((1, 0.30), (2, 0.70)),
+        ((1, 0.20), (2, 0.30), (4, 0.50)),
+        ((1, 0.10), (2, 0.20), (4, 0.30), (8, 0.40)),
+        ((1, 0.10), (2, 0.20), (4, 0.30), (0, 0.40)),
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -1689,7 +1695,10 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
             "num_ankle_links": num_ankle_links,
             "require_expected_foot": True,
             "target_side_enabled": True,
-            "max_touch_force": 22.0,
+            # Hard validity cap only. If force shaping is needed later, start
+            # a separate soft penalty around 45--60 N instead of lowering this
+            # cap and misclassifying ordinary physical touches as misses.
+            "max_touch_force": 100.0,
             "side_deadzone": 0.04,
             "target_forward_min": -0.06,
             "target_forward_max": 0.14,
@@ -1762,11 +1771,14 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         self.terminations.dribbling_no_contact = None
         if hasattr(self.terminations, "ee_body_pos"):
             self.terminations.ee_body_pos = None
-        if self.s2_missed_contact_terminate:
-            self.terminations.missed_contact = DoneTerm(
-                func=mdp.dribbling_missed_contact,
-                params=dict(event_params),
-            )
+        missed_contact_params = dict(event_params)
+        # Single- and two-contact levels terminate on a miss. Longer levels
+        # only record it, matching the staged S2 training plan.
+        missed_contact_params["max_curriculum_level"] = 1
+        self.terminations.missed_contact = DoneTerm(
+            func=mdp.dribbling_missed_contact,
+            params=missed_contact_params,
+        )
 
         # The ball always follows physics.  Only the event region, new-touch,
         # side bonus, and undesired-contact terms above supervise it.  Its
@@ -1775,7 +1787,8 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         setattr(self.commands.motion, "dribble_cg_use_task_frame", False)
         setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
         setattr(self.commands.motion, "dribble_cg_ball_spawn_mode", "reference_first_contact")
-        setattr(self.commands.motion, "dribble_cg_curriculum_mix", self.s2_curriculum_mix)
+        setattr(self.commands.motion, "dribble_cg_curriculum_levels", self.s2_curriculum_levels)
+        setattr(self.commands.motion, "dribble_cg_curriculum_start_level", 0)
         setattr(self.commands.motion, "dribble_cg_pre_contact_seconds_range", (0.3, 0.6))
         setattr(self.commands.motion, "dribble_cg_contact_window_seconds", 0.10)
         setattr(self.commands.motion, "dribble_cg_missed_contact_grace_steps", 3)
@@ -1784,44 +1797,29 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         setattr(self.commands.motion, "dribble_cg_require_surface_labels", True)
         setattr(self.commands.motion, "dribble_cg_require_flow_labels", False)
 
-
-@configclass
-class G1FlatCGDribblingUnifiedS2TwoContactEnvCfg(G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg):
-    """S2-B: 30% single-touch and 70% adjacent two-touch episodes."""
-
-    s2_curriculum_mix: tuple[tuple[int, float], ...] = ((1, 0.30), (2, 0.70))
-
-
-@configclass
-class G1FlatCGDribblingUnifiedS2FourContactEnvCfg(G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg):
-    """S2-C4: mixed one/two/four-contact episodes; misses are logged only."""
-
-    s2_curriculum_mix: tuple[tuple[int, float], ...] = ((1, 0.20), (2, 0.30), (4, 0.50))
-    s2_missed_contact_terminate: bool = False
-
-
-@configclass
-class G1FlatCGDribblingUnifiedS2EightContactEnvCfg(G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg):
-    """S2-C8: mixed curriculum with eight-touch sequences as the longest sample."""
-
-    s2_curriculum_mix: tuple[tuple[int, float], ...] = (
-        (1, 0.10), (2, 0.20), (4, 0.30), (8, 0.40)
-    )
-    s2_missed_contact_terminate: bool = False
-
-
-@configclass
-class G1FlatCGDribblingUnifiedS2FullContactEnvCfg(G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg):
-    """Final S2 mix: short sequences plus complete reference clips."""
-
-    s2_curriculum_mix: tuple[tuple[int, float], ...] = (
-        (1, 0.10), (2, 0.20), (4, 0.30), (0, 0.40)
-    )
-    s2_missed_contact_terminate: bool = False
+        # Isaac Lab runs this term before CommandManager.reset(), allowing it
+        # to evaluate the just-finished episode and promote the sampler before
+        # the next episode is drawn.
+        self.curriculum.s2_contact_levels = CurrTerm(
+            func=mdp.s2_contact_level_curriculum,
+            params={
+                "command_name": "motion",
+                "min_evaluation_episodes": 1024,
+                "required_consecutive_passes": 2,
+                "contact_success_threshold": 0.80,
+                "correct_side_threshold": 0.75,
+                "sequence_completion_threshold": 0.60,
+                "max_fall_rate": 0.05,
+                "fall_termination_terms": ("anchor_pos_z", "anchor_ori"),
+            },
+        )
 
 
 def _apply_s2_contact_ablation(cfg, level: str) -> None:
     """Configure cumulative motion/time/foot/side S2 ablations."""
+    # Ablations remain fixed at the level-0 single-contact distribution so
+    # contact supervision is the only independent variable.
+    cfg.curriculum.s2_contact_levels = None
     event_term_names = (
         "s2_contact_proximity",
         "s2_new_touch",

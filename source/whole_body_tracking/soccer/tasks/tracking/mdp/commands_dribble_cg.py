@@ -59,7 +59,25 @@ class DribbleCGMotionCommand(MotionCommand):
         self.s2_episode_first_contact_frame = torch.full(
             (env.num_envs,), -1, dtype=torch.long, device=env.device
         )
+        self.s2_episode_last_contact_frame = torch.full(
+            (env.num_envs,), -1, dtype=torch.long, device=env.device
+        )
         self.s2_episode_contact_count = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
+        # The Curriculum Manager owns this scalar. Each sampled episode keeps
+        # its originating level so asynchronous resets after a promotion do
+        # not contaminate the next level's evaluation window.
+        start_level = max(0, int(getattr(cfg, "dribble_cg_curriculum_start_level", 0)))
+        self.s2_curriculum_level = torch.tensor(
+            start_level, dtype=torch.long, device=env.device
+        )
+        self.s2_episode_curriculum_level = torch.full(
+            (env.num_envs,), start_level, dtype=torch.long, device=env.device
+        )
+        # Reward-side event state uses this generation instead of relying on
+        # manager-specific episode_length_buf reset ordering.
+        self.s2_episode_generation = torch.zeros(
             env.num_envs, dtype=torch.long, device=env.device
         )
         super().__init__(cfg, env)
@@ -177,9 +195,13 @@ class DribbleCGMotionCommand(MotionCommand):
         )
         for motion_idx, frames in enumerate(self._s2_event_frames_by_motion):
             self._s2_event_frames_padded[motion_idx, : frames.numel()] = frames
+        configured_levels = tuple(
+            getattr(self.cfg, "dribble_cg_curriculum_levels", ())
+        )
         requested_counts = {
             int(item[0])
-            for item in tuple(getattr(self.cfg, "dribble_cg_curriculum_mix", ()))
+            for level_mix in configured_levels
+            for item in tuple(level_mix)
             if int(item[0]) > 0
         }
         requested_counts.update((1, 2, 4, 8))
@@ -200,7 +222,19 @@ class DribbleCGMotionCommand(MotionCommand):
 
     def _s2_current_event_label(self, labels: torch.Tensor) -> torch.Tensor:
         frame = torch.minimum(self.time_steps, self.motion.file_lengths[self.motion_idx] - 1)
-        return labels[self.motion_idx, frame]
+        value = labels[self.motion_idx, frame]
+        raw_event_frame = self._s2_event_frame[self.motion_idx, frame]
+        selected_first = self.s2_episode_first_contact_frame
+        selected_last = self.s2_episode_last_contact_frame
+        selected_curriculum = (selected_first >= 0) & (selected_last >= 0)
+        selected_event = (
+            (raw_event_frame >= selected_first) & (raw_event_frame <= selected_last)
+        )
+        return torch.where(
+            selected_curriculum & ~selected_event,
+            torch.full_like(value, -1),
+            value,
+        )
 
     @property
     def s2_contact_event_id_ref(self) -> torch.Tensor:
@@ -254,15 +288,20 @@ class DribbleCGMotionCommand(MotionCommand):
 
     def _sample_s2_contact_curriculum(self, env_ids: torch.Tensor) -> bool:
         """Sample a contact-count episode; return false when the feature is off."""
-        mix = tuple(getattr(self.cfg, "dribble_cg_curriculum_mix", ()))
-        if not mix:
+        levels = tuple(getattr(self.cfg, "dribble_cg_curriculum_levels", ()))
+        if levels:
+            level = min(max(0, int(self.s2_curriculum_level.item())), len(levels) - 1)
+            mix = tuple(levels[level])
+        else:
             return False
         counts = torch.as_tensor([int(item[0]) for item in mix], device=self.device)
         probabilities = torch.as_tensor(
             [float(item[1]) for item in mix], dtype=torch.float32, device=self.device
         )
         if bool(torch.any(probabilities < 0.0)) or float(probabilities.sum().item()) <= 0.0:
-            raise ValueError("dribble_cg_curriculum_mix probabilities must be non-negative with positive sum")
+            raise ValueError(
+                "Active dribble_cg_curriculum_levels probabilities must be non-negative with positive sum"
+            )
         probabilities = probabilities / probabilities.sum()
         sampled_counts = counts[torch.multinomial(probabilities, env_ids.numel(), replacement=True)]
         fps = float(self.motion.fps.reshape(-1)[0])
@@ -343,7 +382,9 @@ class DribbleCGMotionCommand(MotionCommand):
             self.motion_length[group_env_ids] = end_frame + 1
             self.time_steps[group_env_ids] = start_frame
             self.s2_episode_first_contact_frame[group_env_ids] = first_event
+            self.s2_episode_last_contact_frame[group_env_ids] = last_event
             self.s2_episode_contact_count[group_env_ids] = actual_count
+            self.s2_episode_curriculum_level[group_env_ids] = level
         return True
 
     def _uniform_sampling(self, env_ids: Sequence[int]):
@@ -355,7 +396,15 @@ class DribbleCGMotionCommand(MotionCommand):
             return
         super()._uniform_sampling(ids)
         self.s2_episode_first_contact_frame[ids] = -1
+        self.s2_episode_last_contact_frame[ids] = -1
         self.s2_episode_contact_count[ids] = 0
+        self.s2_episode_curriculum_level[ids] = int(self.s2_curriculum_level.item())
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        ids = self._to_env_id_tensor(env_ids)
+        super()._resample_command(ids)
+        if ids.numel() > 0:
+            self.s2_episode_generation[ids] += 1
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         regions_only = bool(
@@ -742,10 +791,11 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     dribble_cg_front_ball_distance: float = 0.45
     dribble_cg_front_ball_lateral_offset: float = 0.0
     dribble_cg_front_ball_height: float = 0.11
-    # S2 event curriculum.  Each pair is ``(number_of_adjacent_contacts,
-    # probability)``; zero means the complete clip.  An empty tuple preserves
-    # the legacy full-clip sampler.
-    dribble_cg_curriculum_mix: tuple[tuple[int, float], ...] = ()
+    # Performance-driven S2 levels. Each nested pair is
+    # ``(number_of_adjacent_contacts, probability)``; zero means full clip.
+    # The Curriculum Manager updates ``s2_curriculum_level`` at runtime.
+    dribble_cg_curriculum_levels: tuple[tuple[tuple[int, float], ...], ...] = ()
+    dribble_cg_curriculum_start_level: int = 0
     dribble_cg_pre_contact_seconds_range: tuple[float, float] = (0.3, 0.6)
     dribble_cg_contact_window_seconds: float = 0.10
     dribble_cg_missed_contact_grace_steps: int = 3

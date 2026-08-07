@@ -14,20 +14,26 @@ bash shell/progressive_dribbling_train.sh my_run --cg-unified-3stage
 | Stage | Task ID | Objective |
 | --- | --- | --- |
 | S1 | `Tracking-CG-G1-Motion-RNN-unified-s1-local-strict` | Strict relative motion/gait imitation and exact reference local twist; no ball objective. |
-| S2-A | `Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference` | One physical touch in a ±0.1 s reference event window. |
-| S2-B | `Tracking-CG-G1-Dribbling-RNN-unified-s2-two-contact` | 30% one-touch and 70% adjacent two-touch episodes. |
-| S2-C4 | `Tracking-CG-G1-Dribbling-RNN-unified-s2-four-contact` | 20/30/50% one/two/four-touch mixture. |
-| S2-C8 | `Tracking-CG-G1-Dribbling-RNN-unified-s2-eight-contact` | 10/20/30/40% one/two/four/eight-touch mixture. |
-| S2-full | `Tracking-CG-G1-Dribbling-RNN-unified-s2-full-contact` | 10/20/30/40% one/two/four/full-clip mixture. |
+| S2 | `Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference` | One task whose Isaac Lab curriculum automatically advances through one/two/four/eight/full-contact levels. |
 | S3 | `Tracking-CG-G1-Dribbling-RNN-unified-s3-local-task` | Sampled local task twist with generic physical `instep` contacts; no reference ball position, contact time, contact foot, or foot--ball distance reward. |
 
 S1 preserves the raw clip and emits a time-limit `done` on its final frame.
-S2 contact-count tasks start 0.3--0.6 s before their first selected event and
-end after the last selected contact window; S2-full retains complete-clip
-samples. The normal environment reset resets robot, ball, and LSTM state
-together. S3 instead loops the same master clip through a
+S2 starts at one contact and automatically advances through five levels in
+the same run. Short samples start 0.3--0.6 s before their first selected event
+and end after the last selected contact window; the final level also includes
+complete-clip samples. The normal environment reset resets robot, ball, and
+LSTM state together. S3 instead loops the same master clip through a
 25-frame (0.5 s at 50 Hz) quintic bridge, blending its tail into its start
 without resetting the ongoing task scene.
+
+The S2 level distributions are 100% one contact; 30/70% one/two; 20/30/50%
+one/two/four; 10/20/30/40% one/two/four/eight; and 10/20/30/40%
+one/two/four/full clip. The curriculum evaluates non-overlapping windows of at
+least 1024 eligible episodes and requires two consecutive passing windows.
+Level 0 requires at least 80% contact success, 75% correct side, and at most
+5% falls. Levels 1--3 require at least 60% completion of their longest
+sequence and at most 5% falls. Promotion is monotonic; there is no automatic
+demotion or manual task switch.
 
 At reset, all three stages retain the selected reference pelvis pose, yaw, and
 velocity; they do not canonicalize the robot to a simulation/world `+X` axis.
@@ -85,7 +91,7 @@ The cumulative ablation task IDs are
 specified-foot gating, and foot-local side gating while keeping the same
 single-contact initialization distribution.
 
-All S2 contact-curriculum tasks require valid `dribble_cg_contact`,
+The S2 contact-curriculum task requires valid `dribble_cg_contact`,
 `dribble_cg_foot`, `dribble_cg_surface`, and `ball_pos_w` arrays. At this
 revision the compatible checked-in bank is `motions/master-single`; passing a
 legacy mixed bank fails during environment creation instead of training with
