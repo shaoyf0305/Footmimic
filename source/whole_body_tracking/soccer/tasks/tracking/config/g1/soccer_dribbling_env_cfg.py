@@ -1622,16 +1622,16 @@ class G1FlatMotionCGPretrainUnifiedS1LocalStrictEnvCfg(G1FlatMotionStrictPretrai
 
 @configclass
 class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
-    """S2: one task with automatic 1/2/4/8/full contact curriculum."""
+    """S2: clean/robust single touches, then 2/4/8/full sequences."""
 
     dribble_contact_mode: str = "both"
     dribble_contact_surface: str = "instep"
     s2_curriculum_levels: tuple[tuple[tuple[int, float], ...], ...] = (
         ((1, 1.0),),
-        ((1, 0.30), (2, 0.70)),
+        ((1, 1.0),),
+        ((1, 0.40), (2, 0.60)),
         ((1, 0.20), (2, 0.30), (4, 0.50)),
-        ((1, 0.10), (2, 0.20), (4, 0.30), (8, 0.40)),
-        ((1, 0.10), (2, 0.20), (4, 0.30), (0, 0.40)),
+        ((1, 0.10), (2, 0.15), (4, 0.25), (8, 0.25), (0, 0.25)),
     )
 
     def __post_init__(self):
@@ -1710,10 +1710,10 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         }
         self.rewards.s2_contact_proximity = RewTerm(
             func=mdp.dribbling_s2_contact_proximity,
-            # Eleven window frames can contribute, so 0.5 caps the dense
-            # return near the one-shot +5 new-touch reward instead of
-            # overwhelming it with an easy reset-position score.
-            weight=0.5,
+            # The rational-quadratic kernel remains informative at difficult
+            # 20--30 cm offsets. A weight of one strengthens the only dense
+            # ball-control signal without adding another reward objective.
+            weight=1.0,
             params=dict(event_params),
         )
         self.rewards.s2_new_touch = RewTerm(
@@ -1782,7 +1782,7 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         if hasattr(self.terminations, "ee_body_pos"):
             self.terminations.ee_body_pos = None
         missed_contact_params = dict(event_params)
-        # Single- and two-contact levels terminate on a miss. Longer levels
+        # Both single-contact levels terminate on a miss. Multi-contact levels
         # only record it, matching the staged S2 training plan.
         missed_contact_params["max_curriculum_level"] = 1
         self.terminations.missed_contact = DoneTerm(
@@ -1798,12 +1798,45 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         setattr(self.commands.motion, "dribble_cg_snap_mode", "never")
         setattr(self.commands.motion, "dribble_cg_ball_spawn_mode", "reference_first_contact")
         setattr(self.commands.motion, "dribble_cg_curriculum_levels", self.s2_curriculum_levels)
+        setattr(
+            self.commands.motion,
+            "dribble_cg_curriculum_required_contacts",
+            (1, 1, 2, 4, 8),
+        )
         setattr(self.commands.motion, "dribble_cg_curriculum_start_level", 0)
         setattr(self.commands.motion, "dribble_cg_pre_contact_seconds_range", (0.3, 0.6))
         setattr(self.commands.motion, "dribble_cg_contact_window_seconds", 0.10)
         setattr(self.commands.motion, "dribble_cg_missed_contact_grace_steps", 3)
-        setattr(self.commands.motion, "dribble_cg_ball_spawn_jitter_min", 0.05)
-        setattr(self.commands.motion, "dribble_cg_ball_spawn_jitter_max", 0.08)
+        # Per level: (exact-reference probability, maximum initial radius).
+        # Level 0 has no disturbance. Later levels perturb once at sequence
+        # reset in the labelled foot frame; subsequent errors arise naturally
+        # from ball physics and earlier touches.
+        setattr(
+            self.commands.motion,
+            "dribble_cg_curriculum_ball_spawn_jitter",
+            (
+                (1.00, 0.00),
+                (0.70, 0.02),
+                (0.50, 0.02),
+                (0.30, 0.04),
+                (0.20, 0.06),
+            ),
+        )
+        setattr(
+            self.commands.motion,
+            "dribble_cg_ball_spawn_safe_forward_range",
+            (-0.04, 0.12),
+        )
+        setattr(
+            self.commands.motion,
+            "dribble_cg_ball_spawn_safe_side_range",
+            (0.06, 0.14),
+        )
+        setattr(self.commands.motion, "dribble_cg_ball_spawn_jitter_min", 0.0)
+        setattr(self.commands.motion, "dribble_cg_ball_spawn_jitter_max", 0.0)
+        setattr(self.commands.motion, "dribble_cg_hard_replay_min_attempts", 30)
+        setattr(self.commands.motion, "dribble_cg_hard_replay_fraction", 0.30)
+        setattr(self.commands.motion, "dribble_cg_hard_replay_probability", 0.70)
         setattr(self.commands.motion, "dribble_cg_require_surface_labels", True)
         setattr(self.commands.motion, "dribble_cg_require_flow_labels", False)
 
@@ -1816,11 +1849,17 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
                 "command_name": "motion",
                 "min_evaluation_episodes": 1024,
                 "required_consecutive_passes": 2,
-                "contact_success_threshold": 0.80,
-                "correct_side_threshold": 0.75,
+                "contact_success_threshold": 0.75,
+                "correct_side_threshold": 0.70,
                 "sequence_completion_threshold": 0.60,
                 "max_fall_rate": 0.05,
                 "fall_termination_terms": ("anchor_pos_z", "anchor_ori"),
+                "event_min_attempts": 30,
+                "event_success_threshold": 0.60,
+                "event_coverage_threshold": 0.80,
+                "plateau_contact_threshold": 0.50,
+                "plateau_windows": 4,
+                "plateau_min_improvement": 0.02,
             },
         )
 

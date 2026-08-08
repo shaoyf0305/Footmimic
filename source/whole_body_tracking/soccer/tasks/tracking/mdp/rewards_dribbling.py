@@ -988,8 +988,14 @@ def dribbling_s2_contact_event_state(
     )
     current_lateral = ball_from_actual_foot[:, 1]
     target_distance = _target_region_distance(ball_from_actual_foot)
-    proximity = torch.exp(
-        -target_distance.square() / max(float(target_region_std), 1.0e-6) ** 2
+    # A rational-quadratic kernel keeps a useful tail when the physical foot
+    # starts far from the labelled region.  The previous Gaussian kernel was
+    # effectively flat at the difficult 20--30 cm distances, so repeatedly
+    # sampling those events did not provide PPO with a direction for recovery.
+    region_scale = max(float(target_region_std), 1.0e-6)
+    normalized_distance = target_distance / region_scale
+    proximity = (
+        1.0 / (1.0 + normalized_distance.square())
     ) * active.to(torch.float32)
 
     previous_contact = getattr(env, "_dribbling_s2_previous_contact", None)

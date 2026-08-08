@@ -65,6 +65,9 @@ class DribbleCGMotionCommand(MotionCommand):
         self.s2_episode_contact_count = torch.zeros(
             env.num_envs, dtype=torch.long, device=env.device
         )
+        self.s2_episode_first_event_index = torch.full(
+            (env.num_envs,), -1, dtype=torch.long, device=env.device
+        )
         # The Curriculum Manager owns this scalar. Each sampled episode keeps
         # its originating level so asynchronous resets after a promotion do
         # not contaminate the next level's evaluation window.
@@ -197,6 +200,17 @@ class DribbleCGMotionCommand(MotionCommand):
         )
         for motion_idx, frames in enumerate(self._s2_event_frames_by_motion):
             self._s2_event_frames_padded[motion_idx, : frames.numel()] = frames
+        # Persistent single-touch statistics drive level-local hard-event
+        # replay. They are reset on promotion so clean and disturbed levels do
+        # not contaminate one another's reachability estimates.
+        event_stat_shape = self._s2_event_frames_padded.shape
+        self._s2_event_attempt_count = torch.zeros(
+            event_stat_shape, dtype=torch.float32, device=self.device
+        )
+        self._s2_event_success_count = torch.zeros_like(self._s2_event_attempt_count)
+        self._s2_hard_replay_enabled = torch.zeros(
+            (), dtype=torch.long, device=self.device
+        )
         configured_levels = tuple(
             getattr(self.cfg, "dribble_cg_curriculum_levels", ())
         )
@@ -355,9 +369,77 @@ class DribbleCGMotionCommand(MotionCommand):
                     raise ValueError(
                         f"No motion contains a {requested_count}-contact curriculum sequence"
                     )
-                sampled = candidates[
-                    torch.randint(candidates.shape[0], (group_size,), device=self.device)
-                ]
+                sampled_indices = torch.randint(
+                    candidates.shape[0], (group_size,), device=self.device
+                )
+                # Once level-local performance has plateaued, draw most
+                # single-contact episodes from the lowest-success sufficiently
+                # sampled events while retaining a uniform replay fraction.
+                hard_replay = bool(
+                    requested_count == 1
+                    and int(getattr(self, "_s2_hard_replay_enabled", torch.zeros(())).item()) > 0
+                )
+                if hard_replay:
+                    attempts = self._s2_event_attempt_count[
+                        candidates[:, 0], candidates[:, 1]
+                    ]
+                    successes = self._s2_event_success_count[
+                        candidates[:, 0], candidates[:, 1]
+                    ]
+                    min_attempts = max(
+                        1, int(getattr(self.cfg, "dribble_cg_hard_replay_min_attempts", 30))
+                    )
+                    eligible = torch.nonzero(
+                        attempts >= float(min_attempts), as_tuple=False
+                    ).squeeze(-1)
+                    if eligible.numel() > 0:
+                        hard_fraction = min(
+                            1.0,
+                            max(
+                                0.0,
+                                float(getattr(self.cfg, "dribble_cg_hard_replay_fraction", 0.30)),
+                            ),
+                        )
+                        hard_count = max(
+                            1,
+                            min(
+                                int(eligible.numel()),
+                                int(float(eligible.numel()) * hard_fraction + 0.999999),
+                            ),
+                        )
+                        # A Beta(1, 1) posterior mean avoids extreme rankings
+                        # from a small number of binary outcomes.
+                        success_rate = (successes[eligible] + 1.0) / (
+                            attempts[eligible] + 2.0
+                        )
+                        hard_local = torch.topk(
+                            success_rate, k=hard_count, largest=False
+                        ).indices
+                        hard_indices = eligible[hard_local]
+                        hard_probability = min(
+                            1.0,
+                            max(
+                                0.0,
+                                float(
+                                    getattr(
+                                        self.cfg, "dribble_cg_hard_replay_probability", 0.70
+                                    )
+                                ),
+                            ),
+                        )
+                        hard_draw = (
+                            torch.rand(group_size, device=self.device) < hard_probability
+                        )
+                        hard_draw_count = int(hard_draw.sum().item())
+                        if hard_draw_count > 0:
+                            sampled_indices[hard_draw] = hard_indices[
+                                torch.randint(
+                                    hard_indices.numel(),
+                                    (hard_draw_count,),
+                                    device=self.device,
+                                )
+                            ]
+                sampled = candidates[sampled_indices]
                 selected_motion = sampled[:, 0]
                 sequence_start = sampled[:, 1]
                 actual_count = torch.full_like(selected_motion, requested_count)
@@ -386,6 +468,7 @@ class DribbleCGMotionCommand(MotionCommand):
             self.s2_episode_first_contact_frame[group_env_ids] = first_event
             self.s2_episode_last_contact_frame[group_env_ids] = last_event
             self.s2_episode_contact_count[group_env_ids] = actual_count
+            self.s2_episode_first_event_index[group_env_ids] = sequence_start
             self.s2_episode_curriculum_level[group_env_ids] = level
         return True
 
@@ -400,6 +483,7 @@ class DribbleCGMotionCommand(MotionCommand):
         self.s2_episode_first_contact_frame[ids] = -1
         self.s2_episode_last_contact_frame[ids] = -1
         self.s2_episode_contact_count[ids] = 0
+        self.s2_episode_first_event_index[ids] = -1
         self.s2_episode_curriculum_level[ids] = int(self.s2_curriculum_level.item())
 
     def _resample_command(self, env_ids: Sequence[int]):
@@ -658,13 +742,107 @@ class DribbleCGMotionCommand(MotionCommand):
         valid = (contact_frames >= 0) & self.motion.motion_has_ball_demo[mi]
         safe_frames = contact_frames.clamp(min=0)
         positions = self.motion.ball_pos_w[mi, safe_frames].clone()
-        jitter_min = max(0.0, float(getattr(self.cfg, "dribble_cg_ball_spawn_jitter_min", 0.0)))
-        jitter_max = max(jitter_min, float(getattr(self.cfg, "dribble_cg_ball_spawn_jitter_max", 0.0)))
-        if jitter_max > 0.0:
-            radius = jitter_min + torch.rand(env_ids.numel(), device=self.device) * (jitter_max - jitter_min)
-            angle = 2.0 * torch.pi * torch.rand(env_ids.numel(), device=self.device)
-            positions[:, 0] += radius * torch.cos(angle)
-            positions[:, 1] += radius * torch.sin(angle)
+        jitter_levels = tuple(
+            getattr(self.cfg, "dribble_cg_curriculum_ball_spawn_jitter", ())
+        )
+        if jitter_levels:
+            # Each pair is (clean probability, maximum perturbation radius).
+            # Perturb only at sequence reset; later contacts inherit the
+            # physical position/velocity errors produced by previous touches.
+            episode_levels = self.s2_episode_curriculum_level[env_ids]
+            clean_probability = torch.ones(env_ids.numel(), device=self.device)
+            jitter_max = torch.zeros_like(clean_probability)
+            for level_index, (level_clean_probability, level_jitter_max) in enumerate(
+                jitter_levels
+            ):
+                level_mask = episode_levels == level_index
+                clean_probability[level_mask] = min(
+                    1.0, max(0.0, float(level_clean_probability))
+                )
+                jitter_max[level_mask] = max(0.0, float(level_jitter_max))
+            perturb = (
+                torch.rand(env_ids.numel(), device=self.device) >= clean_probability
+            ) & (jitter_max > 0.0)
+
+            if bool(torch.any(perturb)):
+                contact_foot = self.motion.dribble_cg_foot[mi, safe_frames].to(torch.long)
+                expected_side = self._s2_event_side[mi, safe_frames].to(torch.long)
+                left_index = self.cfg.body_names.index("left_ankle_roll_link")
+                right_index = self.cfg.body_names.index("right_ankle_roll_link")
+                foot_index = torch.where(
+                    contact_foot == 1,
+                    torch.full_like(contact_foot, right_index),
+                    torch.full_like(contact_foot, left_index),
+                )
+                foot_pos = self.motion.body_pos_w[mi, safe_frames, foot_index]
+                foot_yaw = yaw_quat(
+                    self.motion.body_quat_w[mi, safe_frames, foot_index]
+                )
+                base_local = quat_apply(quat_inv(foot_yaw), positions - foot_pos)
+                candidate_local = base_local.clone()
+                accepted = torch.zeros_like(perturb)
+                forward_min, forward_max = getattr(
+                    self.cfg, "dribble_cg_ball_spawn_safe_forward_range", (-0.04, 0.12)
+                )
+                side_min, side_max = getattr(
+                    self.cfg, "dribble_cg_ball_spawn_safe_side_range", (0.06, 0.14)
+                )
+                labels_valid = ((contact_foot == 0) | (contact_foot == 1)) & (
+                    (expected_side == 0) | (expected_side == 1)
+                )
+                # Resampling instead of clamping guarantees the configured
+                # radius remains an actual upper bound on the perturbation.
+                for _ in range(8):
+                    pending = perturb & labels_valid & ~accepted
+                    if not bool(torch.any(pending)):
+                        break
+                    radius = jitter_max * torch.sqrt(
+                        torch.rand(env_ids.numel(), device=self.device)
+                    )
+                    angle = 2.0 * torch.pi * torch.rand(
+                        env_ids.numel(), device=self.device
+                    )
+                    proposed = base_local.clone()
+                    proposed[:, 0] += radius * torch.cos(angle)
+                    proposed[:, 1] += radius * torch.sin(angle)
+                    side_valid = torch.where(
+                        expected_side == 0,
+                        (proposed[:, 1] >= float(side_min))
+                        & (proposed[:, 1] <= float(side_max)),
+                        (proposed[:, 1] <= -float(side_min))
+                        & (proposed[:, 1] >= -float(side_max)),
+                    )
+                    safe = (
+                        pending
+                        & (proposed[:, 0] >= float(forward_min))
+                        & (proposed[:, 0] <= float(forward_max))
+                        & side_valid
+                    )
+                    candidate_local = torch.where(
+                        safe.unsqueeze(-1), proposed, candidate_local
+                    )
+                    accepted |= safe
+                perturbed_positions = foot_pos + quat_apply(foot_yaw, candidate_local)
+                positions = torch.where(
+                    accepted.unsqueeze(-1), perturbed_positions, positions
+                )
+        else:
+            # Preserve the old world-XY annulus for non-curriculum users of
+            # this command. S2 configures the side-preserving schedule above.
+            jitter_min = max(
+                0.0, float(getattr(self.cfg, "dribble_cg_ball_spawn_jitter_min", 0.0))
+            )
+            jitter_max = max(
+                jitter_min,
+                float(getattr(self.cfg, "dribble_cg_ball_spawn_jitter_max", 0.0)),
+            )
+            if jitter_max > 0.0:
+                radius = jitter_min + torch.rand(
+                    env_ids.numel(), device=self.device
+                ) * (jitter_max - jitter_min)
+                angle = 2.0 * torch.pi * torch.rand(env_ids.numel(), device=self.device)
+                positions[:, 0] += radius * torch.cos(angle)
+                positions[:, 1] += radius * torch.sin(angle)
         return positions, valid, contact_frames
 
     def _record_ball_spawn(
@@ -803,6 +981,15 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     dribble_cg_missed_contact_grace_steps: int = 3
     dribble_cg_ball_spawn_jitter_min: float = 0.0
     dribble_cg_ball_spawn_jitter_max: float = 0.0
+    # Per curriculum level: (probability of an exact reference spawn,
+    # maximum radius for a foot-yaw-local, side-preserving perturbation).
+    dribble_cg_curriculum_ball_spawn_jitter: tuple[tuple[float, float], ...] = ()
+    dribble_cg_ball_spawn_safe_forward_range: tuple[float, float] = (-0.04, 0.12)
+    dribble_cg_ball_spawn_safe_side_range: tuple[float, float] = (0.06, 0.14)
+    dribble_cg_curriculum_required_contacts: tuple[int, ...] = ()
+    dribble_cg_hard_replay_min_attempts: int = 30
+    dribble_cg_hard_replay_fraction: float = 0.30
+    dribble_cg_hard_replay_probability: float = 0.70
     dribble_cg_s2_debug_regions_only: bool = False
     # ``None`` preserves the historical mixed-foot CG behavior. Unified
     # training sets this to one side and validates every motion at startup.

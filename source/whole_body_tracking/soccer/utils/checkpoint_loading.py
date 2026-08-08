@@ -24,14 +24,24 @@ _S2_CURRICULUM_SCALAR_NAMES = (
     "_s2_curriculum_last_correct_side_rate",
     "_s2_curriculum_last_sequence_completion_rate",
     "_s2_curriculum_last_fall_rate",
+    "_s2_curriculum_last_event_coverage",
     "_s2_curriculum_last_evaluation_count",
+    "_s2_curriculum_best_contact_success_rate",
     "_s2_curriculum_pass_streak",
+    "_s2_curriculum_plateau_streak",
     "_s2_curriculum_last_evaluated_level",
+    "_s2_hard_replay_enabled",
+)
+_S2_CURRICULUM_TENSOR_NAMES = (
+    "_s2_event_attempt_count",
+    "_s2_event_success_count",
 )
 _S2_CURRICULUM_INTEGER_NAMES = {
     "s2_curriculum_level",
     "_s2_curriculum_pass_streak",
+    "_s2_curriculum_plateau_streak",
     "_s2_curriculum_last_evaluated_level",
+    "_s2_hard_replay_enabled",
 }
 
 
@@ -60,18 +70,22 @@ def _s2_curriculum_command(target, *, require_active_term: bool = True):
     return command
 
 
-def capture_s2_curriculum_state(target) -> dict[str, int | float] | None:
-    """Capture the global S2 curriculum scalars for an RSL-RL checkpoint."""
+def capture_s2_curriculum_state(target) -> dict[str, Any] | None:
+    """Capture global S2 curriculum and hard-event replay state."""
     command = _s2_curriculum_command(target)
     if command is None:
         return None
-    state: dict[str, int | float] = {"version": 1}
+    state: dict[str, Any] = {"version": 2}
     for name in _S2_CURRICULUM_SCALAR_NAMES:
         value = getattr(command, name, None)
         if not isinstance(value, torch.Tensor) or value.numel() != 1:
             continue
         scalar = value.detach().cpu().item()
         state[name] = int(scalar) if name in _S2_CURRICULUM_INTEGER_NAMES else float(scalar)
+    for name in _S2_CURRICULUM_TENSOR_NAMES:
+        value = getattr(command, name, None)
+        if isinstance(value, torch.Tensor):
+            state[name] = value.detach().cpu().clone()
     return state
 
 
@@ -111,6 +125,10 @@ def set_s2_curriculum_level(
             value = getattr(command, name, None)
             if isinstance(value, torch.Tensor):
                 value.zero_()
+        for name in _S2_CURRICULUM_TENSOR_NAMES:
+            value = getattr(command, name, None)
+            if isinstance(value, torch.Tensor):
+                value.zero_()
     if reset_env:
         _reset_runner_env(target)
     return resolved_level
@@ -145,6 +163,17 @@ def restore_s2_curriculum_state(
             current.fill_(saved_value)
         else:
             setattr(command, name, torch.tensor(saved_value, dtype=dtype, device=command.device))
+    for name in _S2_CURRICULUM_TENSOR_NAMES:
+        saved_value = state.get(name)
+        current = getattr(command, name, None)
+        if isinstance(saved_value, torch.Tensor) and isinstance(current, torch.Tensor):
+            if saved_value.shape == current.shape:
+                current.copy_(saved_value.to(device=current.device, dtype=current.dtype))
+            else:
+                print(
+                    f"[WARN] S2 curriculum: ignored {name} with shape "
+                    f"{tuple(saved_value.shape)}; expected {tuple(current.shape)}."
+                )
     episode_level = getattr(command, "s2_episode_curriculum_level", None)
     if isinstance(episode_level, torch.Tensor):
         episode_level.fill_(restored_level)
