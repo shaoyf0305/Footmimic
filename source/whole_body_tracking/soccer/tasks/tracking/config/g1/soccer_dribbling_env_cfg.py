@@ -1655,7 +1655,9 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         _disable_s2_unreliable_ball_penalties(self)
 
         # S2 keeps one foot imitation objective: normal reference tracking
-        # outside contact windows and a soft 0.3 multiplier inside them.
+        # outside contact windows and a softened, but still useful, 0.6
+        # multiplier inside them.  The former 0.3 scale allowed roughly
+        # 15 cm of foot/reference drift, enough to invert the actual side.
         self.rewards.motion_foot_pos = None
         self.rewards.dribbling_gait_foot_tracking = None
         if hasattr(self.rewards, "foot_distance"):
@@ -1667,7 +1669,7 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
                 "command_name": "motion",
                 "std": 0.30,
                 "foot_body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
-                "contact_window_scale": 0.30,
+                "contact_window_scale": 0.60,
             },
         )
 
@@ -1695,10 +1697,10 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
             "num_ankle_links": num_ankle_links,
             "require_expected_foot": True,
             "target_side_enabled": True,
-            # Hard validity cap only. If force shaping is needed later, start
-            # a separate soft penalty around 45--60 N instead of lowering this
-            # cap and misclassifying ordinary physical touches as misses.
+            # A continuous soft penalty starts at 60 N below this hard
+            # validity cap. Ordinary touches remain valid through 100 N.
             "max_touch_force": 100.0,
+            "soft_touch_force_start": 60.0,
             "side_deadzone": 0.04,
             "target_forward_min": -0.06,
             "target_forward_max": 0.14,
@@ -1708,7 +1710,10 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         }
         self.rewards.s2_contact_proximity = RewTerm(
             func=mdp.dribbling_s2_contact_proximity,
-            weight=2.0,
+            # Eleven window frames can contribute, so 0.5 caps the dense
+            # return near the one-shot +5 new-touch reward instead of
+            # overwhelming it with an easy reset-position score.
+            weight=0.5,
             params=dict(event_params),
         )
         self.rewards.s2_new_touch = RewTerm(
@@ -1719,6 +1724,11 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         self.rewards.s2_correct_side = RewTerm(
             func=mdp.dribbling_s2_correct_side_reward,
             weight=2.0,
+            params=dict(event_params),
+        )
+        self.rewards.s2_touch_force_soft = RewTerm(
+            func=mdp.dribbling_s2_touch_force_soft_penalty,
+            weight=-1.0,
             params=dict(event_params),
         )
         self.rewards.s2_undesired_ball_contact = RewTerm(
@@ -1824,6 +1834,7 @@ def _apply_s2_contact_ablation(cfg, level: str) -> None:
         "s2_contact_proximity",
         "s2_new_touch",
         "s2_correct_side",
+        "s2_touch_force_soft",
         "s2_undesired_ball_contact",
     )
     if level == "motion":

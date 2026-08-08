@@ -10,6 +10,153 @@ import torch
 from rsl_rl.runners.on_policy_runner import OnPolicyRunner as BaseOnPolicyRunner
 
 
+S2_CURRICULUM_INFO_KEY = "s2_curriculum_state"
+_S2_CURRICULUM_SCALAR_NAMES = (
+    "s2_curriculum_level",
+    "_s2_curriculum_episode_count",
+    "_s2_curriculum_fall_count",
+    "_s2_curriculum_contact_success_sum",
+    "_s2_curriculum_side_success_sum",
+    "_s2_curriculum_side_attempt_count",
+    "_s2_curriculum_sequence_success_sum",
+    "_s2_curriculum_sequence_episode_count",
+    "_s2_curriculum_last_contact_success_rate",
+    "_s2_curriculum_last_correct_side_rate",
+    "_s2_curriculum_last_sequence_completion_rate",
+    "_s2_curriculum_last_fall_rate",
+    "_s2_curriculum_last_evaluation_count",
+    "_s2_curriculum_pass_streak",
+    "_s2_curriculum_last_evaluated_level",
+)
+_S2_CURRICULUM_INTEGER_NAMES = {
+    "s2_curriculum_level",
+    "_s2_curriculum_pass_streak",
+    "_s2_curriculum_last_evaluated_level",
+}
+
+
+def _runner_env(target):
+    return getattr(target, "env", target)
+
+
+def _runner_base_env(target):
+    env = _runner_env(target)
+    return getattr(env, "unwrapped", env)
+
+
+def _s2_curriculum_command(target, *, require_active_term: bool = True):
+    base_env = _runner_base_env(target)
+    if require_active_term:
+        curriculum_manager = getattr(base_env, "curriculum_manager", None)
+        active_terms = tuple(getattr(curriculum_manager, "active_terms", ()))
+        if "s2_contact_levels" not in active_terms:
+            return None
+    try:
+        command = base_env.command_manager.get_term("motion")
+    except (AttributeError, KeyError):
+        return None
+    if not isinstance(getattr(command, "s2_curriculum_level", None), torch.Tensor):
+        return None
+    return command
+
+
+def capture_s2_curriculum_state(target) -> dict[str, int | float] | None:
+    """Capture the global S2 curriculum scalars for an RSL-RL checkpoint."""
+    command = _s2_curriculum_command(target)
+    if command is None:
+        return None
+    state: dict[str, int | float] = {"version": 1}
+    for name in _S2_CURRICULUM_SCALAR_NAMES:
+        value = getattr(command, name, None)
+        if not isinstance(value, torch.Tensor) or value.numel() != 1:
+            continue
+        scalar = value.detach().cpu().item()
+        state[name] = int(scalar) if name in _S2_CURRICULUM_INTEGER_NAMES else float(scalar)
+    return state
+
+
+def _reset_runner_env(target) -> None:
+    env = _runner_env(target)
+    reset = getattr(env, "reset", None)
+    if callable(reset):
+        reset()
+        return
+    base_reset = getattr(_runner_base_env(target), "reset", None)
+    if callable(base_reset):
+        base_reset()
+
+
+def set_s2_curriculum_level(
+    target,
+    level: int,
+    *,
+    reset_env: bool = True,
+    clear_statistics: bool = True,
+) -> int:
+    """Set an S2 level for playback or recovery and resample aligned episodes."""
+    command = _s2_curriculum_command(target)
+    if command is None:
+        raise RuntimeError("The active environment does not expose the S2 contact curriculum.")
+    configured_levels = tuple(getattr(command.cfg, "dribble_cg_curriculum_levels", ()))
+    max_level = max(0, len(configured_levels) - 1)
+    resolved_level = min(max(0, int(level)), max_level)
+    command.s2_curriculum_level.fill_(resolved_level)
+    episode_level = getattr(command, "s2_episode_curriculum_level", None)
+    if isinstance(episode_level, torch.Tensor):
+        episode_level.fill_(resolved_level)
+    if clear_statistics:
+        for name in _S2_CURRICULUM_SCALAR_NAMES:
+            if name == "s2_curriculum_level":
+                continue
+            value = getattr(command, name, None)
+            if isinstance(value, torch.Tensor):
+                value.zero_()
+    if reset_env:
+        _reset_runner_env(target)
+    return resolved_level
+
+
+def restore_s2_curriculum_state(
+    target,
+    checkpoint: dict[str, Any],
+    *,
+    reset_env: bool = True,
+) -> bool:
+    """Restore S2 curriculum state stored under the checkpoint ``infos`` field."""
+    command = _s2_curriculum_command(target)
+    if command is None:
+        return False
+    infos = checkpoint.get("infos")
+    state = infos.get(S2_CURRICULUM_INFO_KEY) if isinstance(infos, dict) else None
+    if not isinstance(state, dict):
+        print("[INFO] S2 curriculum: checkpoint has no saved state; starting at level 0.")
+        return False
+
+    configured_levels = tuple(getattr(command.cfg, "dribble_cg_curriculum_levels", ()))
+    max_level = max(0, len(configured_levels) - 1)
+    restored_level = min(max(0, int(state.get("s2_curriculum_level", 0))), max_level)
+    for name in _S2_CURRICULUM_SCALAR_NAMES:
+        if name not in state:
+            continue
+        saved_value = restored_level if name == "s2_curriculum_level" else state[name]
+        current = getattr(command, name, None)
+        dtype = torch.long if name in _S2_CURRICULUM_INTEGER_NAMES else torch.float32
+        if isinstance(current, torch.Tensor) and current.numel() == 1:
+            current.fill_(saved_value)
+        else:
+            setattr(command, name, torch.tensor(saved_value, dtype=dtype, device=command.device))
+    episode_level = getattr(command, "s2_episode_curriculum_level", None)
+    if isinstance(episode_level, torch.Tensor):
+        episode_level.fill_(restored_level)
+    if reset_env:
+        # The environment was initially sampled before the checkpoint load at
+        # level 0. Reset once so robot, ball, command, and recurrent episode
+        # boundary all begin from the restored distribution immediately.
+        _reset_runner_env(target)
+    print(f"[INFO] S2 curriculum: restored level {restored_level} from checkpoint.")
+    return True
+
+
 def _get_alg_policy(runner):
     """Resolve policy module across rsl_rl versions (``alg.policy`` or legacy ``alg.actor_critic``)."""
     alg = runner.alg
@@ -282,7 +429,9 @@ def load_checkpoint_with_obs_expand(runner, path: str, **load_kwargs) -> Any:
     expanded = prepare_loaded_dict_for_obs_expand(loaded_dict, runner)
 
     if not expanded:
-        return BaseOnPolicyRunner.load(runner, path, **load_kwargs)
+        result = BaseOnPolicyRunner.load(runner, path, **load_kwargs)
+        restore_s2_curriculum_state(runner, loaded_dict)
+        return result
 
     fd, tmp_path = tempfile.mkstemp(suffix=".pt")
     os.close(fd)
@@ -290,6 +439,8 @@ def load_checkpoint_with_obs_expand(runner, path: str, **load_kwargs) -> Any:
         torch.save(loaded_dict, tmp_path)
         # Fresh optimizer after input-dim growth; do not restore old Adam state.
         load_kwargs.setdefault("load_optimizer", False)
-        return BaseOnPolicyRunner.load(runner, tmp_path, **load_kwargs)
+        result = BaseOnPolicyRunner.load(runner, tmp_path, **load_kwargs)
+        restore_s2_curriculum_state(runner, loaded_dict)
+        return result
     finally:
         os.remove(tmp_path)

@@ -114,27 +114,27 @@ _register(
 _register(
     "Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference",
     soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg,
-    "G1DribblingRecurrentPPORunnerCfg",
+    "G1DribblingS2RecurrentPPORunnerCfg",
 )
 _register(
     "Tracking-CG-G1-Dribbling-RNN-unified-s2-ablation-motion",
     soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2AblationMotionEnvCfg,
-    "G1DribblingRecurrentPPORunnerCfg",
+    "G1DribblingS2RecurrentPPORunnerCfg",
 )
 _register(
     "Tracking-CG-G1-Dribbling-RNN-unified-s2-ablation-time",
     soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2AblationTimeEnvCfg,
-    "G1DribblingRecurrentPPORunnerCfg",
+    "G1DribblingS2RecurrentPPORunnerCfg",
 )
 _register(
     "Tracking-CG-G1-Dribbling-RNN-unified-s2-ablation-foot",
     soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2AblationFootEnvCfg,
-    "G1DribblingRecurrentPPORunnerCfg",
+    "G1DribblingS2RecurrentPPORunnerCfg",
 )
 _register(
     "Tracking-CG-G1-Dribbling-RNN-unified-s2-ablation-side",
     soccer_dribbling_env_cfg.G1FlatCGDribblingUnifiedS2AblationSideEnvCfg,
-    "G1DribblingRecurrentPPORunnerCfg",
+    "G1DribblingS2RecurrentPPORunnerCfg",
 )
 _register(
     "Tracking-CG-G1-Dribbling-RNN-unified-s3-local-task",

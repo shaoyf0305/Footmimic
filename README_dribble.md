@@ -33,7 +33,11 @@ least 1024 eligible episodes and requires two consecutive passing windows.
 Level 0 requires at least 80% contact success, 75% correct side, and at most
 5% falls. Levels 1--3 require at least 60% completion of their longest
 sequence and at most 5% falls. Promotion is monotonic; there is no automatic
-demotion or manual task switch.
+demotion or manual task switch. New checkpoints also save the active level,
+pass streak, and evaluation-window accumulators. Resume and playback restore
+that state before resampling the first episode. For older checkpoints, or to
+inspect another distribution explicitly, playback accepts
+`--s2_curriculum_level 0..4`.
 
 At reset, all three stages retain the selected reference pelvis pose, yaw, and
 velocity; they do not canonicalize the robot to a simulation/world `+X` axis.
@@ -75,14 +79,23 @@ segment; it never exposes a polar command or IDLE/STOP state to the policy.
 
 S2 converts each labelled inside/outside event to foot-yaw-local left/right.
 Its target region uses forward `[-0.06, 0.14] m`, lateral magnitude
-`[0.04, 0.16] m`, and a 4 cm side dead zone. The only S2 ball terms are contact
-proximity, one new correct-foot touch, correct-side bonus, and wrong-foot/body
-contact penalty. Between events no ball trajectory or velocity is supervised.
+`[0.04, 0.16] m`, and a 4 cm side dead zone. Contact proximity is evaluated in
+the current physical specified-foot yaw frame, while the frozen reference-foot
+region remains a label/visualization aid. Its per-frame weight is normalized
+against the one-shot touch return. The S2 ball terms are contact proximity, one
+new correct-foot touch, correct-side bonus, a continuous impact penalty starting
+at 60 N, and wrong-foot/body contact penalty. The touch remains valid through
+the 100 N hard cap. Between events no ball trajectory or velocity is supervised.
+
+The checked-in `master-single` clip intentionally labels the right foot only:
+S2 learns that foot's inside/outside contacts, not left/right-foot alternation.
 
 Use `--show_s2_contact_regions` during playback to display the frozen reference
 foot frame and the inner/outer side boundaries. Combine it with
 `--diagnostic --diagnostic_stride 1` to save event id/frame, expected foot,
 expected side, reference foot pose, ball offset, and target-region distance.
+The `dribble-v7` diagnostic records both reference-region and actual-foot-region
+distances, plus the restored curriculum level and sampled episode contact count.
 
 The cumulative ablation task IDs are
 `unified-s2-ablation-motion`, `unified-s2-ablation-time`,
@@ -103,7 +116,7 @@ same-side touches feasible when the task requires them.
 
 ## Diagnostic
 
-Run playback with `--diagnostic --diagnostic_stride 1`.  The `dribble-v4`
+Run playback with `--diagnostic --diagnostic_stride 1`.  The `dribble-v7`
 archive records `reference_twist_local`, `active_twist_local`,
 `actual_twist_local`, `twist_local_error`, and `twist_blend_alpha` alongside
 contact and action traces. It also records the virtual style phase, its source

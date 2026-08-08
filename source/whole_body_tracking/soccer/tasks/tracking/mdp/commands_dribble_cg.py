@@ -90,6 +90,8 @@ class DribbleCGMotionCommand(MotionCommand):
             "s2_contact_timing_error",
             "s2_contact_timing_abs_error",
             "s2_target_region_distance",
+            "s2_over_force_count",
+            "s2_dead_zone_count",
             "s2_wrong_foot_count",
             "s2_wrong_side_count",
             "s2_invalid_body_contact_count",

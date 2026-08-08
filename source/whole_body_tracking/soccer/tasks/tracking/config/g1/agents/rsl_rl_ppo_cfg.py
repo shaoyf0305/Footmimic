@@ -68,6 +68,19 @@ class G1DribblingRecurrentPPORunnerCfg(G1FlatRecurrentPPORunnerCfg):
     experiment_name = "g1_dribbling"
 
 
+@configclass
+class G1DribblingS2RecurrentPPORunnerCfg(G1DribblingRecurrentPPORunnerCfg):
+    """S2 PPO settings for precise, bounded contact exploration."""
+
+    policy_std_min: float = 0.10
+    policy_std_max: float = 1.50
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.policy.init_noise_std = 0.6
+        self.algorithm.entropy_coef = 0.001
+
+
 LOW_FREQ_SCALE = 0.5
 
 

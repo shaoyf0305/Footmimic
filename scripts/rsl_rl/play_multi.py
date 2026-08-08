@@ -179,6 +179,16 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--s2_curriculum_level",
+    type=int,
+    choices=range(5),
+    default=None,
+    help=(
+        "Override the S2 playback curriculum level (0..4). By default a new-format "
+        "checkpoint restores its saved level; legacy checkpoints start at level 0."
+    ),
+)
+parser.add_argument(
     "--upper_body_reference_margin",
     type=float,
     default=None,
@@ -268,7 +278,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
-from soccer.utils.checkpoint_loading import load_checkpoint_with_obs_expand
+from soccer.utils.checkpoint_loading import load_checkpoint_with_obs_expand, set_s2_curriculum_level
 
 def motion_frame_count(motion_file: str) -> int:
     """Return the number of frames in a motion .npz file."""
@@ -372,7 +382,7 @@ def get_motion_files(motion_path: str) -> list[str]:
 _BALL_SENSOR_NAME = "soccer_ball_contact"
 _CONTACT_FORCE_THRESHOLD = 1.0
 _LAST_TERM_REASON: str = "-"
-_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v6"
+_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v7"
 
 _ARM_DIAGNOSTIC_JOINT_NAMES = [
     "left_shoulder_pitch_joint",
@@ -933,6 +943,9 @@ def _create_diagnostic(
         "cg_reference_surface": [],
         "cg_contact_foot_match": [],
         "s2_contact_window": [],
+        "s2_curriculum_level": [],
+        "s2_episode_curriculum_level": [],
+        "s2_episode_contact_count": [],
         "s2_contact_event_id": [],
         "s2_contact_event_frame": [],
         "s2_expected_foot": [],
@@ -940,6 +953,10 @@ def _create_diagnostic(
         "s2_reference_foot_pos_w": [],
         "s2_reference_foot_yaw": [],
         "s2_ball_offset_reference_foot": [],
+        "s2_reference_target_region_distance": [],
+        "s2_actual_foot_pos_w": [],
+        "s2_actual_foot_yaw": [],
+        "s2_ball_offset_actual_foot": [],
         "s2_target_region_distance": [],
         "cg_flow_label_available": [],
         "cg_flow_valid": [],
@@ -1216,6 +1233,20 @@ def _append_diagnostic(
     s2_expected_foot = getattr(command, "s2_contact_event_foot_ref", None)
     s2_expected_side = getattr(command, "s2_contact_event_side_ref", None)
     s2_window = getattr(command, "s2_contact_window_ref", None)
+    curriculum_level = getattr(command, "s2_curriculum_level", None)
+    episode_curriculum_level = getattr(command, "s2_episode_curriculum_level", None)
+    episode_contact_count = getattr(command, "s2_episode_contact_count", None)
+    diagnostic["s2_curriculum_level"].append(
+        int(curriculum_level.item()) if isinstance(curriculum_level, torch.Tensor) else -1
+    )
+    diagnostic["s2_episode_curriculum_level"].append(
+        int(episode_curriculum_level[0].item())
+        if isinstance(episode_curriculum_level, torch.Tensor) else -1
+    )
+    diagnostic["s2_episode_contact_count"].append(
+        int(episode_contact_count[0].item())
+        if isinstance(episode_contact_count, torch.Tensor) else 0
+    )
     if isinstance(s2_event_id, torch.Tensor) and hasattr(command, "s2_contact_reference_foot_pose_w"):
         reference_foot_pos, reference_foot_yaw = command.s2_contact_reference_foot_pose_w()
         ball_offset_reference_foot = quat_apply_inverse(
@@ -1224,23 +1255,50 @@ def _append_diagnostic(
         )
         side_deadzone = 0.04
         side_max = 0.16
-        forward = ball_offset_reference_foot[:, 0]
-        lateral = ball_offset_reference_foot[:, 1]
-        forward_error = torch.relu(-0.06 - forward) + torch.relu(forward - 0.14)
-        left_error = torch.relu(side_deadzone - lateral) + torch.relu(lateral - side_max)
-        right_error = torch.relu(-side_max - lateral) + torch.relu(lateral + side_deadzone)
-        side_error = torch.where(s2_expected_side == 0, left_error, right_error)
-        region_distance = torch.sqrt(forward_error.square() + side_error.square())
+
+        def _s2_region_distance(ball_offset: torch.Tensor) -> torch.Tensor:
+            forward = ball_offset[:, 0]
+            lateral = ball_offset[:, 1]
+            forward_error = torch.relu(-0.06 - forward) + torch.relu(forward - 0.14)
+            left_error = torch.relu(side_deadzone - lateral) + torch.relu(lateral - side_max)
+            right_error = torch.relu(-side_max - lateral) + torch.relu(lateral + side_deadzone)
+            side_error = torch.where(s2_expected_side == 0, left_error, right_error)
+            return torch.sqrt(forward_error.square() + side_error.square())
+
+        reference_region_distance = _s2_region_distance(ball_offset_reference_foot)
+        expected_foot_value = int(s2_expected_foot[0].item())
+        if expected_foot_value in (0, 1):
+            foot_name = "right_ankle_roll_link" if expected_foot_value == 1 else "left_ankle_roll_link"
+            actual_foot_index = command.cfg.body_names.index(foot_name)
+            actual_foot_pos = command.robot_body_pos_w[:, actual_foot_index]
+            actual_foot_yaw = yaw_quat(command.robot_body_quat_w[:, actual_foot_index])
+            ball_offset_actual_foot = quat_apply_inverse(
+                actual_foot_yaw,
+                soccer_ball.data.root_pos_w[:, :3] - actual_foot_pos,
+            )
+            actual_region_distance = _s2_region_distance(ball_offset_actual_foot)
+            actual_yaw = _world_quat_to_rpy(actual_foot_yaw)[:, 2]
+            diagnostic["s2_actual_foot_pos_w"].append(_cpu(actual_foot_pos))
+            diagnostic["s2_actual_foot_yaw"].append(float(actual_yaw[0].item()))
+            diagnostic["s2_ball_offset_actual_foot"].append(_cpu(ball_offset_actual_foot))
+            diagnostic["s2_target_region_distance"].append(float(actual_region_distance[0].item()))
+        else:
+            diagnostic["s2_actual_foot_pos_w"].append(np.full(3, np.nan, dtype=np.float32))
+            diagnostic["s2_actual_foot_yaw"].append(np.nan)
+            diagnostic["s2_ball_offset_actual_foot"].append(np.full(3, np.nan, dtype=np.float32))
+            diagnostic["s2_target_region_distance"].append(np.nan)
         diagnostic["s2_contact_window"].append(bool(s2_window[0].item()))
         diagnostic["s2_contact_event_id"].append(int(s2_event_id[0].item()))
         diagnostic["s2_contact_event_frame"].append(int(s2_event_frame[0].item()))
-        diagnostic["s2_expected_foot"].append(int(s2_expected_foot[0].item()))
+        diagnostic["s2_expected_foot"].append(expected_foot_value)
         diagnostic["s2_expected_side"].append(int(s2_expected_side[0].item()))
         diagnostic["s2_reference_foot_pos_w"].append(_cpu(reference_foot_pos))
         reference_yaw = _world_quat_to_rpy(reference_foot_yaw)[:, 2]
         diagnostic["s2_reference_foot_yaw"].append(float(reference_yaw[0].item()))
         diagnostic["s2_ball_offset_reference_foot"].append(_cpu(ball_offset_reference_foot))
-        diagnostic["s2_target_region_distance"].append(float(region_distance[0].item()))
+        diagnostic["s2_reference_target_region_distance"].append(
+            float(reference_region_distance[0].item())
+        )
     else:
         diagnostic["s2_contact_window"].append(False)
         diagnostic["s2_contact_event_id"].append(-1)
@@ -1250,6 +1308,10 @@ def _append_diagnostic(
         diagnostic["s2_reference_foot_pos_w"].append(np.full(3, np.nan, dtype=np.float32))
         diagnostic["s2_reference_foot_yaw"].append(np.nan)
         diagnostic["s2_ball_offset_reference_foot"].append(np.full(3, np.nan, dtype=np.float32))
+        diagnostic["s2_reference_target_region_distance"].append(np.nan)
+        diagnostic["s2_actual_foot_pos_w"].append(np.full(3, np.nan, dtype=np.float32))
+        diagnostic["s2_actual_foot_yaw"].append(np.nan)
+        diagnostic["s2_ball_offset_actual_foot"].append(np.full(3, np.nan, dtype=np.float32))
         diagnostic["s2_target_region_distance"].append(np.nan)
     flow_available = getattr(command, "motion_has_dribble_cg_flow_label", None)
     flow_valid = getattr(command, "dribble_cg_flow_valid_ref", None)
@@ -1697,6 +1759,11 @@ def _save_diagnostic(diagnostic: dict) -> None:
         if np.any(s2_window_mask)
         else np.nan
     )
+    s2_reference_region_distance = (
+        _finite_mean(arrays["s2_reference_target_region_distance"][s2_window_mask])
+        if np.any(s2_window_mask)
+        else np.nan
+    )
     torso_rel_tilt = float(
         np.mean(np.linalg.norm(arrays["torso_minus_pelvis_rpy"][:, :2], axis=1))
     )
@@ -1796,8 +1863,11 @@ def _save_diagnostic(diagnostic: dict) -> None:
     if np.any(s2_window_mask):
         print(
             "[INFO] S2 contact labels: "
+            f"level={int(arrays['s2_curriculum_level'][-1])}  "
+            f"episode_contacts={int(arrays['s2_episode_contact_count'][-1])}  "
             f"window_samples={int(np.count_nonzero(s2_window_mask))}  "
-            f"mean_target_region_distance={s2_region_distance:.3f} m  "
+            f"actual_target_distance={s2_region_distance:.3f} m  "
+            f"reference_target_distance={s2_reference_region_distance:.3f} m  "
             "side_ids=(left=0, right=1, dead/unknown=-1)"
         )
 
@@ -2330,6 +2400,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     load_checkpoint_with_obs_expand(ppo_runner, resume_path)
+    if args_cli.s2_curriculum_level is not None:
+        resolved_level = set_s2_curriculum_level(
+            ppo_runner, args_cli.s2_curriculum_level, reset_env=True
+        )
+        print(f"[INFO] S2 curriculum: playback override set level {resolved_level}.")
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)

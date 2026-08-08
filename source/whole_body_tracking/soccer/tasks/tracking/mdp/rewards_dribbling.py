@@ -845,6 +845,7 @@ def dribbling_s2_contact_event_state(
     require_expected_foot: bool = True,
     target_side_enabled: bool = True,
     max_touch_force: float = 100.0,
+    soft_touch_force_start: float = 60.0,
     side_deadzone: float = 0.04,
     target_forward_min: float = -0.06,
     target_forward_max: float = 0.14,
@@ -875,6 +876,9 @@ def dribbling_s2_contact_event_state(
             "target_region_distance": zero,
             "new_touch": false,
             "correct_side_touch": false,
+            "touch_force_soft_penalty": zero,
+            "over_force": false,
+            "dead_zone": false,
             "wrong_foot": false,
             "wrong_side": false,
             "invalid_body_contact": false,
@@ -922,23 +926,28 @@ def dribbling_s2_contact_event_state(
     ball_from_reference_foot = quat_apply_inverse(
         reference_foot_yaw_w, ball_pos_w - reference_foot_pos_w
     )
-    forward_error = _dribbling_band_error(
-        ball_from_reference_foot[:, 0], target_forward_min, target_forward_max
-    )
-    left_error = _dribbling_band_error(
-        ball_from_reference_foot[:, 1], side_deadzone, target_side_max
-    )
-    right_error = _dribbling_band_error(
-        ball_from_reference_foot[:, 1], -target_side_max, -side_deadzone
-    )
-    labeled_side_error = torch.where(expected_side == 0, left_error, right_error)
-    side_error = (
-        labeled_side_error if target_side_enabled else torch.minimum(left_error, right_error)
-    )
-    target_distance = torch.sqrt(forward_error.square() + side_error.square())
-    proximity = torch.exp(
-        -target_distance.square() / max(float(target_region_std), 1.0e-6) ** 2
-    ) * active.to(torch.float32)
+
+    def _target_region_distance(ball_from_foot: torch.Tensor) -> torch.Tensor:
+        forward_error = _dribbling_band_error(
+            ball_from_foot[:, 0], target_forward_min, target_forward_max
+        )
+        left_error = _dribbling_band_error(
+            ball_from_foot[:, 1], side_deadzone, target_side_max
+        )
+        right_error = _dribbling_band_error(
+            ball_from_foot[:, 1], -target_side_max, -side_deadzone
+        )
+        labeled_side_error = torch.where(expected_side == 0, left_error, right_error)
+        side_error = (
+            labeled_side_error if target_side_enabled else torch.minimum(left_error, right_error)
+        )
+        return torch.sqrt(forward_error.square() + side_error.square())
+
+    # Retain the frozen-reference distance for visualization and offline
+    # auditing, but do not use it as the trainable proximity signal.  The
+    # reset ball is already near that reference region, so rewarding it every
+    # window frame produced a large action-independent return.
+    reference_target_distance = _target_region_distance(ball_from_reference_foot)
 
     has_contact, force_magnitude, closest_body = _identify_contact_body(
         env, command, ball_sensor_name, all_body_cfg
@@ -974,9 +983,14 @@ def dribbling_s2_contact_event_state(
     batch = torch.arange(env.num_envs, device=env.device)
     actual_foot_pos = robot.data.body_pos_w[batch, selected_pose_index]
     actual_foot_yaw = yaw_quat(robot.data.body_quat_w[batch, selected_pose_index])
-    current_lateral = quat_apply_inverse(
+    ball_from_actual_foot = quat_apply_inverse(
         actual_foot_yaw, ball_pos_w - actual_foot_pos
-    )[:, 1]
+    )
+    current_lateral = ball_from_actual_foot[:, 1]
+    target_distance = _target_region_distance(ball_from_actual_foot)
+    proximity = torch.exp(
+        -target_distance.square() / max(float(target_region_std), 1.0e-6) ** 2
+    ) * active.to(torch.float32)
 
     previous_contact = getattr(env, "_dribbling_s2_previous_contact", None)
     previous_lateral = getattr(env, "_dribbling_s2_previous_lateral", None)
@@ -1007,6 +1021,9 @@ def dribbling_s2_contact_event_state(
     )
     force_valid = force_magnitude <= float(max_touch_force)
     selected_foot_valid = correct_foot if require_expected_foot else legal_ankle
+    over_force = (
+        active & new_physical_contact & selected_foot_valid & ~force_valid
+    )
     valid_touch = active & new_physical_contact & selected_foot_valid & force_valid
 
     tracked_event = getattr(env, "_dribbling_s2_tracked_event", None)
@@ -1043,6 +1060,20 @@ def dribbling_s2_contact_event_state(
     new_touch = valid_touch & ~event_succeeded
     correct_side_touch = new_touch & side_known & side_correct
     wrong_side = new_touch & side_known & side_wrong
+    dead_zone = new_touch & side_known & ~side_correct & ~side_wrong
+    if not 0.0 <= float(soft_touch_force_start) < float(max_touch_force):
+        raise ValueError(
+            "soft_touch_force_start must satisfy 0 <= start < max_touch_force; "
+            f"got {soft_touch_force_start} and {max_touch_force}"
+        )
+    force_scale = max(float(max_touch_force) - float(soft_touch_force_start), 1.0e-6)
+    force_excess = torch.relu(force_magnitude - float(soft_touch_force_start)) / force_scale
+    # The hard 100 N validity cap remains binary.  This separate continuous
+    # signal starts at 60 N and grows through (and moderately beyond) the cap,
+    # allowing PPO to learn gentler impacts before a touch becomes invalid.
+    touch_force_soft_penalty = torch.clamp(force_excess, max=2.0) * (
+        active & new_physical_contact & selected_foot_valid
+    ).to(force_excess.dtype)
     event_succeeded = event_succeeded | new_touch
 
     # A full-clip curriculum cannot provide grace frames beyond the source
@@ -1097,6 +1128,8 @@ def dribbling_s2_contact_event_state(
     )
     side_attempt_count = _episode_counter("_dribbling_s2_side_attempt_count", new_touch & side_known)
     correct_side_count = _episode_counter("_dribbling_s2_correct_side_count", correct_side_touch)
+    over_force_count = _episode_counter("_dribbling_s2_over_force_count", over_force)
+    dead_zone_count = _episode_counter("_dribbling_s2_dead_zone_count", dead_zone)
     wrong_foot_count = _episode_counter("_dribbling_s2_wrong_foot_count", wrong_foot)
     wrong_side_count = _episode_counter("_dribbling_s2_wrong_side_count", wrong_side)
     invalid_body_count = _episode_counter("_dribbling_s2_invalid_body_count", invalid_body_contact)
@@ -1136,6 +1169,8 @@ def dribbling_s2_contact_event_state(
     command.metrics["s2_target_region_distance"] = _rate(
         target_distance_sum, target_distance_count
     )
+    command.metrics["s2_over_force_count"] = over_force_count
+    command.metrics["s2_dead_zone_count"] = dead_zone_count
     command.metrics["s2_complete_2"] = (max_streak >= 2).to(torch.float32)
     command.metrics["s2_complete_4"] = (max_streak >= 4).to(torch.float32)
     command.metrics["s2_complete_8"] = (max_streak >= 8).to(torch.float32)
@@ -1146,6 +1181,9 @@ def dribbling_s2_contact_event_state(
         "target_region_distance": target_distance,
         "new_touch": new_touch,
         "correct_side_touch": correct_side_touch,
+        "touch_force_soft_penalty": touch_force_soft_penalty,
+        "over_force": over_force,
+        "dead_zone": dead_zone,
         "wrong_foot": wrong_foot,
         "wrong_side": wrong_side,
         "invalid_body_contact": invalid_body_contact,
@@ -1157,6 +1195,8 @@ def dribbling_s2_contact_event_state(
         "expected_foot": expected_foot,
         "expected_side": expected_side,
         "ball_from_reference_foot": ball_from_reference_foot,
+        "reference_target_region_distance": reference_target_distance,
+        "ball_from_actual_foot": ball_from_actual_foot,
     }
     setattr(env, "_dribbling_s2_contact_event_cache", {
         "step": step.detach().clone(),
@@ -1177,6 +1217,7 @@ def dribbling_s2_contact_proximity(
     require_expected_foot: bool = True,
     target_side_enabled: bool = True,
     max_touch_force: float = 100.0,
+    soft_touch_force_start: float = 60.0,
     side_deadzone: float = 0.04,
     target_forward_min: float = -0.06,
     target_forward_max: float = 0.14,
@@ -1188,7 +1229,7 @@ def dribbling_s2_contact_proximity(
     return dribbling_s2_contact_event_state(
         env, command_name, ball_sensor_name, all_body_cfg, num_ankle_links,
         require_expected_foot, target_side_enabled,
-        max_touch_force, side_deadzone, target_forward_min, target_forward_max,
+        max_touch_force, soft_touch_force_start, side_deadzone, target_forward_min, target_forward_max,
         target_side_max, target_region_std, missed_contact_grace_steps,
     )["contact_proximity"]
 
@@ -1202,6 +1243,7 @@ def dribbling_s2_new_touch_reward(
     require_expected_foot: bool = True,
     target_side_enabled: bool = True,
     max_touch_force: float = 100.0,
+    soft_touch_force_start: float = 60.0,
     side_deadzone: float = 0.04,
     target_forward_min: float = -0.06,
     target_forward_max: float = 0.14,
@@ -1213,7 +1255,7 @@ def dribbling_s2_new_touch_reward(
     return dribbling_s2_contact_event_state(
         env, command_name, ball_sensor_name, all_body_cfg, num_ankle_links,
         require_expected_foot, target_side_enabled,
-        max_touch_force, side_deadzone, target_forward_min, target_forward_max,
+        max_touch_force, soft_touch_force_start, side_deadzone, target_forward_min, target_forward_max,
         target_side_max, target_region_std, missed_contact_grace_steps,
     )["new_touch"].to(torch.float32)
 
@@ -1227,6 +1269,7 @@ def dribbling_s2_correct_side_reward(
     require_expected_foot: bool = True,
     target_side_enabled: bool = True,
     max_touch_force: float = 100.0,
+    soft_touch_force_start: float = 60.0,
     side_deadzone: float = 0.04,
     target_forward_min: float = -0.06,
     target_forward_max: float = 0.14,
@@ -1238,9 +1281,35 @@ def dribbling_s2_correct_side_reward(
     return dribbling_s2_contact_event_state(
         env, command_name, ball_sensor_name, all_body_cfg, num_ankle_links,
         require_expected_foot, target_side_enabled,
-        max_touch_force, side_deadzone, target_forward_min, target_forward_max,
+        max_touch_force, soft_touch_force_start, side_deadzone, target_forward_min, target_forward_max,
         target_side_max, target_region_std, missed_contact_grace_steps,
     )["correct_side_touch"].to(torch.float32)
+
+
+def dribbling_s2_touch_force_soft_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    all_body_cfg: SceneEntityCfg | None = None,
+    num_ankle_links: int = 2,
+    require_expected_foot: bool = True,
+    target_side_enabled: bool = True,
+    max_touch_force: float = 100.0,
+    soft_touch_force_start: float = 60.0,
+    side_deadzone: float = 0.04,
+    target_forward_min: float = -0.06,
+    target_forward_max: float = 0.14,
+    target_side_max: float = 0.16,
+    target_region_std: float = 0.12,
+    missed_contact_grace_steps: int = 3,
+) -> torch.Tensor:
+    """Continuous correct-foot impact penalty above the soft force threshold."""
+    return dribbling_s2_contact_event_state(
+        env, command_name, ball_sensor_name, all_body_cfg, num_ankle_links,
+        require_expected_foot, target_side_enabled,
+        max_touch_force, soft_touch_force_start, side_deadzone, target_forward_min, target_forward_max,
+        target_side_max, target_region_std, missed_contact_grace_steps,
+    )["touch_force_soft_penalty"]
 
 
 def dribbling_s2_undesired_ball_contact_penalty(
@@ -1252,6 +1321,7 @@ def dribbling_s2_undesired_ball_contact_penalty(
     require_expected_foot: bool = True,
     target_side_enabled: bool = True,
     max_touch_force: float = 100.0,
+    soft_touch_force_start: float = 60.0,
     side_deadzone: float = 0.04,
     target_forward_min: float = -0.06,
     target_forward_max: float = 0.14,
@@ -1263,7 +1333,7 @@ def dribbling_s2_undesired_ball_contact_penalty(
     return dribbling_s2_contact_event_state(
         env, command_name, ball_sensor_name, all_body_cfg, num_ankle_links,
         require_expected_foot, target_side_enabled,
-        max_touch_force, side_deadzone, target_forward_min, target_forward_max,
+        max_touch_force, soft_touch_force_start, side_deadzone, target_forward_min, target_forward_max,
         target_side_max, target_region_std, missed_contact_grace_steps,
     )["undesired_contact_penalty"]
 
