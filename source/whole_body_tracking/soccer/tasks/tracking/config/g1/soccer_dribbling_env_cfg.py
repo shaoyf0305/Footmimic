@@ -1622,16 +1622,16 @@ class G1FlatMotionCGPretrainUnifiedS1LocalStrictEnvCfg(G1FlatMotionStrictPretrai
 
 @configclass
 class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
-    """S2: clean/robust single touches, then 2/4/8/full sequences."""
+    """S2: learn contact transitions from two-touch through full sequences."""
 
     dribble_contact_mode: str = "both"
     dribble_contact_surface: str = "instep"
     s2_curriculum_levels: tuple[tuple[tuple[int, float], ...], ...] = (
-        ((1, 1.0),),
-        ((1, 1.0),),
-        ((1, 0.40), (2, 0.60)),
-        ((1, 0.20), (2, 0.30), (4, 0.50)),
-        ((1, 0.10), (2, 0.15), (4, 0.25), (8, 0.25), (0, 0.25)),
+        ((2, 1.0),),
+        ((2, 1.0),),
+        ((2, 0.20), (4, 0.80)),
+        ((4, 0.20), (8, 0.80)),
+        ((8, 0.20), (0, 0.80)),
     )
 
     def __post_init__(self):
@@ -1786,14 +1786,10 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         self.terminations.dribbling_no_contact = None
         if hasattr(self.terminations, "ee_body_pos"):
             self.terminations.ee_body_pos = None
-        missed_contact_params = dict(event_params)
-        # Both single-contact levels terminate on a miss. Multi-contact levels
-        # only record it, matching the staged S2 training plan.
-        missed_contact_params["max_curriculum_level"] = 1
-        self.terminations.missed_contact = DoneTerm(
-            func=mdp.dribbling_missed_contact,
-            params=missed_contact_params,
-        )
+        # Missed events remain part of the sequence metrics, but no longer end
+        # the episode. Every level must expose the policy to the physical state
+        # passed from one contact attempt into the next.
+        self.terminations.missed_contact = None
 
         # The ball always follows physics.  Only the event region, new-touch,
         # side bonus, and undesired-contact terms above supervise it.  Its
@@ -1806,7 +1802,7 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         setattr(
             self.commands.motion,
             "dribble_cg_curriculum_required_contacts",
-            (1, 1, 2, 4, 8),
+            (2, 2, 4, 8, 8),
         )
         setattr(self.commands.motion, "dribble_cg_curriculum_start_level", 0)
         setattr(self.commands.motion, "dribble_cg_pre_contact_seconds_range", (0.3, 0.6))
@@ -1839,9 +1835,6 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         )
         setattr(self.commands.motion, "dribble_cg_ball_spawn_jitter_min", 0.0)
         setattr(self.commands.motion, "dribble_cg_ball_spawn_jitter_max", 0.0)
-        setattr(self.commands.motion, "dribble_cg_hard_replay_min_attempts", 30)
-        setattr(self.commands.motion, "dribble_cg_hard_replay_fraction", 0.30)
-        setattr(self.commands.motion, "dribble_cg_curriculum_audit_probability", 0.25)
         setattr(self.commands.motion, "dribble_cg_require_surface_labels", True)
         setattr(self.commands.motion, "dribble_cg_require_flow_labels", False)
 
@@ -1854,24 +1847,16 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
                 "command_name": "motion",
                 "min_evaluation_episodes": 1024,
                 "required_consecutive_passes": 2,
-                "contact_success_threshold": 0.75,
-                "correct_side_threshold": 0.70,
                 "sequence_completion_threshold": 0.60,
                 "max_fall_rate": 0.05,
                 "fall_termination_terms": ("anchor_pos_z", "anchor_ori"),
-                "event_min_attempts": 30,
-                "event_success_threshold": 0.60,
-                "event_coverage_threshold": 0.80,
-                "plateau_contact_threshold": 0.50,
-                "plateau_windows": 4,
-                "plateau_min_improvement": 0.02,
             },
         )
 
 
 def _apply_s2_contact_ablation(cfg, level: str) -> None:
     """Configure cumulative motion/time/foot/side S2 ablations."""
-    # Ablations remain fixed at the level-0 single-contact distribution so
+    # Ablations remain fixed at the level-0 two-contact distribution so
     # contact supervision is the only independent variable.
     cfg.curriculum.s2_contact_levels = None
     event_term_names = (

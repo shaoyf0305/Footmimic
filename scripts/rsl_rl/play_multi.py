@@ -382,7 +382,7 @@ def get_motion_files(motion_path: str) -> list[str]:
 _BALL_SENSOR_NAME = "soccer_ball_contact"
 _CONTACT_FORCE_THRESHOLD = 1.0
 _LAST_TERM_REASON: str = "-"
-_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v7"
+_DIAGNOSTIC_SCHEMA_VERSION = "dribble-v8"
 
 _ARM_DIAGNOSTIC_JOINT_NAMES = [
     "left_shoulder_pitch_joint",
@@ -796,6 +796,20 @@ def _create_diagnostic(
     )
     reward_manager = getattr(base_env, "reward_manager", None)
     reward_term_names = np.asarray(getattr(reward_manager, "_term_names", []))
+    level_entry_iteration = getattr(
+        command, "_s2_curriculum_level_entry_iteration", None
+    )
+    if isinstance(level_entry_iteration, torch.Tensor):
+        level_entry_iteration = level_entry_iteration.detach().cpu().numpy().copy()
+    else:
+        level_entry_iteration = np.empty(0, dtype=np.int64)
+    checkpoint_iteration = getattr(command, "_s2_training_iteration", None)
+    checkpoint_iteration = (
+        int(checkpoint_iteration.item())
+        if isinstance(checkpoint_iteration, torch.Tensor)
+        and checkpoint_iteration.numel() == 1
+        else -1
+    )
     contact_settings = _diagnostic_contact_settings(base_env)
     constraint_groups = np.asarray([constraint["group"] for constraint in constraints])
     constraint_margins = np.asarray([constraint["margin"] for constraint in constraints], dtype=np.float32)
@@ -853,6 +867,8 @@ def _create_diagnostic(
         "contact_force_threshold": contact_settings["contact_force_threshold"],
         "contact_cg_gated": contact_settings["cg_gated"],
         "contact_cg_surface_gated": contact_settings["cg_surface_gated"],
+        "s2_checkpoint_iteration": checkpoint_iteration,
+        "s2_curriculum_level_entry_iteration": level_entry_iteration,
         "step": [],
         "motion_idx": [],
         "ball_spawn_source": [],
@@ -1900,9 +1916,17 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"latent_clip={latent_clip:.3f}  terminations={terminations} ({reason_summary})"
     )
     if np.any(s2_window_mask):
+        level_history = arrays["s2_curriculum_level_entry_iteration"].astype(
+            np.int64, copy=False
+        )
+        history_summary = ", ".join(
+            f"L{level}={int(iteration)}"
+            for level, iteration in enumerate(level_history.tolist())
+        )
         print(
             "[INFO] S2 contact labels: "
             f"level={int(arrays['s2_curriculum_level'][-1])}  "
+            f"checkpoint_iteration={int(arrays['s2_checkpoint_iteration'])}  "
             f"episode_contacts={int(arrays['s2_episode_contact_count'][-1])}  "
             f"window_samples={int(np.count_nonzero(s2_window_mask))}  "
             f"actual_target_distance={s2_region_distance:.3f} m  "
@@ -1911,6 +1935,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
             f"reference_target_distance={s2_reference_region_distance:.3f} m  "
             "side_ids=(left=0, right=1, dead/unknown=-1)"
         )
+        print(f"[INFO] S2 level entry iterations: {history_summary or 'unavailable'}")
 
 
 def _load_local_twist_command_plan(plan_path: str) -> tuple[list[tuple[float, float, float, float]], bool, bool]:

@@ -38,6 +38,7 @@ _S2_CURRICULUM_TENSOR_NAMES = (
     "_s2_event_success_count",
     "_s2_audit_event_attempt_count",
     "_s2_audit_event_success_count",
+    "_s2_curriculum_level_entry_iteration",
 )
 _S2_CURRICULUM_INTEGER_NAMES = {
     "s2_curriculum_level",
@@ -73,12 +74,65 @@ def _s2_curriculum_command(target, *, require_active_term: bool = True):
     return command
 
 
+def _s2_curriculum_signature(command) -> tuple:
+    """Return the sampling/promotion contract that gives each level meaning."""
+    levels = tuple(
+        tuple((int(count), float(probability)) for count, probability in level)
+        for level in getattr(command.cfg, "dribble_cg_curriculum_levels", ())
+    )
+    required_contacts = tuple(
+        int(count)
+        for count in getattr(
+            command.cfg, "dribble_cg_curriculum_required_contacts", ()
+        )
+    )
+    return levels, required_contacts
+
+
+def set_s2_training_iteration(
+    target,
+    iteration: int,
+    *,
+    initialize_current_level: bool = False,
+) -> bool:
+    """Expose the RSL-RL learning iteration to the environment curriculum.
+
+    ``initialize_current_level`` is reserved for a fresh S2 stage loaded from
+    a checkpoint without S2 curriculum state. Legacy S2 checkpoints keep -1
+    history entries because their earlier promotion iterations are unknowable.
+    """
+    command = _s2_curriculum_command(target)
+    if command is None:
+        return False
+    resolved_iteration = int(iteration)
+    value = getattr(command, "_s2_training_iteration", None)
+    if isinstance(value, torch.Tensor) and value.numel() == 1:
+        value.fill_(resolved_iteration)
+    else:
+        command._s2_training_iteration = torch.tensor(
+            resolved_iteration, dtype=torch.long, device=command.device
+        )
+    if initialize_current_level and resolved_iteration >= 0:
+        history = getattr(command, "_s2_curriculum_level_entry_iteration", None)
+        level = int(command.s2_curriculum_level.item())
+        if (
+            isinstance(history, torch.Tensor)
+            and history.ndim == 1
+            and 0 <= level < history.shape[0]
+        ):
+            history[level] = resolved_iteration
+    return True
+
+
 def capture_s2_curriculum_state(target) -> dict[str, Any] | None:
     """Capture global S2 curriculum and hard-event replay state."""
     command = _s2_curriculum_command(target)
     if command is None:
         return None
-    state: dict[str, Any] = {"version": 3}
+    state: dict[str, Any] = {
+        "version": 5,
+        "curriculum_signature": _s2_curriculum_signature(command),
+    }
     for name in _S2_CURRICULUM_SCALAR_NAMES:
         value = getattr(command, name, None)
         if not isinstance(value, torch.Tensor) or value.numel() != 1:
@@ -129,6 +183,8 @@ def set_s2_curriculum_level(
             if isinstance(value, torch.Tensor):
                 value.zero_()
         for name in _S2_CURRICULUM_TENSOR_NAMES:
+            if name == "_s2_curriculum_level_entry_iteration":
+                continue
             value = getattr(command, name, None)
             if isinstance(value, torch.Tensor):
                 value.zero_()
@@ -152,6 +208,30 @@ def restore_s2_curriculum_state(
     if not isinstance(state, dict):
         print("[INFO] S2 curriculum: checkpoint has no saved state; starting at level 0.")
         return False
+
+    current_signature = _s2_curriculum_signature(command)
+    if state.get("curriculum_signature") != current_signature:
+        # A saved numeric level is not portable across schedules: old level 2
+        # meant a one/two-touch mixture, while the sequence-first schedule's
+        # level 2 is predominantly four touches. Retain policy/optimizer state
+        # but restart only the curriculum so the new level has honest metrics.
+        set_s2_curriculum_level(
+            target,
+            0,
+            reset_env=reset_env,
+            clear_statistics=True,
+        )
+        print(
+            "[INFO] S2 curriculum: checkpoint schedule differs from the active "
+            "schedule; reset curriculum to level 0."
+        )
+        return False
+
+    history = getattr(command, "_s2_curriculum_level_entry_iteration", None)
+    if int(state.get("version", 0)) < 4 and isinstance(history, torch.Tensor):
+        # Earlier checkpoints contain the current level but no trustworthy
+        # promotion timestamps. Preserve that distinction explicitly.
+        history.fill_(-1)
 
     configured_levels = tuple(getattr(command.cfg, "dribble_cg_curriculum_levels", ()))
     max_level = max(0, len(configured_levels) - 1)
@@ -493,7 +573,12 @@ def load_checkpoint_with_obs_expand(runner, path: str, **load_kwargs) -> Any:
 
     if not expanded:
         result = BaseOnPolicyRunner.load(runner, path, **load_kwargs)
-        restore_s2_curriculum_state(runner, loaded_dict)
+        restored_s2_state = restore_s2_curriculum_state(runner, loaded_dict)
+        set_s2_training_iteration(
+            runner,
+            int(loaded_dict.get("iter", -1)),
+            initialize_current_level=not restored_s2_state,
+        )
         if s2_cross_stage_warm_start:
             warm_start_std = getattr(runner, "s2_warm_start_policy_std", None)
             if warm_start_std is not None:
@@ -508,7 +593,12 @@ def load_checkpoint_with_obs_expand(runner, path: str, **load_kwargs) -> Any:
         # Fresh optimizer after input-dim growth; do not restore old Adam state.
         load_kwargs.setdefault("load_optimizer", False)
         result = BaseOnPolicyRunner.load(runner, tmp_path, **load_kwargs)
-        restore_s2_curriculum_state(runner, loaded_dict)
+        restored_s2_state = restore_s2_curriculum_state(runner, loaded_dict)
+        set_s2_training_iteration(
+            runner,
+            int(loaded_dict.get("iter", -1)),
+            initialize_current_level=not restored_s2_state,
+        )
         if s2_cross_stage_warm_start:
             warm_start_std = getattr(runner, "s2_warm_start_policy_std", None)
             if warm_start_std is not None:

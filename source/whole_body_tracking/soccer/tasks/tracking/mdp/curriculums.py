@@ -71,19 +71,19 @@ def s2_contact_level_curriculum(
     plateau_windows: int = 4,
     plateau_min_improvement: float = 0.02,
 ) -> dict[str, torch.Tensor]:
-    """Advance S2 while training on persistently difficult single-touch events.
+    """Advance S2 from short contact transitions into longer sequences.
 
     Isaac Lab calls curriculum terms before resetting the command manager, so
     the terminal episode metrics are still available here. Statistics are
     evaluated in non-overlapping windows. Two passing windows are required by
     default to avoid promoting on one unusually favorable reset batch.
 
-    Single-touch levels require both aggregate mastery and per-event coverage.
-    If aggregate contact exceeds the bootstrap threshold but stops improving,
-    the sampler stays at the same level and enables hard-event replay. Once
-    enabled, hard samples train the policy while a disjoint uniform sample
-    supplies promotion statistics. The curriculum remains global and monotonic;
-    old-level episodes finishing after promotion are ignored until resampled.
+    Sequence levels are evaluated only on the longest sequence sampled at that
+    level; retained shorter sequences train stability without making promotion
+    easier. Optional single-touch configurations retain the legacy per-event
+    coverage and hard-replay path, but the active S2 schedule does not sample
+    isolated contacts. The curriculum remains global and monotonic; old-level
+    episodes finishing after promotion are ignored until resampled.
     """
     command = env.command_manager.get_term(command_name)
     level_tensor = getattr(command, "s2_curriculum_level", None)
@@ -108,6 +108,7 @@ def s2_contact_level_curriculum(
             "hard_replay": zero,
             "plateau_streak": zero,
             "pass_streak": zero,
+            "level_entry_iteration": zero,
         }
 
     float_stats = (
@@ -145,6 +146,22 @@ def s2_contact_level_curriculum(
     level = int(level_tensor.item())
     configured_levels = tuple(getattr(command.cfg, "dribble_cg_curriculum_levels", ()))
     max_level = max(0, len(configured_levels) - 1)
+    level_entry_history = getattr(
+        command, "_s2_curriculum_level_entry_iteration", None
+    )
+    if (
+        not isinstance(level_entry_history, torch.Tensor)
+        or level_entry_history.ndim != 1
+        or level_entry_history.shape[0] != max_level + 1
+    ):
+        level_entry_history = torch.full(
+            (max_level + 1,), -1, dtype=torch.long, device=env.device
+        )
+        setattr(command, "_s2_curriculum_level_entry_iteration", level_entry_history)
+    training_iteration = getattr(command, "_s2_training_iteration", None)
+    if not isinstance(training_iteration, torch.Tensor) or training_iteration.numel() != 1:
+        training_iteration = torch.tensor(-1, dtype=torch.long, device=env.device)
+        setattr(command, "_s2_training_iteration", training_iteration)
     required_contacts = _s2_required_contacts(command, level)
     single_touch_level = required_contacts == 1
 
@@ -372,7 +389,10 @@ def s2_contact_level_curriculum(
         else:
             pass_streak.zero_()
         if int(pass_streak.item()) >= max(1, int(required_consecutive_passes)):
-            level_tensor.fill_(min(level + 1, max_level))
+            promoted_level = min(level + 1, max_level)
+            level_tensor.fill_(promoted_level)
+            if int(training_iteration.item()) >= 0:
+                level_entry_history[promoted_level] = training_iteration
             pass_streak.zero_()
             plateau_streak.zero_()
             hard_replay.zero_()
@@ -429,4 +449,5 @@ def s2_contact_level_curriculum(
         "hard_replay": hard_replay.to(torch.float32),
         "plateau_streak": plateau_streak.to(torch.float32),
         "pass_streak": pass_streak.to(torch.float32),
+        "level_entry_iteration": level_entry_history[level_tensor].to(torch.float32),
     }

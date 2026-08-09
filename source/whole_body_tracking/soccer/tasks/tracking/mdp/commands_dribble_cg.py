@@ -75,6 +75,22 @@ class DribbleCGMotionCommand(MotionCommand):
         self.s2_curriculum_level = torch.tensor(
             start_level, dtype=torch.long, device=env.device
         )
+        configured_levels = tuple(
+            getattr(cfg, "dribble_cg_curriculum_levels", ())
+        )
+        history_size = max(1, len(configured_levels))
+        # Model filenames call RSL-RL learning iterations "epochs". Keep the
+        # exact iteration at which each global level first became active. A
+        # fixed tensor is easy to checkpoint and leaves unknown legacy history
+        # as -1 instead of inventing a transition time.
+        self._s2_curriculum_level_entry_iteration = torch.full(
+            (history_size,), -1, dtype=torch.long, device=env.device
+        )
+        if start_level == 0:
+            self._s2_curriculum_level_entry_iteration[0] = 0
+        self._s2_training_iteration = torch.tensor(
+            -1, dtype=torch.long, device=env.device
+        )
         self.s2_episode_curriculum_level = torch.full(
             (env.num_envs,), start_level, dtype=torch.long, device=env.device
         )
@@ -234,7 +250,10 @@ class DribbleCGMotionCommand(MotionCommand):
             for item in tuple(level_mix)
             if int(item[0]) > 0
         }
-        requested_counts.update((1, 2, 4, 8))
+        # Sequence-first S2 no longer needs to precompute isolated contacts.
+        # Keep the standard retained sequence lengths available even when a
+        # particular level mix does not sample all of them.
+        requested_counts.update((2, 4, 8))
         self._s2_sequence_candidates: dict[int, torch.Tensor] = {}
         for count in requested_counts:
             candidates: list[tuple[int, int]] = []

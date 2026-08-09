@@ -13,6 +13,7 @@ from soccer.utils.checkpoint_loading import (
     S2_CURRICULUM_INFO_KEY,
     capture_s2_curriculum_state,
     load_checkpoint_with_obs_expand,
+    set_s2_training_iteration,
 )
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
@@ -54,6 +55,7 @@ class MotionOnPolicyRunner(OnPolicyRunner):
             raise ValueError("policy_std_min cannot be greater than policy_std_max")
         super().__init__(env, runner_cfg, log_dir, device)
         self.registry_name = registry_name
+        self._install_s2_iteration_bridge()
         self._install_policy_std_clamp()
 
     def _policy_module(self):
@@ -105,6 +107,25 @@ class MotionOnPolicyRunner(OnPolicyRunner):
             return result
 
         self.alg.update = update_and_clamp
+
+    def _sync_s2_training_iteration(self) -> bool:
+        return set_s2_training_iteration(
+            self,
+            int(getattr(self, "current_learning_iteration", 0)),
+        )
+
+    def _install_s2_iteration_bridge(self) -> None:
+        """Publish the exact runner iteration before every rollout action."""
+        if not self._sync_s2_training_iteration():
+            return
+        original_act = self.alg.act
+
+        @wraps(original_act)
+        def act_with_iteration(*args, **kwargs):
+            self._sync_s2_training_iteration()
+            return original_act(*args, **kwargs)
+
+        self.alg.act = act_with_iteration
 
     def save(self, path: str, infos=None):
         """Save the model and training information."""

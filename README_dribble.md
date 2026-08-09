@@ -14,11 +14,11 @@ bash shell/progressive_dribbling_train.sh my_run --cg-unified-3stage
 | Stage | Task ID | Objective |
 | --- | --- | --- |
 | S1 | `Tracking-CG-G1-Motion-RNN-unified-s1-local-strict` | Strict relative motion/gait imitation and exact reference local twist; no ball objective. |
-| S2 | `Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference` | One task whose Isaac Lab curriculum automatically advances through one/two/four/eight/full-contact levels. |
+| S2 | `Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference` | One task whose Isaac Lab curriculum automatically advances through two/four/eight/full-contact sequences. |
 | S3 | `Tracking-CG-G1-Dribbling-RNN-unified-s3-local-task` | Sampled local task twist with generic physical `instep` contacts; no reference ball position, contact time, contact foot, or foot--ball distance reward. |
 
 S1 preserves the raw clip and emits a time-limit `done` on its final frame.
-S2 starts at one contact and automatically advances through five levels in
+S2 starts at two adjacent contacts and automatically advances through five levels in
 the same run. Short samples start 0.3--0.6 s before their first selected event
 and end after the last selected contact window; the final level also includes
 complete-clip samples. The normal environment reset resets robot, ball, and
@@ -26,22 +26,21 @@ LSTM state together. S3 instead loops the same master clip through a
 25-frame (0.5 s at 50 Hz) quintic bridge, blending its tail into its start
 without resetting the ongoing task scene.
 
-The S2 level distributions are 100% one contact; 100% disturbed one contact;
-40/60% one/two; 20/30/50% one/two/four; and 10/15/25/25/25%
-one/two/four/eight/full clip. The curriculum evaluates non-overlapping windows
-of at least 1024 eligible episodes and requires two consecutive passing
-windows. Both single-touch levels require at least 75% contact success, 70%
-correct side, 80% event coverage, and at most 5% falls. A covered event needs
-at least 30 attempts and 60% success. Sequence levels require at least 60%
-completion of their longest sequence and at most 5% falls. If single-touch
-learning plateaus, 75% of subsequent samples train on hard events while a
-disjoint 25% remains uniformly sampled; only that uniform audit controls
-promotion. Promotion is monotonic; there is no automatic demotion or manual
-task switch. New checkpoints also save the active level, pass streak,
-evaluation-window accumulators, and replay/audit event statistics. Resume and
-playback restore that state before resampling the first episode. For older
-checkpoints, or to inspect another distribution explicitly, playback accepts
-`--s2_curriculum_level 0..4`.
+The S2 level distributions are 100% two contacts; 100% disturbed two contacts;
+20/80% two/four; 20/80% four/eight; and 20/80% eight/full clip. No curriculum
+level samples an isolated contact. Missed events are recorded but never end an
+episode, so every rollout preserves the physical transition into later contact
+attempts. The curriculum evaluates non-overlapping windows of at least 1024
+eligible longest-sequence episodes and requires two consecutive passing
+windows. Levels 0--3 require at least 60% completion of their longest sequence
+and at most 5% falls. Promotion is monotonic; there is no automatic demotion or
+manual task switch. New checkpoints save the active level, pass streak,
+evaluation-window accumulators, level-entry history, and a signature of the
+level schedule. Resume and playback restore that state before resampling the
+first episode. A checkpoint from the former single-contact schedule retains its
+policy and optimizer but resets the incompatible curriculum state to the new
+level 0. Playback accepts `--s2_curriculum_level 0..4` to inspect another
+distribution explicitly.
 
 At reset, all three stages retain the selected reference pelvis pose, yaw, and
 velocity; they do not canonicalize the robot to a simulation/world `+X` axis.
@@ -113,16 +112,19 @@ Use `--show_s2_contact_regions` during playback to display the frozen reference
 foot frame, coarse front ramp, and expected lateral half-space. Combine it with
 `--diagnostic --diagnostic_stride 1` to save event id/frame, expected foot,
 expected side, reference foot pose, ball offset, physical ball-foot distance,
-front-gate value, and proximity error. The `dribble-v7` diagnostic also records
-the restored curriculum level, uniform-audit flag, sampled episode contact
-count, and cumulative premature-contact count.
+front-gate value, and proximity error. The `dribble-v8` diagnostic also records
+the checkpoint iteration and `s2_curriculum_level_entry_iteration`: the exact
+RSL-RL learning iteration at which every future level first became active.
+Unknown history from an older checkpoint remains `-1`. The trace retains the
+restored curriculum level, uniform-audit flag, sampled episode contact count,
+and cumulative premature-contact count.
 
 The cumulative ablation task IDs are
 `unified-s2-ablation-motion`, `unified-s2-ablation-time`,
 `unified-s2-ablation-foot`, and `unified-s2-ablation-side` (all prefixed by
 `Tracking-CG-G1-Dribbling-RNN-`). They respectively add contact timing,
 specified-foot gating, and foot-local side gating while keeping the same
-single-contact initialization distribution.
+two-contact initialization distribution.
 
 The S2 contact-curriculum task requires valid `dribble_cg_contact`,
 `dribble_cg_foot`, `dribble_cg_surface`, and `ball_pos_w` arrays. At this
@@ -136,7 +138,7 @@ same-side touches feasible when the task requires them.
 
 ## Diagnostic
 
-Run playback with `--diagnostic --diagnostic_stride 1`.  The `dribble-v7`
+Run playback with `--diagnostic --diagnostic_stride 1`.  The `dribble-v8`
 archive records `reference_twist_local`, `active_twist_local`,
 `actual_twist_local`, `twist_local_error`, and `twist_blend_alpha` alongside
 contact and action traces. It also records the virtual style phase, its source
