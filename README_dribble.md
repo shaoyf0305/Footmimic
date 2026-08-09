@@ -26,25 +26,30 @@ LSTM state together. S3 instead loops the same master clip through a
 25-frame (0.5 s at 50 Hz) quintic bridge, blending its tail into its start
 without resetting the ongoing task scene.
 
-The S2 level distributions are 100% one contact; 30/70% one/two; 20/30/50%
-one/two/four; 10/20/30/40% one/two/four/eight; and 10/20/30/40%
-one/two/four/full clip. The curriculum evaluates non-overlapping windows of at
-least 1024 eligible episodes and requires two consecutive passing windows.
-Level 0 requires at least 80% contact success, 75% correct side, and at most
-5% falls. Levels 1--3 require at least 60% completion of their longest
-sequence and at most 5% falls. Promotion is monotonic; there is no automatic
-demotion or manual task switch. New checkpoints also save the active level,
-pass streak, and evaluation-window accumulators. Resume and playback restore
-that state before resampling the first episode. For older checkpoints, or to
-inspect another distribution explicitly, playback accepts
+The S2 level distributions are 100% one contact; 100% disturbed one contact;
+40/60% one/two; 20/30/50% one/two/four; and 10/15/25/25/25%
+one/two/four/eight/full clip. The curriculum evaluates non-overlapping windows
+of at least 1024 eligible episodes and requires two consecutive passing
+windows. Both single-touch levels require at least 75% contact success, 70%
+correct side, 80% event coverage, and at most 5% falls. A covered event needs
+at least 30 attempts and 60% success. Sequence levels require at least 60%
+completion of their longest sequence and at most 5% falls. If single-touch
+learning plateaus, 75% of subsequent samples train on hard events while a
+disjoint 25% remains uniformly sampled; only that uniform audit controls
+promotion. Promotion is monotonic; there is no automatic demotion or manual
+task switch. New checkpoints also save the active level, pass streak,
+evaluation-window accumulators, and replay/audit event statistics. Resume and
+playback restore that state before resampling the first episode. For older
+checkpoints, or to inspect another distribution explicitly, playback accepts
 `--s2_curriculum_level 0..4`.
 
 At reset, all three stages retain the selected reference pelvis pose, yaw, and
 velocity; they do not canonicalize the robot to a simulation/world `+X` axis.
-For S2 the physical ball is initialized at the selected first contact target
-with a 5--8 cm planar perturbation. Internally this point is stored as a
-pelvis-local offset, so the same reset geometry remains valid under any
-simulator yaw. If a motion lacks either a contact label or
+For S2 the physical ball is initialized at the selected first contact target.
+Level 0 uses the exact reset; later levels add their configured one-time planar
+perturbation. Internally this point is stored as a pelvis-local offset, so the
+same reset geometry remains valid under any simulator yaw. If a motion lacks
+either a contact label or
 `ball_pos_w`, the explicit fallback is 0.45 m ahead in the frame-0 pelvis
 local frame. S1 applies no ball reward; it retains this identical spawn only
 because the unified 163-D observation contains the ball-relative input.
@@ -78,24 +83,39 @@ segment; it never exposes a polar command or IDLE/STOP state to the policy.
 ## Contact semantics
 
 S2 converts each labelled inside/outside event to foot-yaw-local left/right.
-Its target region uses forward `[-0.06, 0.14] m`, lateral magnitude
-`[0.04, 0.16] m`, and a 4 cm side dead zone. Contact proximity is evaluated in
-the current physical specified-foot yaw frame, while the frozen reference-foot
-region remains a label/visualization aid. Its per-frame weight is normalized
-against the one-shot touch return. The S2 ball terms are contact proximity, one
-new correct-foot touch, correct-side bonus, a continuous impact penalty starting
-at 60 N, and wrong-foot/body contact penalty. The touch remains valid through
-the 100 N hard cap. Between events no ball trajectory or velocity is supervised.
+Contact proximity uses only the physical ball relative to the actual specified
+foot: distance beyond the 0.25 m contact reach and the labelled lateral
+half-space beyond a 4 cm dead zone. A coarse one-sided front gate ramps from
+zero at -0.05 m to full at +0.05 m in the foot-yaw frame. It has no forward
+target coordinate or upper forward bound; it exists only to suppress dense
+reward from keeping the ball behind the foot. Starting 0.30 s before the event,
+contact proximity ramps from 0.2 to full strength and stops accumulating after
+the first valid touch. During the contact window the support foot keeps its
+reference target while the contact foot's imitation weight falls to 0.1. A
+correct-side touch is decided from the physical ball's current collision-frame
+lateral sign and dead zone, without a forward-position condition or lateral
+upper bound. The S2 ball terms remain
+contact proximity, one new correct-foot touch, correct-side bonus, a continuous
+impact penalty starting at 80 N, and undesired-contact penalty. The touch remains
+valid through the 150 N hard cap; premature touches reuse the existing
+undesired-contact term at half strength. Between events no reference ball
+trajectory or velocity is supervised.
+
+When S2 loads an S1 checkpoint, policy/LSTM weights and observation normalizers
+are retained, but the S1 optimizer state is not loaded and Gaussian exploration
+is reset to standard deviation 0.40. Resuming an S2 checkpoint retains its
+optimizer, learned exploration, and curriculum state.
 
 The checked-in `master-single` clip intentionally labels the right foot only:
 S2 learns that foot's inside/outside contacts, not left/right-foot alternation.
 
 Use `--show_s2_contact_regions` during playback to display the frozen reference
-foot frame and the inner/outer side boundaries. Combine it with
+foot frame, coarse front ramp, and expected lateral half-space. Combine it with
 `--diagnostic --diagnostic_stride 1` to save event id/frame, expected foot,
-expected side, reference foot pose, ball offset, and target-region distance.
-The `dribble-v7` diagnostic records both reference-region and actual-foot-region
-distances, plus the restored curriculum level and sampled episode contact count.
+expected side, reference foot pose, ball offset, physical ball-foot distance,
+front-gate value, and proximity error. The `dribble-v7` diagnostic also records
+the restored curriculum level, uniform-audit flag, sampled episode contact
+count, and cumulative premature-contact count.
 
 The cumulative ablation task IDs are
 `unified-s2-ablation-motion`, `unified-s2-ablation-time`,

@@ -1654,10 +1654,10 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         _apply_local_reference_ball_objectives(self)
         _disable_s2_unreliable_ball_penalties(self)
 
-        # S2 keeps one foot imitation objective: normal reference tracking
-        # outside contact windows and a softened, but still useful, 0.6
-        # multiplier inside them.  The former 0.3 scale allowed roughly
-        # 15 cm of foot/reference drift, enough to invert the actual side.
+        # S2 keeps normal two-foot imitation outside contact windows. During
+        # contact it preserves the support-foot target and nearly releases
+        # only the labelled contact foot so physics can determine its final
+        # ball-relative placement.
         self.rewards.motion_foot_pos = None
         self.rewards.dribbling_gait_foot_tracking = None
         if hasattr(self.rewards, "foot_distance"):
@@ -1669,7 +1669,7 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
                 "command_name": "motion",
                 "std": 0.30,
                 "foot_body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
-                "contact_window_scale": 0.60,
+                "contact_foot_scale": 0.10,
             },
         )
 
@@ -1697,15 +1697,20 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
             "num_ankle_links": num_ankle_links,
             "require_expected_foot": True,
             "target_side_enabled": True,
-            # A continuous soft penalty starts at 60 N below this hard
-            # validity cap. Ordinary touches remain valid through 100 N.
-            "max_touch_force": 100.0,
-            "soft_touch_force_start": 60.0,
+            # Keep a soft force cost, but do not reject ordinary first-impact
+            # peaks that fall between the old 100 N cap and 150 N.
+            "max_touch_force": 150.0,
+            "soft_touch_force_start": 80.0,
             "side_deadzone": 0.04,
-            "target_forward_min": -0.06,
-            "target_forward_max": 0.14,
-            "target_side_max": 0.16,
+            # Physical reach is measured from the actual expected foot. The
+            # one-sided front ramp only suppresses ball-behind-foot exploits;
+            # it does not prescribe a forward target or an upper bound.
+            "proximity_contact_distance_max": 0.25,
+            "proximity_front_gate_min": -0.05,
+            "proximity_front_gate_full": 0.05,
             "target_region_std": 0.12,
+            "proximity_approach_seconds": 0.30,
+            "proximity_approach_min_weight": 0.20,
             "missed_contact_grace_steps": 3,
         }
         self.rewards.s2_contact_proximity = RewTerm(
@@ -1718,12 +1723,12 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         )
         self.rewards.s2_new_touch = RewTerm(
             func=mdp.dribbling_s2_new_touch_reward,
-            weight=5.0,
+            weight=10.0,
             params=dict(event_params),
         )
         self.rewards.s2_correct_side = RewTerm(
             func=mdp.dribbling_s2_correct_side_reward,
-            weight=2.0,
+            weight=4.0,
             params=dict(event_params),
         )
         self.rewards.s2_touch_force_soft = RewTerm(
@@ -1836,7 +1841,7 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         setattr(self.commands.motion, "dribble_cg_ball_spawn_jitter_max", 0.0)
         setattr(self.commands.motion, "dribble_cg_hard_replay_min_attempts", 30)
         setattr(self.commands.motion, "dribble_cg_hard_replay_fraction", 0.30)
-        setattr(self.commands.motion, "dribble_cg_hard_replay_probability", 0.70)
+        setattr(self.commands.motion, "dribble_cg_curriculum_audit_probability", 0.25)
         setattr(self.commands.motion, "dribble_cg_require_surface_labels", True)
         setattr(self.commands.motion, "dribble_cg_require_flow_labels", False)
 
@@ -1881,7 +1886,7 @@ def _apply_s2_contact_ablation(cfg, level: str) -> None:
             if hasattr(cfg.rewards, name):
                 setattr(cfg.rewards, name, None)
         if hasattr(cfg.rewards, "s2_windowed_foot_tracking"):
-            cfg.rewards.s2_windowed_foot_tracking.params["contact_window_scale"] = 1.0
+            cfg.rewards.s2_windowed_foot_tracking.params["contact_foot_scale"] = 1.0
         if hasattr(cfg.terminations, "missed_contact"):
             cfg.terminations.missed_contact = None
         if hasattr(cfg.terminations, "ball_lost"):

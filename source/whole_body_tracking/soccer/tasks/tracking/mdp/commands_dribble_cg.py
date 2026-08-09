@@ -78,6 +78,13 @@ class DribbleCGMotionCommand(MotionCommand):
         self.s2_episode_curriculum_level = torch.full(
             (env.num_envs,), start_level, dtype=torch.long, device=env.device
         )
+        # True episodes are drawn uniformly and are the only samples allowed
+        # to update promotion statistics once hard-event replay is enabled.
+        # Before replay starts every episode is uniform, so every episode is
+        # also an audit episode.
+        self.s2_episode_curriculum_audit = torch.ones(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
         # Reward-side event state uses this generation instead of relying on
         # manager-specific episode_length_buf reset ordering.
         self.s2_episode_generation = torch.zeros(
@@ -97,6 +104,7 @@ class DribbleCGMotionCommand(MotionCommand):
             "s2_dead_zone_count",
             "s2_wrong_foot_count",
             "s2_wrong_side_count",
+            "s2_premature_contact_count",
             "s2_invalid_body_contact_count",
             "s2_complete_2",
             "s2_complete_4",
@@ -208,6 +216,12 @@ class DribbleCGMotionCommand(MotionCommand):
             event_stat_shape, dtype=torch.float32, device=self.device
         )
         self._s2_event_success_count = torch.zeros_like(self._s2_event_attempt_count)
+        self._s2_audit_event_attempt_count = torch.zeros_like(
+            self._s2_event_attempt_count
+        )
+        self._s2_audit_event_success_count = torch.zeros_like(
+            self._s2_event_attempt_count
+        )
         self._s2_hard_replay_enabled = torch.zeros(
             (), dtype=torch.long, device=self.device
         )
@@ -273,6 +287,51 @@ class DribbleCGMotionCommand(MotionCommand):
     def s2_contact_window_ref(self) -> torch.Tensor:
         return self.s2_contact_event_id_ref >= 0
 
+    def s2_upcoming_contact_event_ref(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the next selected event's id, frame, foot, and local side.
+
+        Unlike the contact-window properties above, this lookup remains valid
+        throughout the pre-contact part of an episode.  It exposes only the
+        event label; no reference ball or reference foot position is used.
+        Invalid entries are returned as ``-1``.
+        """
+        event_slots = torch.arange(
+            self._s2_event_frames_padded.shape[1], device=self.device
+        ).unsqueeze(0)
+        selected_first = self.s2_episode_first_event_index.unsqueeze(1)
+        selected_count = self.s2_episode_contact_count.unsqueeze(1)
+        selected = (
+            (selected_first >= 0)
+            & (event_slots >= selected_first)
+            & (event_slots < selected_first + selected_count)
+        )
+        event_frames = self._s2_event_frames_padded[self.motion_idx]
+        upcoming = selected & (event_frames >= self.time_steps.unsqueeze(1))
+        frame_delta = torch.where(
+            upcoming,
+            event_frames - self.time_steps.unsqueeze(1),
+            torch.full_like(event_frames, torch.iinfo(event_frames.dtype).max),
+        )
+        event_slot = torch.argmin(frame_delta, dim=1)
+        batch = torch.arange(self.num_envs, device=self.device)
+        valid = torch.any(upcoming, dim=1)
+        event_frame = event_frames[batch, event_slot]
+        event_foot = self.motion.dribble_cg_foot[
+            self.motion_idx, event_frame.clamp(min=0)
+        ].to(torch.long)
+        event_side = self._s2_event_side[
+            self.motion_idx, event_frame.clamp(min=0)
+        ].to(torch.long)
+        invalid = torch.full_like(event_slot, -1)
+        return (
+            torch.where(valid, event_slot, invalid),
+            torch.where(valid, event_frame, invalid),
+            torch.where(valid, event_foot, invalid),
+            torch.where(valid, event_side, invalid),
+        )
+
     def s2_contact_reference_foot_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the selected event's frozen reference foot position/yaw.
 
@@ -336,6 +395,9 @@ class DribbleCGMotionCommand(MotionCommand):
             group_size = group_env_ids.numel()
             if group_size == 0:
                 continue
+            uniform_audit = torch.ones(
+                group_size, dtype=torch.bool, device=self.device
+            )
 
             selected_motion = torch.empty(group_size, dtype=torch.long, device=self.device)
             sequence_start = torch.zeros(group_size, dtype=torch.long, device=self.device)
@@ -372,9 +434,11 @@ class DribbleCGMotionCommand(MotionCommand):
                 sampled_indices = torch.randint(
                     candidates.shape[0], (group_size,), device=self.device
                 )
-                # Once level-local performance has plateaued, draw most
-                # single-contact episodes from the lowest-success sufficiently
-                # sampled events while retaining a uniform replay fraction.
+                # Once level-local performance has plateaued, split single-
+                # contact episodes into a uniform promotion audit and a hard-
+                # event training pool.  Only the audit pool is allowed to
+                # update promotion statistics, so replay cannot lower its own
+                # measured pass rate by oversampling weak events.
                 hard_replay = bool(
                     requested_count == 1
                     and int(getattr(self, "_s2_hard_replay_enabled", torch.zeros(())).item()) > 0
@@ -416,20 +480,21 @@ class DribbleCGMotionCommand(MotionCommand):
                             success_rate, k=hard_count, largest=False
                         ).indices
                         hard_indices = eligible[hard_local]
-                        hard_probability = min(
+                        audit_probability = min(
                             1.0,
                             max(
                                 0.0,
                                 float(
                                     getattr(
-                                        self.cfg, "dribble_cg_hard_replay_probability", 0.70
+                                        self.cfg, "dribble_cg_curriculum_audit_probability", 0.25
                                     )
                                 ),
                             ),
                         )
-                        hard_draw = (
-                            torch.rand(group_size, device=self.device) < hard_probability
+                        uniform_audit = (
+                            torch.rand(group_size, device=self.device) < audit_probability
                         )
+                        hard_draw = ~uniform_audit
                         hard_draw_count = int(hard_draw.sum().item())
                         if hard_draw_count > 0:
                             sampled_indices[hard_draw] = hard_indices[
@@ -470,6 +535,7 @@ class DribbleCGMotionCommand(MotionCommand):
             self.s2_episode_contact_count[group_env_ids] = actual_count
             self.s2_episode_first_event_index[group_env_ids] = sequence_start
             self.s2_episode_curriculum_level[group_env_ids] = level
+            self.s2_episode_curriculum_audit[group_env_ids] = uniform_audit
         return True
 
     def _uniform_sampling(self, env_ids: Sequence[int]):
@@ -485,6 +551,7 @@ class DribbleCGMotionCommand(MotionCommand):
         self.s2_episode_contact_count[ids] = 0
         self.s2_episode_first_event_index[ids] = -1
         self.s2_episode_curriculum_level[ids] = int(self.s2_curriculum_level.item())
+        self.s2_episode_curriculum_audit[ids] = True
 
     def _resample_command(self, env_ids: Sequence[int]):
         ids = self._to_env_id_tensor(env_ids)
@@ -530,19 +597,15 @@ class DribbleCGMotionCommand(MotionCommand):
         hidden_foot_pos[~active, 2] = -100.0
         self.s2_contact_event_foot_visualizer.visualize(hidden_foot_pos, foot_yaw)
 
-        # Four frames mark the target rectangle corners.  +Y is visibly the
-        # foot's local left axis, so the expected side can be audited without
-        # relying on a world-frame convention.
+        # Four frames show the coarse front ramp (-5 to +5 cm), the 4 cm
+        # lateral boundary, and the unbounded expected-side direction. +Y is
+        # the foot's local left axis; these are guides, not a target rectangle.
         side_sign = torch.where(side == 0, torch.ones_like(side), -torch.ones_like(side)).to(foot_pos.dtype)
         local_corners = foot_pos.new_zeros((self.num_envs, 4, 3))
-        local_corners[:, 0, 0] = -0.06
-        local_corners[:, 1, 0] = -0.06
-        local_corners[:, 2, 0] = 0.14
-        local_corners[:, 3, 0] = 0.14
-        local_corners[:, 0, 1] = side_sign * 0.04
-        local_corners[:, 1, 1] = side_sign * 0.16
+        local_corners[:, 0, 0] = -0.05
+        local_corners[:, 1, 0] = 0.05
         local_corners[:, 2, 1] = side_sign * 0.04
-        local_corners[:, 3, 1] = side_sign * 0.16
+        local_corners[:, 3, 1] = side_sign * 0.20
         corner_yaw = foot_yaw[:, None, :].expand(-1, 4, -1)
         corners = foot_pos[:, None, :] + quat_apply(
             corner_yaw.reshape(-1, 4), local_corners.reshape(-1, 3)
@@ -989,7 +1052,7 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     dribble_cg_curriculum_required_contacts: tuple[int, ...] = ()
     dribble_cg_hard_replay_min_attempts: int = 30
     dribble_cg_hard_replay_fraction: float = 0.30
-    dribble_cg_hard_replay_probability: float = 0.70
+    dribble_cg_curriculum_audit_probability: float = 0.25
     dribble_cg_s2_debug_regions_only: bool = False
     # ``None`` preserves the historical mixed-foot CG behavior. Unified
     # training sets this to one side and validates every motion at startup.

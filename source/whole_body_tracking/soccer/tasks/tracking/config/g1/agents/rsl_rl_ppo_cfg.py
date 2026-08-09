@@ -74,10 +74,12 @@ class G1DribblingS2RecurrentPPORunnerCfg(G1DribblingRecurrentPPORunnerCfg):
 
     policy_std_min: float = 0.10
     policy_std_max: float = 1.50
+    s2_warm_start_reset_optimizer: bool = True
+    s2_warm_start_policy_std: float = 0.40
 
     def __post_init__(self):
         super().__post_init__()
-        self.policy.init_noise_std = 0.6
+        self.policy.init_noise_std = 0.40
         self.algorithm.entropy_coef = 0.001
 
 

@@ -174,8 +174,8 @@ parser.add_argument(
     action="store_true",
     default=False,
     help=(
-        "Show the active S2 reference-foot frame and the inner/outer boundaries "
-        "of its expected left/right ball region."
+        "Show the active S2 reference-foot frame, coarse front gate, and "
+        "expected left/right half-space."
     ),
 )
 parser.add_argument(
@@ -945,7 +945,9 @@ def _create_diagnostic(
         "s2_contact_window": [],
         "s2_curriculum_level": [],
         "s2_episode_curriculum_level": [],
+        "s2_episode_curriculum_audit": [],
         "s2_episode_contact_count": [],
+        "s2_premature_contact_count": [],
         "s2_contact_event_id": [],
         "s2_contact_event_frame": [],
         "s2_expected_foot": [],
@@ -958,6 +960,8 @@ def _create_diagnostic(
         "s2_actual_foot_yaw": [],
         "s2_ball_offset_actual_foot": [],
         "s2_target_region_distance": [],
+        "s2_proximity_front_gate": [],
+        "s2_physical_foot_ball_distance": [],
         "cg_flow_label_available": [],
         "cg_flow_valid": [],
         "cg_flow_anchor_frame": [],
@@ -1235,6 +1239,7 @@ def _append_diagnostic(
     s2_window = getattr(command, "s2_contact_window_ref", None)
     curriculum_level = getattr(command, "s2_curriculum_level", None)
     episode_curriculum_level = getattr(command, "s2_episode_curriculum_level", None)
+    episode_curriculum_audit = getattr(command, "s2_episode_curriculum_audit", None)
     episode_contact_count = getattr(command, "s2_episode_contact_count", None)
     diagnostic["s2_curriculum_level"].append(
         int(curriculum_level.item()) if isinstance(curriculum_level, torch.Tensor) else -1
@@ -1243,9 +1248,18 @@ def _append_diagnostic(
         int(episode_curriculum_level[0].item())
         if isinstance(episode_curriculum_level, torch.Tensor) else -1
     )
+    diagnostic["s2_episode_curriculum_audit"].append(
+        bool(episode_curriculum_audit[0].item())
+        if isinstance(episode_curriculum_audit, torch.Tensor) else True
+    )
     diagnostic["s2_episode_contact_count"].append(
         int(episode_contact_count[0].item())
         if isinstance(episode_contact_count, torch.Tensor) else 0
+    )
+    premature_contact_count = command.metrics.get("s2_premature_contact_count")
+    diagnostic["s2_premature_contact_count"].append(
+        float(premature_contact_count[0].item())
+        if isinstance(premature_contact_count, torch.Tensor) else 0.0
     )
     if isinstance(s2_event_id, torch.Tensor) and hasattr(command, "s2_contact_reference_foot_pose_w"):
         reference_foot_pos, reference_foot_yaw = command.s2_contact_reference_foot_pose_w()
@@ -1253,19 +1267,22 @@ def _append_diagnostic(
             reference_foot_yaw,
             soccer_ball.data.root_pos_w[:, :3] - reference_foot_pos,
         )
-        side_deadzone = 0.04
-        side_max = 0.16
+        def _s2_proximity_geometry(
+            ball_offset: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            physical_distance = torch.linalg.vector_norm(ball_offset, dim=-1)
+            reach_error = torch.relu(physical_distance - 0.25)
+            signed_lateral = torch.where(
+                s2_expected_side == 0, ball_offset[:, 1], -ball_offset[:, 1]
+            )
+            side_error = torch.relu(0.04 - signed_lateral)
+            target_distance = torch.sqrt(reach_error.square() + side_error.square())
+            front_gate = torch.clamp((ball_offset[:, 0] + 0.05) / 0.10, 0.0, 1.0)
+            return target_distance, front_gate, physical_distance
 
-        def _s2_region_distance(ball_offset: torch.Tensor) -> torch.Tensor:
-            forward = ball_offset[:, 0]
-            lateral = ball_offset[:, 1]
-            forward_error = torch.relu(-0.06 - forward) + torch.relu(forward - 0.14)
-            left_error = torch.relu(side_deadzone - lateral) + torch.relu(lateral - side_max)
-            right_error = torch.relu(-side_max - lateral) + torch.relu(lateral + side_deadzone)
-            side_error = torch.where(s2_expected_side == 0, left_error, right_error)
-            return torch.sqrt(forward_error.square() + side_error.square())
-
-        reference_region_distance = _s2_region_distance(ball_offset_reference_foot)
+        reference_region_distance, _, _ = _s2_proximity_geometry(
+            ball_offset_reference_foot
+        )
         expected_foot_value = int(s2_expected_foot[0].item())
         if expected_foot_value in (0, 1):
             foot_name = "right_ankle_roll_link" if expected_foot_value == 1 else "left_ankle_roll_link"
@@ -1276,17 +1293,27 @@ def _append_diagnostic(
                 actual_foot_yaw,
                 soccer_ball.data.root_pos_w[:, :3] - actual_foot_pos,
             )
-            actual_region_distance = _s2_region_distance(ball_offset_actual_foot)
+            (
+                actual_region_distance,
+                actual_front_gate,
+                actual_physical_distance,
+            ) = _s2_proximity_geometry(ball_offset_actual_foot)
             actual_yaw = _world_quat_to_rpy(actual_foot_yaw)[:, 2]
             diagnostic["s2_actual_foot_pos_w"].append(_cpu(actual_foot_pos))
             diagnostic["s2_actual_foot_yaw"].append(float(actual_yaw[0].item()))
             diagnostic["s2_ball_offset_actual_foot"].append(_cpu(ball_offset_actual_foot))
             diagnostic["s2_target_region_distance"].append(float(actual_region_distance[0].item()))
+            diagnostic["s2_proximity_front_gate"].append(float(actual_front_gate[0].item()))
+            diagnostic["s2_physical_foot_ball_distance"].append(
+                float(actual_physical_distance[0].item())
+            )
         else:
             diagnostic["s2_actual_foot_pos_w"].append(np.full(3, np.nan, dtype=np.float32))
             diagnostic["s2_actual_foot_yaw"].append(np.nan)
             diagnostic["s2_ball_offset_actual_foot"].append(np.full(3, np.nan, dtype=np.float32))
             diagnostic["s2_target_region_distance"].append(np.nan)
+            diagnostic["s2_proximity_front_gate"].append(np.nan)
+            diagnostic["s2_physical_foot_ball_distance"].append(np.nan)
         diagnostic["s2_contact_window"].append(bool(s2_window[0].item()))
         diagnostic["s2_contact_event_id"].append(int(s2_event_id[0].item()))
         diagnostic["s2_contact_event_frame"].append(int(s2_event_frame[0].item()))
@@ -1313,6 +1340,8 @@ def _append_diagnostic(
         diagnostic["s2_actual_foot_yaw"].append(np.nan)
         diagnostic["s2_ball_offset_actual_foot"].append(np.full(3, np.nan, dtype=np.float32))
         diagnostic["s2_target_region_distance"].append(np.nan)
+        diagnostic["s2_proximity_front_gate"].append(np.nan)
+        diagnostic["s2_physical_foot_ball_distance"].append(np.nan)
     flow_available = getattr(command, "motion_has_dribble_cg_flow_label", None)
     flow_valid = getattr(command, "dribble_cg_flow_valid_ref", None)
     flow_anchor = getattr(command, "dribble_cg_flow_anchor_frame_ref", None)
@@ -1764,6 +1793,16 @@ def _save_diagnostic(diagnostic: dict) -> None:
         if np.any(s2_window_mask)
         else np.nan
     )
+    s2_front_gate = (
+        _finite_mean(arrays["s2_proximity_front_gate"][s2_window_mask])
+        if np.any(s2_window_mask)
+        else np.nan
+    )
+    s2_physical_distance = (
+        _finite_mean(arrays["s2_physical_foot_ball_distance"][s2_window_mask])
+        if np.any(s2_window_mask)
+        else np.nan
+    )
     torso_rel_tilt = float(
         np.mean(np.linalg.norm(arrays["torso_minus_pelvis_rpy"][:, :2], axis=1))
     )
@@ -1867,6 +1906,8 @@ def _save_diagnostic(diagnostic: dict) -> None:
             f"episode_contacts={int(arrays['s2_episode_contact_count'][-1])}  "
             f"window_samples={int(np.count_nonzero(s2_window_mask))}  "
             f"actual_target_distance={s2_region_distance:.3f} m  "
+            f"front_gate={s2_front_gate:.3f}  "
+            f"physical_foot_ball_distance={s2_physical_distance:.3f} m  "
             f"reference_target_distance={s2_reference_region_distance:.3f} m  "
             "side_ids=(left=0, right=1, dead/unknown=-1)"
         )

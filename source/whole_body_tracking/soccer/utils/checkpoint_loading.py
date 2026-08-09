@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 from typing import Any
@@ -35,6 +36,8 @@ _S2_CURRICULUM_SCALAR_NAMES = (
 _S2_CURRICULUM_TENSOR_NAMES = (
     "_s2_event_attempt_count",
     "_s2_event_success_count",
+    "_s2_audit_event_attempt_count",
+    "_s2_audit_event_success_count",
 )
 _S2_CURRICULUM_INTEGER_NAMES = {
     "s2_curriculum_level",
@@ -75,7 +78,7 @@ def capture_s2_curriculum_state(target) -> dict[str, Any] | None:
     command = _s2_curriculum_command(target)
     if command is None:
         return None
-    state: dict[str, Any] = {"version": 2}
+    state: dict[str, Any] = {"version": 3}
     for name in _S2_CURRICULUM_SCALAR_NAMES:
         value = getattr(command, name, None)
         if not isinstance(value, torch.Tensor) or value.numel() != 1:
@@ -451,15 +454,51 @@ def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> b
     return True
 
 
+def _set_policy_exploration_std(runner, value: float) -> None:
+    """Reset a loaded Gaussian policy to a scalar exploration standard deviation."""
+    if value <= 0.0:
+        raise ValueError(f"Policy exploration std must be positive; got {value}")
+    policy = _get_alg_policy(runner)
+    parameters = dict(policy.named_parameters())
+    with torch.no_grad():
+        std = parameters.get("std")
+        if isinstance(std, torch.Tensor):
+            std.fill_(float(value))
+            return
+        log_std = parameters.get("log_std")
+        if isinstance(log_std, torch.Tensor):
+            log_std.fill_(math.log(float(value)))
+            return
+    raise RuntimeError("Unable to locate policy std/log_std parameter for S2 warm-start")
+
+
 def load_checkpoint_with_obs_expand(runner, path: str, **load_kwargs) -> Any:
     """Load a checkpoint, auto-expanding actor/critic inputs when obs grew (forward -> follow/control)."""
     map_location = load_kwargs.pop("map_location", getattr(runner, "device", None))
     loaded_dict = torch.load(path, map_location=map_location, weights_only=False)
+    infos = loaded_dict.get("infos")
+    checkpoint_has_s2_state = (
+        isinstance(infos, dict) and S2_CURRICULUM_INFO_KEY in infos
+    )
+    s2_cross_stage_warm_start = bool(
+        getattr(runner, "s2_warm_start_reset_optimizer", False)
+        and not checkpoint_has_s2_state
+    )
+    if s2_cross_stage_warm_start:
+        # S1 and S2 intentionally share policy/LSTM/normalizer shapes, but the
+        # S1 Adam momentum and learned exploration scale are poor priors for
+        # the new contact objective.
+        load_kwargs["load_optimizer"] = False
     expanded = prepare_loaded_dict_for_obs_expand(loaded_dict, runner)
 
     if not expanded:
         result = BaseOnPolicyRunner.load(runner, path, **load_kwargs)
         restore_s2_curriculum_state(runner, loaded_dict)
+        if s2_cross_stage_warm_start:
+            warm_start_std = getattr(runner, "s2_warm_start_policy_std", None)
+            if warm_start_std is not None:
+                _set_policy_exploration_std(runner, float(warm_start_std))
+            print("[INFO] S2 warm-start: reset optimizer and policy exploration std.")
         return result
 
     fd, tmp_path = tempfile.mkstemp(suffix=".pt")
@@ -470,6 +509,11 @@ def load_checkpoint_with_obs_expand(runner, path: str, **load_kwargs) -> Any:
         load_kwargs.setdefault("load_optimizer", False)
         result = BaseOnPolicyRunner.load(runner, tmp_path, **load_kwargs)
         restore_s2_curriculum_state(runner, loaded_dict)
+        if s2_cross_stage_warm_start:
+            warm_start_std = getattr(runner, "s2_warm_start_policy_std", None)
+            if warm_start_std is not None:
+                _set_policy_exploration_std(runner, float(warm_start_std))
+            print("[INFO] S2 warm-start: reset optimizer and policy exploration std.")
         return result
     finally:
         os.remove(tmp_path)

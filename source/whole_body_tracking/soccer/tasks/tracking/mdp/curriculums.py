@@ -71,7 +71,7 @@ def s2_contact_level_curriculum(
     plateau_windows: int = 4,
     plateau_min_improvement: float = 0.02,
 ) -> dict[str, torch.Tensor]:
-    """Advance S2 while replaying persistently difficult single-touch events.
+    """Advance S2 while training on persistently difficult single-touch events.
 
     Isaac Lab calls curriculum terms before resetting the command manager, so
     the terminal episode metrics are still available here. Statistics are
@@ -80,9 +80,10 @@ def s2_contact_level_curriculum(
 
     Single-touch levels require both aggregate mastery and per-event coverage.
     If aggregate contact exceeds the bootstrap threshold but stops improving,
-    the sampler stays at the same level and enables hard-event replay. The
-    curriculum remains global and monotonic; old-level episodes finishing after
-    promotion are ignored until they are resampled at the active level.
+    the sampler stays at the same level and enables hard-event replay. Once
+    enabled, hard samples train the policy while a disjoint uniform sample
+    supplies promotion statistics. The curriculum remains global and monotonic;
+    old-level episodes finishing after promotion are ignored until resampled.
     """
     command = env.command_manager.get_term(command_name)
     level_tensor = getattr(command, "s2_curriculum_level", None)
@@ -153,65 +154,115 @@ def s2_contact_level_curriculum(
         ids = ids[valid]
 
         if ids.numel() > 0:
-            command._s2_curriculum_episode_count.add_(float(ids.numel()))
-
-            fall = torch.zeros(ids.numel(), dtype=torch.bool, device=env.device)
-            active_termination_terms = set(env.termination_manager.active_terms)
-            for term_name in fall_termination_terms:
-                if term_name in active_termination_terms:
-                    fall |= env.termination_manager.get_term(term_name)[ids].to(torch.bool)
-            command._s2_curriculum_fall_count.add_(fall.to(torch.float32).sum())
+            episode_audit = getattr(command, "s2_episode_curriculum_audit", None)
+            if isinstance(episode_audit, torch.Tensor):
+                audit_mask = episode_audit[ids].to(torch.bool)
+            else:
+                audit_mask = torch.ones(ids.numel(), dtype=torch.bool, device=env.device)
 
             if single_touch_level:
-                success = command.metrics["s2_contact_success_rate"][ids].to(torch.float32)
-                command._s2_curriculum_contact_success_sum.add_(success.sum())
-                successful_touch = success > 0.0
-                if bool(torch.any(successful_touch)):
-                    side = command.metrics["s2_correct_side_rate"][ids][successful_touch]
-                    command._s2_curriculum_side_success_sum.add_(side.to(torch.float32).sum())
-                    command._s2_curriculum_side_attempt_count.add_(
-                        successful_touch.to(torch.float32).sum()
-                    )
+                all_success = command.metrics["s2_contact_success_rate"][ids].to(
+                    torch.float32
+                )
                 episode_event_index = getattr(
                     command, "s2_episode_first_event_index", None
                 )
-                event_attempt_count = getattr(command, "_s2_event_attempt_count", None)
-                event_success_count = getattr(command, "_s2_event_success_count", None)
-                if (
-                    isinstance(episode_event_index, torch.Tensor)
-                    and isinstance(event_attempt_count, torch.Tensor)
-                    and isinstance(event_success_count, torch.Tensor)
-                ):
-                    motion_index = command.motion_idx[ids].to(torch.long)
-                    event_index = episode_event_index[ids].to(torch.long)
+
+                def _record_event_outcomes(
+                    sample_ids: torch.Tensor,
+                    success: torch.Tensor,
+                    attempt_count: torch.Tensor | None,
+                    success_count: torch.Tensor | None,
+                ) -> None:
+                    if (
+                        not isinstance(episode_event_index, torch.Tensor)
+                        or not isinstance(attempt_count, torch.Tensor)
+                        or not isinstance(success_count, torch.Tensor)
+                        or sample_ids.numel() == 0
+                    ):
+                        return
+                    motion_index = command.motion_idx[sample_ids].to(torch.long)
+                    event_index = episode_event_index[sample_ids].to(torch.long)
                     valid_event = (
                         (event_index >= 0)
                         & (motion_index >= 0)
-                        & (motion_index < event_attempt_count.shape[0])
-                        & (event_index < event_attempt_count.shape[1])
+                        & (motion_index < attempt_count.shape[0])
+                        & (event_index < attempt_count.shape[1])
                     )
-                    if bool(torch.any(valid_event)):
-                        flat_index = (
-                            motion_index[valid_event] * event_attempt_count.shape[1]
-                            + event_index[valid_event]
-                        )
-                        event_attempt_count.view(-1).scatter_add_(
-                            0,
-                            flat_index,
-                            torch.ones_like(flat_index, dtype=torch.float32),
-                        )
-                        event_success_count.view(-1).scatter_add_(
-                            0, flat_index, success[valid_event]
-                        )
-            else:
-                sequence_episode = episode_contact_count[ids] >= required_contacts
-                if bool(torch.any(sequence_episode)):
-                    completion = command.metrics[f"s2_complete_{required_contacts}"][ids]
-                    completion = completion[sequence_episode].to(torch.float32)
-                    command._s2_curriculum_sequence_success_sum.add_(completion.sum())
-                    command._s2_curriculum_sequence_episode_count.add_(
-                        sequence_episode.to(torch.float32).sum()
+                    if not bool(torch.any(valid_event)):
+                        return
+                    flat_index = (
+                        motion_index[valid_event] * attempt_count.shape[1]
+                        + event_index[valid_event]
                     )
+                    attempt_count.view(-1).scatter_add_(
+                        0,
+                        flat_index,
+                        torch.ones_like(flat_index, dtype=torch.float32),
+                    )
+                    success_count.view(-1).scatter_add_(
+                        0, flat_index, success[valid_event]
+                    )
+
+                # All outcomes rank hard events for training. They never feed
+                # promotion coverage unless the episode was uniformly drawn.
+                _record_event_outcomes(
+                    ids,
+                    all_success,
+                    getattr(command, "_s2_event_attempt_count", None),
+                    getattr(command, "_s2_event_success_count", None),
+                )
+
+            audit_ids = ids[audit_mask]
+            if audit_ids.numel() > 0:
+                command._s2_curriculum_episode_count.add_(float(audit_ids.numel()))
+
+                fall = torch.zeros(
+                    audit_ids.numel(), dtype=torch.bool, device=env.device
+                )
+                active_termination_terms = set(env.termination_manager.active_terms)
+                for term_name in fall_termination_terms:
+                    if term_name in active_termination_terms:
+                        fall |= env.termination_manager.get_term(term_name)[audit_ids].to(
+                            torch.bool
+                        )
+                command._s2_curriculum_fall_count.add_(fall.to(torch.float32).sum())
+
+                if single_touch_level:
+                    success = command.metrics["s2_contact_success_rate"][audit_ids].to(
+                        torch.float32
+                    )
+                    command._s2_curriculum_contact_success_sum.add_(success.sum())
+                    successful_touch = success > 0.0
+                    if bool(torch.any(successful_touch)):
+                        side = command.metrics["s2_correct_side_rate"][audit_ids][
+                            successful_touch
+                        ]
+                        command._s2_curriculum_side_success_sum.add_(
+                            side.to(torch.float32).sum()
+                        )
+                        command._s2_curriculum_side_attempt_count.add_(
+                            successful_touch.to(torch.float32).sum()
+                        )
+                    _record_event_outcomes(
+                        audit_ids,
+                        success,
+                        getattr(command, "_s2_audit_event_attempt_count", None),
+                        getattr(command, "_s2_audit_event_success_count", None),
+                    )
+                else:
+                    sequence_episode = (
+                        episode_contact_count[audit_ids] >= required_contacts
+                    )
+                    if bool(torch.any(sequence_episode)):
+                        completion = command.metrics[
+                            f"s2_complete_{required_contacts}"
+                        ][audit_ids]
+                        completion = completion[sequence_episode].to(torch.float32)
+                        command._s2_curriculum_sequence_success_sum.add_(completion.sum())
+                        command._s2_curriculum_sequence_episode_count.add_(
+                            sequence_episode.to(torch.float32).sum()
+                        )
 
     episode_count = command._s2_curriculum_episode_count
     contact_rate = command._s2_curriculum_contact_success_sum / episode_count.clamp(min=1.0)
@@ -228,22 +279,32 @@ def s2_contact_level_curriculum(
     event_coverage = torch.zeros((), device=env.device, dtype=torch.float32)
     event_attempt_count = getattr(command, "_s2_event_attempt_count", None)
     event_success_count = getattr(command, "_s2_event_success_count", None)
+    audit_event_attempt_count = getattr(
+        command, "_s2_audit_event_attempt_count", None
+    )
+    audit_event_success_count = getattr(
+        command, "_s2_audit_event_success_count", None
+    )
     sequence_candidates = getattr(command, "_s2_sequence_candidates", {})
     single_contact_candidates = (
         sequence_candidates.get(1) if isinstance(sequence_candidates, dict) else None
     )
     if (
         single_touch_level
-        and isinstance(event_attempt_count, torch.Tensor)
-        and isinstance(event_success_count, torch.Tensor)
+        and isinstance(audit_event_attempt_count, torch.Tensor)
+        and isinstance(audit_event_success_count, torch.Tensor)
         and isinstance(single_contact_candidates, torch.Tensor)
     ):
-        valid_events = torch.zeros_like(event_attempt_count, dtype=torch.bool)
+        valid_events = torch.zeros_like(audit_event_attempt_count, dtype=torch.bool)
         valid_events[
             single_contact_candidates[:, 0], single_contact_candidates[:, 1]
         ] = True
-        sufficiently_sampled = event_attempt_count >= float(max(1, int(event_min_attempts)))
-        event_success_rate = event_success_count / event_attempt_count.clamp(min=1.0)
+        sufficiently_sampled = audit_event_attempt_count >= float(
+            max(1, int(event_min_attempts))
+        )
+        event_success_rate = audit_event_success_count / audit_event_attempt_count.clamp(
+            min=1.0
+        )
         covered = (
             valid_events
             & sufficiently_sampled
@@ -320,6 +381,10 @@ def s2_contact_level_curriculum(
                 event_attempt_count.zero_()
             if isinstance(event_success_count, torch.Tensor):
                 event_success_count.zero_()
+            if isinstance(audit_event_attempt_count, torch.Tensor):
+                audit_event_attempt_count.zero_()
+            if isinstance(audit_event_success_count, torch.Tensor):
+                audit_event_success_count.zero_()
         _clear_s2_curriculum_window(command)
 
     # Before the first completed evaluation window, expose the live window

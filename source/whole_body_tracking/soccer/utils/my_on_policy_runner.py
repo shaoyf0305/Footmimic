@@ -40,6 +40,12 @@ class MotionOnPolicyRunner(OnPolicyRunner):
         runner_cfg = dict(train_cfg)
         self.policy_std_min = runner_cfg.pop("policy_std_min", None)
         self.policy_std_max = runner_cfg.pop("policy_std_max", None)
+        self.s2_warm_start_reset_optimizer = runner_cfg.pop(
+            "s2_warm_start_reset_optimizer", False
+        )
+        self.s2_warm_start_policy_std = runner_cfg.pop(
+            "s2_warm_start_policy_std", None
+        )
         if (
             self.policy_std_min is not None
             and self.policy_std_max is not None
