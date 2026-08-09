@@ -14,38 +14,39 @@ bash shell/progressive_dribbling_train.sh my_run --cg-unified-3stage
 | Stage | Task ID | Objective |
 | --- | --- | --- |
 | S1 | `Tracking-CG-G1-Motion-RNN-unified-s1-local-strict` | Strict relative motion/gait imitation and exact reference local twist; no ball objective. |
-| S2 | `Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference` | One task whose Isaac Lab curriculum automatically advances through two/four/eight/full-contact sequences. |
+| S2 | `Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference` | One task whose Isaac Lab curriculum automatically advances through frame-0 prefixes of two/four/eight/full contacts. |
 | S3 | `Tracking-CG-G1-Dribbling-RNN-unified-s3-local-task` | Sampled local task twist with generic physical `instep` contacts; no reference ball position, contact time, contact foot, or foot--ball distance reward. |
 
 S1 preserves the raw clip and emits a time-limit `done` on its final frame.
-S2 starts at two adjacent contacts and automatically advances through five levels in
-the same run. Short samples start 0.3--0.6 s before their first selected event
-and end after the last selected contact window; the final level also includes
-complete-clip samples. The normal environment reset resets robot, ball, and
-LSTM state together. S3 instead loops the same master clip through a
+S2 starts at frame 0 and automatically advances through five levels in the same
+run. Partial levels end after their second, fourth, or eighth contact window;
+the last two levels run the complete clip. Every reset therefore gives the
+robot, physical ball, and LSTM the same causal prefix. S3 instead loops the same master clip through a
 25-frame (0.5 s at 50 Hz) quintic bridge, blending its tail into its start
 without resetting the ongoing task scene.
 
-The S2 level distributions are 100% two contacts; 100% disturbed two contacts;
-20/80% two/four; 20/80% four/eight; and 20/80% eight/full clip. No curriculum
-level samples an isolated contact. Missed events are recorded but never end an
+The S2 levels are the exact first two contacts, exact first four, exact first
+eight, exact full clip, and disturbed full clip. No curriculum level samples an
+isolated or interior contact. Missed events are recorded but never end an
 episode, so every rollout preserves the physical transition into later contact
 attempts. The curriculum evaluates non-overlapping windows of at least 1024
-eligible longest-sequence episodes and requires two consecutive passing
-windows. Levels 0--3 require at least 60% completion of their longest sequence
+eligible prefix episodes and requires two consecutive passing windows. Levels
+0--2 require at least 60% completion of the two/four/eight prefix; level 3
+requires at least 60% completion of every selected contact in the full clip
 and at most 5% falls. Promotion is monotonic; there is no automatic demotion or
 manual task switch. New checkpoints save the active level, pass streak,
 evaluation-window accumulators, level-entry history, and a signature of the
 level schedule. Resume and playback restore that state before resampling the
-first episode. A checkpoint from the former single-contact schedule retains its
-policy and optimizer but resets the incompatible curriculum state to the new
-level 0. Playback accepts `--s2_curriculum_level 0..4` to inspect another
+first episode. A checkpoint from any former schedule, including the v5.17
+random-window sequence schedule, retains its policy and optimizer but resets
+the incompatible curriculum state to the new level 0. Playback accepts
+`--s2_curriculum_level 0..4` to inspect another
 distribution explicitly.
 
 At reset, all three stages retain the selected reference pelvis pose, yaw, and
 velocity; they do not canonicalize the robot to a simulation/world `+X` axis.
-For S2 the physical ball is initialized at the selected first contact target.
-Level 0 uses the exact reset; later levels add their configured one-time planar
+For S2 the physical ball is initialized at the reference's first contact target.
+Levels 0--3 use the exact reset; only level 4 adds its configured one-time planar
 perturbation. Internally this point is stored as a pelvis-local offset, so the
 same reset geometry remains valid under any simulator yaw. If a motion lacks
 either a contact label or
@@ -81,16 +82,18 @@ segment; it never exposes a polar command or IDLE/STOP state to the policy.
 
 ## Contact semantics
 
-S2 converts each labelled inside/outside event to foot-yaw-local left/right.
-Contact proximity uses only the physical ball relative to the actual specified
-foot: distance beyond the 0.25 m contact reach and the labelled lateral
+S2 keeps each source label explicitly as `0=inside_instep` or
+`1=outside_instep`; conversion to the selected foot's medial axis happens only
+inside the geometry calculation. Contact proximity uses only the physical ball
+relative to the actual specified foot: distance beyond the 0.25 m contact reach and the labelled lateral
 half-space beyond a 4 cm dead zone. A coarse one-sided front gate ramps from
 zero at -0.05 m to full at +0.05 m in the foot-yaw frame. It has no forward
 target coordinate or upper forward bound; it exists only to suppress dense
 reward from keeping the ball behind the foot. Starting 0.30 s before the event,
 contact proximity ramps from 0.2 to full strength and stops accumulating after
-the first valid touch. During the contact window the support foot keeps its
-reference target while the contact foot's imitation weight falls to 0.1. A
+the first valid touch. During the final 0.3 s before an event, the contact foot's
+imitation weight ramps from 1.0 to 0.1 and stays at 0.1 after contact until the
+window closes; the support foot always keeps its full reference target. A
 correct-side touch is decided from the physical ball's current collision-frame
 lateral sign and dead zone, without a forward-position condition or lateral
 upper bound. The S2 ball terms remain
@@ -111,7 +114,7 @@ S2 learns that foot's inside/outside contacts, not left/right-foot alternation.
 Use `--show_s2_contact_regions` during playback to display the frozen reference
 foot frame, coarse front ramp, and expected lateral half-space. Combine it with
 `--diagnostic --diagnostic_stride 1` to save event id/frame, expected foot,
-expected side, reference foot pose, ball offset, physical ball-foot distance,
+expected source surface and derived local side, reference foot pose, ball offset, physical ball-foot distance,
 front-gate value, and proximity error. The `dribble-v8` diagnostic also records
 the checkpoint iteration and `s2_curriculum_level_entry_iteration`: the exact
 RSL-RL learning iteration at which every future level first became active.

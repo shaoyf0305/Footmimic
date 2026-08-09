@@ -1622,16 +1622,16 @@ class G1FlatMotionCGPretrainUnifiedS1LocalStrictEnvCfg(G1FlatMotionStrictPretrai
 
 @configclass
 class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
-    """S2: learn contact transitions from two-touch through full sequences."""
+    """S2: learn frame-0 prefixes from two contacts through the full clip."""
 
     dribble_contact_mode: str = "both"
     dribble_contact_surface: str = "instep"
     s2_curriculum_levels: tuple[tuple[tuple[int, float], ...], ...] = (
         ((2, 1.0),),
-        ((2, 1.0),),
-        ((2, 0.20), (4, 0.80)),
-        ((4, 0.20), (8, 0.80)),
-        ((8, 0.20), (0, 0.80)),
+        ((4, 1.0),),
+        ((8, 1.0),),
+        ((0, 1.0),),
+        ((0, 1.0),),
     )
 
     def __post_init__(self):
@@ -1670,6 +1670,7 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
                 "std": 0.30,
                 "foot_body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
                 "contact_foot_scale": 0.10,
+                "contact_foot_release_seconds": 0.30,
             },
         )
 
@@ -1802,24 +1803,26 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         setattr(
             self.commands.motion,
             "dribble_cg_curriculum_required_contacts",
-            (2, 2, 4, 8, 8),
+            # Zero means that every selected event in the full clip must be
+            # completed consecutively, rather than accepting an eight-touch
+            # prefix as completion of a longer reference.
+            (2, 4, 8, 0, 0),
         )
         setattr(self.commands.motion, "dribble_cg_curriculum_start_level", 0)
-        setattr(self.commands.motion, "dribble_cg_pre_contact_seconds_range", (0.3, 0.6))
         setattr(self.commands.motion, "dribble_cg_contact_window_seconds", 0.10)
         setattr(self.commands.motion, "dribble_cg_missed_contact_grace_steps", 3)
         # Per level: (exact-reference probability, maximum initial radius).
-        # Level 0 has no disturbance. Later levels perturb once at sequence
-        # reset in the labelled foot frame; subsequent errors arise naturally
-        # from ball physics and earlier touches.
+        # Levels 0--3 preserve the exact frame-0 reference state. Only the
+        # final full-clip level perturbs the ball once at reset; every later
+        # error still arises from ball physics and the preceding touches.
         setattr(
             self.commands.motion,
             "dribble_cg_curriculum_ball_spawn_jitter",
             (
                 (1.00, 0.00),
-                (0.70, 0.02),
-                (0.50, 0.02),
-                (0.30, 0.04),
+                (1.00, 0.00),
+                (1.00, 0.00),
+                (1.00, 0.00),
                 (0.20, 0.06),
             ),
         )

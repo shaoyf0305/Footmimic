@@ -211,10 +211,9 @@ def restore_s2_curriculum_state(
 
     current_signature = _s2_curriculum_signature(command)
     if state.get("curriculum_signature") != current_signature:
-        # A saved numeric level is not portable across schedules: old level 2
-        # meant a one/two-touch mixture, while the sequence-first schedule's
-        # level 2 is predominantly four touches. Retain policy/optimizer state
-        # but restart only the curriculum so the new level has honest metrics.
+        # A saved numeric level is not portable across schedules. Retain the
+        # policy/optimizer state, but restart only the curriculum so a former
+        # random-window level cannot masquerade as a frame-0 prefix level.
         set_s2_curriculum_level(
             target,
             0,

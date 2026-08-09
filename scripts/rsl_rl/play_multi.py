@@ -175,7 +175,7 @@ parser.add_argument(
     default=False,
     help=(
         "Show the active S2 reference-foot frame, coarse front gate, and "
-        "expected left/right half-space."
+        "expected inside/outside instep half-space."
     ),
 )
 parser.add_argument(
@@ -184,7 +184,8 @@ parser.add_argument(
     choices=range(5),
     default=None,
     help=(
-        "Override the S2 playback curriculum level (0..4). By default a new-format "
+        "Override the S2 playback curriculum level (0=2, 1=4, 2=8, "
+        "3=full exact, 4=full disturbed). By default a new-format "
         "checkpoint restores its saved level; legacy checkpoints start at level 0."
     ),
 )
@@ -968,6 +969,7 @@ def _create_diagnostic(
         "s2_contact_event_frame": [],
         "s2_expected_foot": [],
         "s2_expected_side": [],
+        "s2_expected_surface": [],
         "s2_reference_foot_pos_w": [],
         "s2_reference_foot_yaw": [],
         "s2_ball_offset_reference_foot": [],
@@ -1252,6 +1254,7 @@ def _append_diagnostic(
     s2_event_frame = getattr(command, "s2_contact_event_frame_ref", None)
     s2_expected_foot = getattr(command, "s2_contact_event_foot_ref", None)
     s2_expected_side = getattr(command, "s2_contact_event_side_ref", None)
+    s2_expected_surface = getattr(command, "s2_contact_event_surface_ref", None)
     s2_window = getattr(command, "s2_contact_window_ref", None)
     curriculum_level = getattr(command, "s2_curriculum_level", None)
     episode_curriculum_level = getattr(command, "s2_episode_curriculum_level", None)
@@ -1335,6 +1338,10 @@ def _append_diagnostic(
         diagnostic["s2_contact_event_frame"].append(int(s2_event_frame[0].item()))
         diagnostic["s2_expected_foot"].append(expected_foot_value)
         diagnostic["s2_expected_side"].append(int(s2_expected_side[0].item()))
+        diagnostic["s2_expected_surface"].append(
+            int(s2_expected_surface[0].item())
+            if isinstance(s2_expected_surface, torch.Tensor) else -1
+        )
         diagnostic["s2_reference_foot_pos_w"].append(_cpu(reference_foot_pos))
         reference_yaw = _world_quat_to_rpy(reference_foot_yaw)[:, 2]
         diagnostic["s2_reference_foot_yaw"].append(float(reference_yaw[0].item()))
@@ -1348,6 +1355,7 @@ def _append_diagnostic(
         diagnostic["s2_contact_event_frame"].append(-1)
         diagnostic["s2_expected_foot"].append(-1)
         diagnostic["s2_expected_side"].append(-1)
+        diagnostic["s2_expected_surface"].append(-1)
         diagnostic["s2_reference_foot_pos_w"].append(np.full(3, np.nan, dtype=np.float32))
         diagnostic["s2_reference_foot_yaw"].append(np.nan)
         diagnostic["s2_ball_offset_reference_foot"].append(np.full(3, np.nan, dtype=np.float32))

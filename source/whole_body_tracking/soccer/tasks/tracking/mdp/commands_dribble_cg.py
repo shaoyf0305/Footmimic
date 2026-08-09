@@ -125,6 +125,7 @@ class DribbleCGMotionCommand(MotionCommand):
             "s2_complete_2",
             "s2_complete_4",
             "s2_complete_8",
+            "s2_complete_selected",
         ):
             self.metrics[metric_name] = torch.zeros(self.num_envs, device=self.device)
         self._validate_fixed_touch_spec()
@@ -134,9 +135,10 @@ class DribbleCGMotionCommand(MotionCommand):
 
         A rising edge in ``dribble_cg_contact`` is the event frame.  Each
         event owns a symmetric time window and carries exactly one expected
-        foot and one foot-yaw-local ball side (0=left, 1=right).  The older
-        inside/outside labels are converted to local left/right here so every
-        downstream consumer uses one unambiguous convention.
+        foot and one instep surface (0=inside, 1=outside).  A derived
+        foot-yaw-local side is retained only for visualization and backwards-
+        compatible diagnostics; learning consumes the source surface label
+        directly so left/right feet cannot silently invert its meaning.
         """
         num_motions, max_frames = self.motion.dribble_cg_contact.shape
         self._s2_event_id = torch.full(
@@ -146,6 +148,7 @@ class DribbleCGMotionCommand(MotionCommand):
         self._s2_event_foot = torch.full(
             (num_motions, max_frames), -1, dtype=torch.int8, device=self.device
         )
+        self._s2_event_surface = torch.full_like(self._s2_event_foot, -1)
         self._s2_event_side = torch.full_like(self._s2_event_foot, -1)
         self._s2_event_frames_by_motion: list[torch.Tensor] = []
 
@@ -187,31 +190,8 @@ class DribbleCGMotionCommand(MotionCommand):
                 self._s2_event_id[motion_idx, target_frames] = event_id
                 self._s2_event_frame[motion_idx, target_frames] = event_frame
                 self._s2_event_foot[motion_idx, target_frames] = foot
+                self._s2_event_surface[motion_idx, target_frames] = surface
                 self._s2_event_side[motion_idx, target_frames] = side
-        self._s2_two_contact_transition_candidates: dict[
-            tuple[int, int], torch.Tensor
-        ] = {}
-        transition_lists: dict[tuple[int, int], list[tuple[int, int]]] = {
-            (0, 1): [], (1, 0): []
-        }
-        for motion_idx, frames in enumerate(self._s2_event_frames_by_motion):
-            final_eligible_event = int(self.motion.file_lengths[motion_idx].item()) - 1 - required_tail
-            for start_index in range(max(0, int(frames.numel()) - 1)):
-                first = int(frames[start_index].item())
-                second = int(frames[start_index + 1].item())
-                if second > final_eligible_event:
-                    continue
-                transition = (
-                    int(self.motion.dribble_cg_surface[motion_idx, first].item()),
-                    int(self.motion.dribble_cg_surface[motion_idx, second].item()),
-                )
-                if transition in transition_lists:
-                    transition_lists[transition].append((motion_idx, start_index))
-        for transition, candidates in transition_lists.items():
-            if candidates:
-                self._s2_two_contact_transition_candidates[transition] = torch.as_tensor(
-                    candidates, dtype=torch.long, device=self.device
-                )
 
         max_events = max((int(frames.numel()) for frames in self._s2_event_frames_by_motion), default=0)
         self._s2_event_count_by_motion = torch.as_tensor(
@@ -250,9 +230,9 @@ class DribbleCGMotionCommand(MotionCommand):
             for item in tuple(level_mix)
             if int(item[0]) > 0
         }
-        # Sequence-first S2 no longer needs to precompute isolated contacts.
-        # Keep the standard retained sequence lengths available even when a
-        # particular level mix does not sample all of them.
+        # Prefix S2 never starts at an interior event.  Keep one candidate per
+        # eligible motion and fix its event index to zero so robot state, ball
+        # physics, and recurrent context all share the same frame-0 history.
         requested_counts.update((2, 4, 8))
         self._s2_sequence_candidates: dict[int, torch.Tensor] = {}
         for count in requested_counts:
@@ -261,9 +241,11 @@ class DribbleCGMotionCommand(MotionCommand):
                 final_eligible_event = (
                     int(self.motion.file_lengths[motion_idx].item()) - 1 - required_tail
                 )
-                for start_index in range(max(0, int(frames.numel()) - count + 1)):
-                    if int(frames[start_index + count - 1].item()) <= final_eligible_event:
-                        candidates.append((motion_idx, start_index))
+                if (
+                    int(frames.numel()) >= count
+                    and int(frames[count - 1].item()) <= final_eligible_event
+                ):
+                    candidates.append((motion_idx, 0))
             if candidates:
                 self._s2_sequence_candidates[count] = torch.as_tensor(
                     candidates, dtype=torch.long, device=self.device
@@ -303,13 +285,18 @@ class DribbleCGMotionCommand(MotionCommand):
         return self._s2_current_event_label(self._s2_event_side).to(torch.long)
 
     @property
+    def s2_contact_event_surface_ref(self) -> torch.Tensor:
+        """Expected instep surface from the source label: inside=0/outside=1."""
+        return self._s2_current_event_label(self._s2_event_surface).to(torch.long)
+
+    @property
     def s2_contact_window_ref(self) -> torch.Tensor:
         return self.s2_contact_event_id_ref >= 0
 
     def s2_upcoming_contact_event_ref(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return the next selected event's id, frame, foot, and local side.
+        """Return the next selected event's id, frame, foot, and instep surface.
 
         Unlike the contact-window properties above, this lookup remains valid
         throughout the pre-contact part of an episode.  It exposes only the
@@ -340,7 +327,7 @@ class DribbleCGMotionCommand(MotionCommand):
         event_foot = self.motion.dribble_cg_foot[
             self.motion_idx, event_frame.clamp(min=0)
         ].to(torch.long)
-        event_side = self._s2_event_side[
+        event_surface = self._s2_event_surface[
             self.motion_idx, event_frame.clamp(min=0)
         ].to(torch.long)
         invalid = torch.full_like(event_slot, -1)
@@ -348,7 +335,7 @@ class DribbleCGMotionCommand(MotionCommand):
             torch.where(valid, event_slot, invalid),
             torch.where(valid, event_frame, invalid),
             torch.where(valid, event_foot, invalid),
-            torch.where(valid, event_side, invalid),
+            torch.where(valid, event_surface, invalid),
         )
 
     def s2_contact_reference_foot_pose_w(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -399,9 +386,6 @@ class DribbleCGMotionCommand(MotionCommand):
         probabilities = probabilities / probabilities.sum()
         sampled_counts = counts[torch.multinomial(probabilities, env_ids.numel(), replacement=True)]
         fps = float(self.motion.fps.reshape(-1)[0])
-        pre_min, pre_max = getattr(self.cfg, "dribble_cg_pre_contact_seconds_range", (0.3, 0.6))
-        pre_min_frames = max(0, int(round(float(pre_min) * fps)))
-        pre_max_frames = max(pre_min_frames, int(round(float(pre_max) * fps)))
         half_window = max(
             0, int(round(float(getattr(self.cfg, "dribble_cg_contact_window_seconds", 0.10)) * fps))
         )
@@ -430,20 +414,6 @@ class DribbleCGMotionCommand(MotionCommand):
                     torch.randint(eligible_motion.numel(), (group_size,), device=self.device)
                 ]
                 actual_count = self._s2_event_count_by_motion[selected_motion]
-            elif requested_count == 2 and self._s2_two_contact_transition_candidates:
-                transitions = tuple(self._s2_two_contact_transition_candidates.values())
-                transition_choice = torch.randint(len(transitions), (group_size,), device=self.device)
-                for transition_index, candidates in enumerate(transitions):
-                    transition_mask = transition_choice == transition_index
-                    count_in_transition = int(transition_mask.sum().item())
-                    if count_in_transition == 0:
-                        continue
-                    sampled = candidates[
-                        torch.randint(candidates.shape[0], (count_in_transition,), device=self.device)
-                    ]
-                    selected_motion[transition_mask] = sampled[:, 0]
-                    sequence_start[transition_mask] = sampled[:, 1]
-                actual_count = torch.full_like(selected_motion, 2)
             else:
                 candidates = self._s2_sequence_candidates.get(requested_count)
                 if candidates is None or candidates.numel() == 0:
@@ -532,15 +502,12 @@ class DribbleCGMotionCommand(MotionCommand):
             last_event = self._s2_event_frames_padded[
                 selected_motion, sequence_start + actual_count - 1
             ]
-            pre_frames = torch.randint(
-                pre_min_frames, pre_max_frames + 1, (group_size,), device=self.device
-            )
             true_length = self.motion.file_lengths[selected_motion]
             if requested_count == 0:
                 start_frame = torch.zeros_like(first_event)
                 end_frame = true_length - 1
             else:
-                start_frame = torch.clamp(first_event - pre_frames, min=0)
+                start_frame = torch.zeros_like(first_event)
                 end_frame = torch.minimum(
                     true_length - 1,
                     last_event + half_window + post_grace + 1,
@@ -848,7 +815,7 @@ class DribbleCGMotionCommand(MotionCommand):
 
             if bool(torch.any(perturb)):
                 contact_foot = self.motion.dribble_cg_foot[mi, safe_frames].to(torch.long)
-                expected_side = self._s2_event_side[mi, safe_frames].to(torch.long)
+                expected_surface = self._s2_event_surface[mi, safe_frames].to(torch.long)
                 left_index = self.cfg.body_names.index("left_ankle_roll_link")
                 right_index = self.cfg.body_names.index("right_ankle_roll_link")
                 foot_index = torch.where(
@@ -870,7 +837,18 @@ class DribbleCGMotionCommand(MotionCommand):
                     self.cfg, "dribble_cg_ball_spawn_safe_side_range", (0.06, 0.14)
                 )
                 labels_valid = ((contact_foot == 0) | (contact_foot == 1)) & (
-                    (expected_side == 0) | (expected_side == 1)
+                    (expected_surface == 0) | (expected_surface == 1)
+                )
+                # Convert the source inside/outside label into the signed
+                # lateral axis of the selected foot only at the geometry
+                # boundary: right-foot inside is +Y; left-foot inside is -Y.
+                medial_sign = torch.where(
+                    contact_foot == 1,
+                    torch.ones_like(base_local[:, 1]),
+                    -torch.ones_like(base_local[:, 1]),
+                )
+                expected_lateral_sign = torch.where(
+                    expected_surface == 0, medial_sign, -medial_sign
                 )
                 # Resampling instead of clamping guarantees the configured
                 # radius remains an actual upper bound on the perturbation.
@@ -887,12 +865,9 @@ class DribbleCGMotionCommand(MotionCommand):
                     proposed = base_local.clone()
                     proposed[:, 0] += radius * torch.cos(angle)
                     proposed[:, 1] += radius * torch.sin(angle)
-                    side_valid = torch.where(
-                        expected_side == 0,
-                        (proposed[:, 1] >= float(side_min))
-                        & (proposed[:, 1] <= float(side_max)),
-                        (proposed[:, 1] <= -float(side_min))
-                        & (proposed[:, 1] >= -float(side_max)),
+                    signed_side = proposed[:, 1] * expected_lateral_sign
+                    side_valid = (signed_side >= float(side_min)) & (
+                        signed_side <= float(side_max)
                     )
                     safe = (
                         pending
@@ -1054,11 +1029,10 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     dribble_cg_front_ball_lateral_offset: float = 0.0
     dribble_cg_front_ball_height: float = 0.11
     # Performance-driven S2 levels. Each nested pair is
-    # ``(number_of_adjacent_contacts, probability)``; zero means full clip.
+    # ``(number_of_prefix_contacts, probability)``; zero means full clip.
     # The Curriculum Manager updates ``s2_curriculum_level`` at runtime.
     dribble_cg_curriculum_levels: tuple[tuple[tuple[int, float], ...], ...] = ()
     dribble_cg_curriculum_start_level: int = 0
-    dribble_cg_pre_contact_seconds_range: tuple[float, float] = (0.3, 0.6)
     dribble_cg_contact_window_seconds: float = 0.10
     dribble_cg_missed_contact_grace_steps: int = 3
     dribble_cg_ball_spawn_jitter_min: float = 0.0

@@ -49,7 +49,8 @@ def _s2_required_contacts(command, level: int) -> int:
         getattr(command.cfg, "dribble_cg_curriculum_required_contacts", ())
     )
     if configured:
-        return max(1, int(configured[min(level, len(configured) - 1)]))
+        # Zero explicitly means every selected event in a full-clip episode.
+        return max(0, int(configured[min(level, len(configured) - 1)]))
     return (1, 2, 4, 8)[min(level, 3)]
 
 
@@ -78,12 +79,12 @@ def s2_contact_level_curriculum(
     evaluated in non-overlapping windows. Two passing windows are required by
     default to avoid promoting on one unusually favorable reset batch.
 
-    Sequence levels are evaluated only on the longest sequence sampled at that
-    level; retained shorter sequences train stability without making promotion
-    easier. Optional single-touch configurations retain the legacy per-event
-    coverage and hard-replay path, but the active S2 schedule does not sample
-    isolated contacts. The curriculum remains global and monotonic; old-level
-    episodes finishing after promotion are ignored until resampled.
+    The active schedule evaluates fixed frame-0 prefixes of two, four, eight,
+    and then every contact in the full clip. Optional single-touch
+    configurations retain the legacy per-event coverage and hard-replay path,
+    but active S2 never samples an isolated or interior contact. The curriculum
+    remains global and monotonic; old-level episodes finishing after promotion
+    are ignored until resampled.
     """
     command = env.command_manager.get_term(command_name)
     level_tensor = getattr(command, "s2_curriculum_level", None)
@@ -164,6 +165,7 @@ def s2_contact_level_curriculum(
         setattr(command, "_s2_training_iteration", training_iteration)
     required_contacts = _s2_required_contacts(command, level)
     single_touch_level = required_contacts == 1
+    full_sequence_level = required_contacts == 0
 
     if ids.numel() > 0 and level < max_level:
         episode_steps = env.episode_length_buf[ids]
@@ -268,13 +270,19 @@ def s2_contact_level_curriculum(
                         getattr(command, "_s2_audit_event_success_count", None),
                     )
                 else:
-                    sequence_episode = (
-                        episode_contact_count[audit_ids] >= required_contacts
-                    )
+                    if full_sequence_level:
+                        sequence_episode = episode_contact_count[audit_ids] > 0
+                    else:
+                        sequence_episode = (
+                            episode_contact_count[audit_ids] >= required_contacts
+                        )
                     if bool(torch.any(sequence_episode)):
-                        completion = command.metrics[
-                            f"s2_complete_{required_contacts}"
-                        ][audit_ids]
+                        metric_name = (
+                            "s2_complete_selected"
+                            if full_sequence_level
+                            else f"s2_complete_{required_contacts}"
+                        )
+                        completion = command.metrics[metric_name][audit_ids]
                         completion = completion[sequence_episode].to(torch.float32)
                         command._s2_curriculum_sequence_success_sum.add_(completion.sum())
                         command._s2_curriculum_sequence_episode_count.add_(
