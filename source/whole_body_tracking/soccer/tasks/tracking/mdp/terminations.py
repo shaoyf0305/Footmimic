@@ -161,7 +161,7 @@ def ball_lost_dribbling(
     return lost
 
 
-def dribbling_missed_contact(
+def dribbling_missed_valid_contact(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
     ball_sensor_name: str = "soccer_ball_contact",
@@ -169,8 +169,6 @@ def dribbling_missed_contact(
     num_ankle_links: int = 2,
     require_expected_foot: bool = True,
     target_side_enabled: bool = True,
-    max_touch_force: float = 150.0,
-    soft_touch_force_start: float = 80.0,
     side_deadzone: float = 0.04,
     proximity_contact_distance_max: float = 0.25,
     proximity_front_gate_min: float = -0.05,
@@ -179,9 +177,9 @@ def dribbling_missed_contact(
     proximity_approach_seconds: float = 0.30,
     proximity_approach_min_weight: float = 0.20,
     missed_contact_grace_steps: int = 3,
-    max_curriculum_level: int | None = None,
+    max_required_contact_count: int | None = 2,
 ) -> torch.Tensor:
-    """Terminate an early-level S2 episode after a missed selected event."""
+    """Terminate a short S2 episode after a missed side-valid contact event."""
     state = dribbling_s2_contact_event_state(
         env,
         command_name=command_name,
@@ -190,8 +188,6 @@ def dribbling_missed_contact(
         num_ankle_links=num_ankle_links,
         require_expected_foot=require_expected_foot,
         target_side_enabled=target_side_enabled,
-        max_touch_force=max_touch_force,
-        soft_touch_force_start=soft_touch_force_start,
         side_deadzone=side_deadzone,
         proximity_contact_distance_max=proximity_contact_distance_max,
         proximity_front_gate_min=proximity_front_gate_min,
@@ -201,14 +197,39 @@ def dribbling_missed_contact(
         proximity_approach_min_weight=proximity_approach_min_weight,
         missed_contact_grace_steps=missed_contact_grace_steps,
     )
-    missed = state["missed_contact"]
-    if max_curriculum_level is None:
+    missed = state["missed_valid_contact"]
+    if max_required_contact_count is None:
         return missed
     command = env.command_manager.get_term(command_name)
     episode_level = getattr(command, "s2_episode_curriculum_level", None)
-    if not isinstance(episode_level, torch.Tensor) or episode_level.shape[0] != env.num_envs:
+    configured_required = tuple(
+        getattr(command.cfg, "dribble_cg_curriculum_required_contacts", ())
+    )
+    if (
+        isinstance(episode_level, torch.Tensor)
+        and episode_level.shape[0] == env.num_envs
+        and configured_required
+    ):
+        required_by_level = torch.as_tensor(
+            configured_required, dtype=torch.long, device=env.device
+        )
+        level_index = episode_level.to(torch.long).clamp(
+            min=0, max=required_by_level.numel() - 1
+        )
+        required_count = required_by_level[level_index]
+        short_episode = (required_count > 0) & (
+            required_count <= max(1, int(max_required_contact_count))
+        )
+        return missed & short_episode
+
+    # Fallback for custom commands without a configured curriculum contract.
+    selected_count = getattr(command, "s2_episode_contact_count", None)
+    if not isinstance(selected_count, torch.Tensor) or selected_count.shape[0] != env.num_envs:
         return missed
-    return missed & (episode_level <= int(max_curriculum_level))
+    short_episode = (selected_count > 0) & (
+        selected_count <= max(1, int(max_required_contact_count))
+    )
+    return missed & short_episode
 
 
 def dribbling_no_ball_contact_timeout(

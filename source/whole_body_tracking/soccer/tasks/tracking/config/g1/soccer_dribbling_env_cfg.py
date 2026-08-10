@@ -935,6 +935,8 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         _apply_unified_local_163_contract(self)
         _apply_local_reference_ball_objectives(self)
         _disable_s2_unreliable_ball_penalties(self)
+        if hasattr(self.rewards, "dribbling_pelvis_quat_tracking"):
+            self.rewards.dribbling_pelvis_quat_tracking.weight = 0.0
 
         # S2 keeps normal two-foot imitation outside contact windows. During
         # contact it preserves the support-foot target and nearly releases
@@ -980,10 +982,6 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
             "num_ankle_links": num_ankle_links,
             "require_expected_foot": True,
             "target_side_enabled": True,
-            # Keep a soft force cost, but do not reject ordinary first-impact
-            # peaks that fall between the old 100 N cap and 150 N.
-            "max_touch_force": 150.0,
-            "soft_touch_force_start": 80.0,
             "side_deadzone": 0.04,
             # Physical reach is measured from the actual expected foot. The
             # one-sided front ramp only suppresses ball-behind-foot exploits;
@@ -998,30 +996,32 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         }
         self.rewards.s2_contact_proximity = RewTerm(
             func=mdp.dribbling_s2_contact_proximity,
-            # The rational-quadratic kernel remains informative at difficult
-            # 20--30 cm offsets. A weight of one strengthens the only dense
-            # ball-control signal without adding another reward objective.
-            weight=1.0,
+            # Dense side-aware guidance bridges the released reference foot to
+            # the sparse physical event. It is disabled immediately after a
+            # side-valid contact succeeds.
+            weight=0.5,
             params=dict(event_params),
         )
-        self.rewards.s2_new_touch = RewTerm(
-            func=mdp.dribbling_s2_new_touch_reward,
-            weight=10.0,
+        # Touch occurrence remains telemetry only. The sparse reward is paid
+        # exclusively for a physical rising edge on the labelled foot side.
+        self.rewards.s2_valid_contact_bonus = RewTerm(
+            func=mdp.dribbling_s2_valid_contact_bonus,
+            weight=4.5,
             params=dict(event_params),
         )
-        self.rewards.s2_correct_side = RewTerm(
-            func=mdp.dribbling_s2_correct_side_reward,
-            weight=4.0,
-            params=dict(event_params),
-        )
-        self.rewards.s2_touch_force_soft = RewTerm(
-            func=mdp.dribbling_s2_touch_force_soft_penalty,
+        self.rewards.s2_nonfoot_ball_contact = RewTerm(
+            func=mdp.dribbling_s2_nonfoot_ball_contact_penalty,
             weight=-1.0,
             params=dict(event_params),
         )
-        self.rewards.s2_undesired_ball_contact = RewTerm(
-            func=mdp.dribbling_s2_undesired_ball_contact_penalty,
-            weight=-6.0,
+        self.rewards.s2_wrong_foot_contact = RewTerm(
+            func=mdp.dribbling_s2_wrong_foot_contact_penalty,
+            weight=-0.25,
+            params=dict(event_params),
+        )
+        self.rewards.s2_premature_contact = RewTerm(
+            func=mdp.dribbling_s2_premature_contact_penalty,
+            weight=-0.25,
             params=dict(event_params),
         )
 
@@ -1067,13 +1067,19 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         self.terminations.dribbling_no_contact = None
         if hasattr(self.terminations, "ee_body_pos"):
             self.terminations.ee_body_pos = None
-        # Missed events remain part of the sequence metrics, but no longer end
-        # the episode. Every level must expose the policy to the physical state
-        # passed from one contact attempt into the next.
-        self.terminations.missed_contact = None
+        # A missed event ends only the short one/two-contact curriculum. Longer
+        # sequences keep running so the policy observes downstream physical
+        # state, while their consecutive-success streak is still reset.
+        self.terminations.missed_valid_contact = DoneTerm(
+            func=mdp.dribbling_missed_valid_contact,
+            params={
+                **dict(event_params),
+                "max_required_contact_count": 2,
+            },
+        )
 
-        # The ball always follows physics.  Only the event region, new-touch,
-        # side bonus, and undesired-contact terms above supervise it.  Its
+        # The ball always follows physics. Only the side-aware event region,
+        # side-valid contact bonus, and split contact penalties supervise it. Its
         # reset location is the selected first event's reference target,
         # represented in the reference pelvis-local frame rather than task +X.
         setattr(self.commands.motion, "dribble_cg_use_task_frame", False)

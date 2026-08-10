@@ -77,35 +77,39 @@ S2 和 S3 都继承下面 13 项。两阶段的区别主要在 local twist 的 `
 
 ## 4. S2：参考 contact-event reward
 
-S2 在上面 13 个共同项之外，还生效 7 项，共 20 项。
+S2 在上面 13 个共同项之外，还生效 6 项，共 19 项。
 
 ### 4.1 参考姿态与脚轨迹
 
 | Reward term | 权重 | 原始值/主要参数 | 作用 |
 |---|---:|---|---|
-| `dribbling_pelvis_quat_tracking` | `+2.0` | `exp(-angle(q_ref_pelvis,q_sim_pelvis)²/0.45²)` | 额外跟踪参考 pelvis quaternion，防止为了够球而产生明显错误的 pelvis 姿态。它与 `motion_body_ori` 和直立惩罚同时存在。 |
+| `dribbling_pelvis_quat_tracking` | `0` | 已关闭 | pelvis 已包含在 `motion_body_ori` 中，并由 `pelvis_orientation` 保持直立；S2 不再额外放大 reference pelvis quaternion。 |
 | `s2_windowed_foot_tracking` | `+1.0` | 双脚位置误差指数，`σ=0.30`；支撑脚权重始终为 `1`；触球脚在事件前 `0.30 s` 从 `1` 线性降到 `0.10`，事件后窗口内保持 `0.10` | 非触球阶段跟踪双脚 gait；接近触球时释放指定触球脚，让物理和球的位置决定最后落脚，同时保持支撑脚稳定。 |
 
 ### 4.2 共享的 S2 触球事件判定
 
-后面 5 个 reward 共用一次缓存的 `dribbling_s2_contact_event_state()`，所以它们对“本步是否是新触球、哪只 body 触球、力多大”的判断完全一致。
+后面 5 个 reward 共用一次缓存的 `dribbling_s2_contact_event_state()`，所以它们对“本步是否是新触球、哪只 body 触球、力多大”的判断完全一致。`s2_touch_occurrence` 只保留为 telemetry，不进入 reward。
 
 当前主要条件：
 
 - reference contact window 为事件中心前后各 `0.10 s`；接近 shaping 从事件前 `0.30 s` 开始。
 - 指定脚必须正确：`require_expected_foot=True`。
 - inside/outside instep 标签启用：`target_side_enabled=True`，脚面侧向 deadzone 为 `0.04 m`。
-- 有效触球必须是 contact 的上升沿、处于 reference window、由指定脚踝完成，且冲击力 `<=150 N`。
+- 有效触球必须是 contact 的上升沿、处于 reference window、由指定脚踝完成，并位于标注的 inside/outside 侧。触球力不参与有效性判定。
 - 球始终由物理仿真驱动；reward **不读取 reference 球位置或 reference 球速度**。
 - 球传感器没有给出具体碰撞点；代码用离球心最近的候选 robot body 估计触球 body，并在所选脚的 yaw-local 坐标中用球心横向偏移近似 inside/outside surface。
 
 | Reward term | 权重 | 原始值/主要参数 | 作用 |
 |---|---:|---|---|
-| `s2_contact_proximity` | `+1.0` | `1/(1+(d_target/0.12)²) × front_gate × time_weight` | 给指定脚接近球的连续梯度。`d_target=sqrt(reach_error²+side_error²)`：距离在 `0.25 m` 内没有 reach error，球进入正确内/外侧 `0.04 m` 外没有 side error。球在脚后方时，`front_gate` 在局部 `x=-0.05..0.05 m` 从 0 线性升到 1。事件前 0.30 s 的 `time_weight` 从 0.20 升到 1；该事件一旦成功，后续 dense reward 被关掉。 |
-| `s2_new_touch` | `+10.0` | 每个事件最多一个 `1` 脉冲 | 当前事件窗口内，指定脚第一次以 `<=150 N` 接触球就奖励。这是 S2 最强的稀疏成功信号。注意它本身不要求 inside/outside 正确，脚面侧别由下一项单独加分。 |
-| `s2_correct_side` | `+4.0` | 正确侧的新触球返回 `1` | 在 `s2_new_touch` 成立的同时，球位于 reference 标注的 inside/outside instep 一侧且越过 `0.04 m` deadzone 时追加奖励。 |
-| `s2_touch_force_soft` | `-1.0` | `clip(relu(F-80)/(150-80),0,2)`；仅指定脚的新物理接触 | 从 `80 N` 开始连续惩罚冲击力，使触球在到达 `150 N` 硬失效上限之前就有“更轻”的学习梯度。 |
-| `s2_undesired_ball_contact` | `-6.0` | 非脚踝 `1.0`；错误脚 `0.5`；事件前过早脚踝触球 `0.5` | 惩罚身体/膝/腕等非脚踝触球（实际贡献 `-6`），以及错误脚或过早触球（各实际贡献 `-3`）。错误 inside/outside 不在此项直接扣分，而是少拿 `s2_correct_side` 并降低 proximity。 |
+| `s2_contact_proximity` | `+0.5` | `1/(1+(d_target/0.12)²) × front_gate × time_weight` | 给指定脚接近球的连续梯度。`d_target=sqrt(reach_error²+side_error²)`：距离在 `0.25 m` 内没有 reach error，球进入正确内/外侧 `0.04 m` 外没有 side error。球在脚后方时，`front_gate` 在局部 `x=-0.05..0.05 m` 从 0 线性升到 1。事件前 0.30 s 的 `time_weight` 从 0.20 升到 1；有效事件成功后关闭。 |
+| `s2_valid_contact_bonus` | `+4.5` | 每个事件最多一个 `1` 脉冲 | 只有窗口内、指定脚、contact 上升沿、正确 inside/outside 侧的真实物理触球才奖励。错误侧触球不设置成功；松开后仍可在窗口内重试。 |
+| `s2_nonfoot_ball_contact` | `-1.0` | 非脚踝新触球返回 `1` | 轻量惩罚身体、膝、腕等非法 link 碰球。 |
+| `s2_wrong_foot_contact` | `-0.25` | 窗口内错误脚的新触球返回 `1` | reference 明确给出指定脚；错误脚不能完成有效事件，并额外受到轻量惩罚。 |
+| `s2_premature_contact` | `-0.25` | 目标窗口前的新脚踝触球；每个目标事件最多一个脉冲 | 抑制提前碰球，同时避免接触抖动导致同一事件被重复处罚。 |
+
+触球检测仍保留 `>1 N` 的传感器噪声下限。除此之外，触球力只记录为 `s2_touch_force_mean` 和 `s2_touch_force_max` telemetry；不存在 `150 N` hard gate、soft-force reward 或 force termination。`s2_touch_occurrence` 同样只记录 occurrence rate，不产生 reward。
+
+事件窗口加 3 步 grace 后仍没有 `s2_valid_contact_bonus`，记为 `missed_valid_contact`。只有 curriculum 配置要求 1 或 2 次触球的短序列会因此立即结束；4/8/全片段等级只重置连续成功计数并继续 episode。当前正式 curriculum 的最短等级要求 2 次触球。
 
 ### 4.3 S2 实际没有在优化什么
 

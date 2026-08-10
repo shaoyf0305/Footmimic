@@ -543,8 +543,13 @@ def _diagnostic_reward_params(base_env, reward_name: str) -> dict:
 def _diagnostic_contact_settings(base_env) -> dict:
     """Resolve the exact legal-touch geometry configured for this task."""
     params = _diagnostic_reward_params(base_env, "dribbling_legal_foot_touch")
+    default_force_threshold = 14.0
     if not params:
-        params = _diagnostic_reward_params(base_env, "s2_new_touch")
+        params = _diagnostic_reward_params(base_env, "s2_valid_contact_bonus")
+        # S2 deliberately has no force-validity cap. Infinity keeps the generic
+        # playback classifier aligned with that contract while raw force is
+        # still exported separately.
+        default_force_threshold = float("inf")
     all_body_cfg = params.get("all_body_cfg")
     return {
         "command_name": str(params.get("command_name", "motion")),
@@ -554,7 +559,7 @@ def _diagnostic_contact_settings(base_env) -> dict:
         "contact_surface": str(params.get("contact_surface", "any")),
         "medial_y_min": float(params.get("medial_y_min", 0.018)),
         "contact_force_threshold": float(
-            params.get("force_threshold", params.get("max_touch_force", 14.0))
+            params.get("force_threshold", default_force_threshold)
         ),
         "cg_gated": bool(params.get("cg_gated", False)),
         "cg_surface_gated": bool(params.get("cg_surface_gated", False)),
@@ -965,6 +970,11 @@ def _create_diagnostic(
         "s2_episode_curriculum_audit": [],
         "s2_episode_contact_count": [],
         "s2_premature_contact_count": [],
+        "s2_touch_occurrence_rate": [],
+        "s2_valid_contact_rate": [],
+        "s2_correct_side_rate": [],
+        "s2_touch_force_mean": [],
+        "s2_touch_force_max": [],
         "s2_contact_event_id": [],
         "s2_contact_event_frame": [],
         "s2_expected_foot": [],
@@ -1280,6 +1290,19 @@ def _append_diagnostic(
         float(premature_contact_count[0].item())
         if isinstance(premature_contact_count, torch.Tensor) else 0.0
     )
+    for metric_name in (
+        "s2_touch_occurrence_rate",
+        "s2_valid_contact_rate",
+        "s2_correct_side_rate",
+        "s2_touch_force_mean",
+        "s2_touch_force_max",
+    ):
+        metric_value = command.metrics.get(metric_name)
+        diagnostic[metric_name].append(
+            float(metric_value[0].item())
+            if isinstance(metric_value, torch.Tensor)
+            else 0.0
+        )
     if isinstance(s2_event_id, torch.Tensor) and hasattr(command, "s2_contact_reference_foot_pose_w"):
         reference_foot_pos, reference_foot_yaw = command.s2_contact_reference_foot_pose_w()
         ball_offset_reference_foot = quat_apply_inverse(
