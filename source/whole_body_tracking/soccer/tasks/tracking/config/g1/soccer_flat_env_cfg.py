@@ -1,5 +1,3 @@
-import math
-
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -10,10 +8,8 @@ from isaaclab.utils import configclass
 from isaaclab.markers import VisualizationMarkersCfg
 
 from soccer.assets import ASSET_DIR
-from soccer.robots.g1 import G1_ACTION_SCALE, G1_CYLINDER_CFG
-from soccer.tasks.tracking.config.g1.agents.rsl_rl_ppo_cfg import LOW_FREQ_SCALE
 from soccer.tasks.tracking import mdp
-from soccer.tasks.tracking.tracking_env_cfg import TrackingEnvCfg, MySceneCfg, CurriculumCfg
+from soccer.tasks.tracking.tracking_env_cfg import MySceneCfg
 from .flat_env_cfg import G1FlatEnvCfg
 
 SOCCER_BALL_RADIUS = 0.11
@@ -288,7 +284,7 @@ class G1FlatMotionEnvCfg(G1FlatEnvCfg):
 
 @configclass
 class G1FlatMotionPretrainEnvCfg(G1FlatMotionEnvCfg):
-    """Stage-1 flat motion pretrain (``Tracking-Flat-G1-Motion-RNN-v0``).
+    """Stage-1 flat motion pretrain base configuration.
 
     Sibling of :class:`G1FlatProximityEnvCfg` under :class:`G1FlatMotionEnvCfg`:
     shared scene/commands live on the base; mimic-pretrain rewards/terminations
@@ -352,15 +348,6 @@ class G1FlatProximityEnvCfg(G1FlatMotionEnvCfg):
                 "foot_cfg": self.foot_cfg,
             },
         )
-
-        # self.rewards.feet_slip_penalty = RewTerm(
-        #     func=mdp.feet_slip_penalty,
-        #     weight=-1.0,
-        #     params={
-        #         "foot_cfg": self.foot_cfg,
-        #         "slip_force_threshold": 5.0,
-        #     },
-        # )
 
         self.rewards.target_point_proximity = RewTerm(
             func=mdp.target_point_proximity,

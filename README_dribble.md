@@ -8,7 +8,7 @@ yaw target, which matches real-robot deployment.
 Train the complete path with:
 
 ```bash
-bash shell/progressive_dribbling_train.sh my_run --cg-unified-3stage
+bash shell/progressive_dribbling_train.sh my_run
 ```
 
 | Stage | Task ID | Objective |
@@ -61,9 +61,7 @@ effective command blends from the S2 reference twist to the sampled task
 twist. All root-velocity rewards and policy inputs use that same effective
 command.
 
-The legacy `unified-s1-mimic`, `unified-s2-reference`, and `unified-s3-task`
-IDs remain frozen compatibility baselines; do not resume them into this local
-curriculum.
+Only the three local S1/S2/S3 task IDs in the table above are registered.
 
 ## Interface and deployment
 
@@ -122,12 +120,20 @@ Unknown history from an older checkpoint remains `-1`. The trace retains the
 restored curriculum level, uniform-audit flag, sampled episode contact count,
 and cumulative premature-contact count.
 
-The cumulative ablation task IDs are
-`unified-s2-ablation-motion`, `unified-s2-ablation-time`,
-`unified-s2-ablation-foot`, and `unified-s2-ablation-side` (all prefixed by
-`Tracking-CG-G1-Dribbling-RNN-`). They respectively add contact timing,
-specified-foot gating, and foot-local side gating while keeping the same
-two-contact initialization distribution.
+### Removed S2 ablations
+
+The four former S2 ablations were cumulative diagnostic environments, not four
+extra reward terms. They have now been removed together with the old task IDs:
+
+| Label | Contact supervision that was enabled |
+|---|---|
+| `motion` | Motion/reference-twist objectives only; all S2 contact-event rewards and contact-related terminations were disabled. |
+| `time` | Added reference-window touch timing, but accepted either ankle and ignored the labelled instep side. |
+| `foot` | Added the expected left/right contact foot, but still ignored inside/outside instep side. |
+| `side` | Added the labelled inside/outside instep side, making it equivalent to the complete S2 contact objective. |
+
+All four used a fixed two-contact initialization distribution so that contact
+supervision was the only independent variable.
 
 The S2 contact-curriculum task requires valid `dribble_cg_contact`,
 `dribble_cg_foot`, `dribble_cg_surface`, and `ball_pos_w` arrays. At this

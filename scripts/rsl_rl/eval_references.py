@@ -4,11 +4,11 @@ Runs one reference .npz at a time with a trained checkpoint, aggregates tracking
 termination metrics, writes a JSON + CSV report, and can symlink passing motions
 into a filtered directory for re-training.
 
-Example (dribbling stage-2, dribble-distance references):
+Example (dribbling stage-2, labelled master-single reference):
   python scripts/rsl_rl/eval_references.py \\
-    --task Tracking-CG-G1-Dribbling-RNN-unified-control \\
+    --task Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference \\
     --experiment_name g1_dribbling \\
-    --motion_path motions/dribble-distance \\
+    --motion_path motions/master-single \\
     --load_run 2026-06-09_03-45-57_resumed_dribble \\
     --checkpoint model_84000.pt \\
     --num_rollouts 5 \\
@@ -44,7 +44,7 @@ parser.add_argument(
     "--task",
     type=str,
     required=True,
-    help="Gym task id, e.g. Tracking-CG-G1-Dribbling-RNN-unified-control.",
+    help="Gym task id, e.g. Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference.",
 )
 parser.add_argument(
     "--motion_path",

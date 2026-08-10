@@ -14,7 +14,7 @@ Written fields (compatible with current loader):
   - kick_frame: int
   - kick_end_frame: int
 
-Contact-graph (for ``Tracking-CG-G1-Dribbling-RNN-unified-control``):
+Contact-graph (for ``Tracking-CG-G1-Dribbling-RNN-unified-s2-local-reference``):
   - contact_segments: list of {start, end, foot, surface}; ``foot`` is
     {left, right} and ``surface`` is {inside_instep, outside_instep}.
   - apply writes ``dribble_cg_contact`` / ``dribble_cg_foot`` /
