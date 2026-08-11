@@ -3,8 +3,10 @@
 Uses per-frame ``ball_pos_w`` from motion for labels and, for unified local
 stages, reset placement at the first labelled contact.  The reset position is
 represented relative to the frame-0 pelvis yaw, never by a fixed simulation
-``+X`` direction. Optional demo kinematic snap is controlled separately by
-``dribble_cg_snap_mode``:
+``+X`` direction. Optional demo kinematic snap is controlled by
+``dribble_cg_snap_mode`` for legacy spawn modes.  A
+``reference_first_contact`` spawn always remains physical and cannot be
+kinematically snapped:
 
 - ``full`` (default): every step writes the demo ball pose into simulation.
 - ``non_contact_only``: only overwrite the ball when the CG label says
@@ -36,6 +38,11 @@ from .commands_multi_motion_soccer import MotionCommand, MotionCommandCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+_REFERENCE_FIRST_CONTACT_SPAWN_MODES = frozenset(
+    {"reference_first_contact", "first_contact", "contact"}
+)
 
 
 class DribbleCGMotionCommand(MotionCommand):
@@ -738,6 +745,14 @@ class DribbleCGMotionCommand(MotionCommand):
 
     def _should_snap_demo_ball(self, env_ids: torch.Tensor) -> torch.Tensor:
         """Per-env bool: write sim ball from demo this step."""
+        # A first-contact spawn is a physical initial condition.  Snapping it
+        # to the demo trajectory would immediately replace that world-space
+        # target with ``ball_pos_w[current_frame]`` (usually frame 0).  Make
+        # the two modes mutually exclusive here instead of relying on every
+        # stage config to repeat ``dribble_cg_snap_mode = "never"``.
+        if self._uses_reference_first_contact_spawn():
+            return torch.zeros(env_ids.numel(), device=self.device, dtype=torch.bool)
+
         mi = self.motion_idx[env_ids]
         has_demo = self.motion.motion_has_ball_demo[mi]
         mode = str(getattr(self.cfg, "dribble_cg_snap_mode", "full")).lower().strip()
@@ -747,6 +762,13 @@ class DribbleCGMotionCommand(MotionCommand):
             in_ref_contact = self.motion.dribble_cg_contact[mi, self.time_steps[env_ids]] > 0
             return has_demo & ~in_ref_contact
         return has_demo
+
+    def _uses_reference_first_contact_spawn(self) -> bool:
+        """Whether reset placement owns a persistent physical ball."""
+        spawn_mode = str(
+            getattr(self.cfg, "dribble_cg_ball_spawn_mode", "legacy")
+        ).lower().strip()
+        return spawn_mode in _REFERENCE_FIRST_CONTACT_SPAWN_MODES
 
     def _anchor_local_front_ball_positions(self, env_ids: torch.Tensor) -> torch.Tensor:
         """Fallback ball ahead of the frame-0 reference pelvis in pelvis-local axes."""
@@ -785,12 +807,11 @@ class DribbleCGMotionCommand(MotionCommand):
         direct value avoids introducing any simulation/world-forward axis.
         """
         mi = self.motion_idx[env_ids]
-        selected_frames = self.s2_episode_first_contact_frame[env_ids]
-        contact_frames = torch.where(
-            selected_frames >= 0,
-            selected_frames,
-            self.motion.first_dribble_contact_frame[mi],
-        )
+        # "Reference first contact" means the first rising edge in the whole
+        # source clip.  It must not depend on a curriculum/replay selection:
+        # the robot always resets at source frame 0, so an interior event would
+        # put the ball at a future touch while replaying the prefix from frame 0.
+        contact_frames = self.motion.first_dribble_contact_frame[mi]
         valid = (contact_frames >= 0) & self.motion.motion_has_ball_demo[mi]
         safe_frames = contact_frames.clamp(min=0)
         positions = self.motion.ball_pos_w[mi, safe_frames].clone()
@@ -947,8 +968,7 @@ class DribbleCGMotionCommand(MotionCommand):
         if ids.numel() == 0:
             return
 
-        spawn_mode = str(getattr(self.cfg, "dribble_cg_ball_spawn_mode", "legacy")).lower().strip()
-        if spawn_mode in {"reference_first_contact", "first_contact", "contact"}:
+        if self._uses_reference_first_contact_spawn():
             contact_positions, valid, contact_frames = self._reference_first_contact_ball_positions(ids)
             fallback_positions = self._anchor_local_front_ball_positions(ids)
             ball_positions = torch.where(valid.unsqueeze(-1), contact_positions, fallback_positions)
@@ -1020,8 +1040,9 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     class_type: type = DribbleCGMotionCommand
 
     dribble_cg_snap_mode: str = "full"
-    # This does not select a reset spawn frame; unified local stages disable
-    # demo-ball snapping with ``dribble_cg_snap_mode = \"never\"``.
+    # This does not select a reset spawn frame.  Unified local stages still
+    # set it to ``never`` explicitly, while ``reference_first_contact`` also
+    # enforces that invariant inside the command implementation.
     dribble_cg_use_task_frame: bool = True
     # ``reference_first_contact`` places a physical reset ball at the first
     # labelled ``dribble_cg_contact`` point in ``ball_pos_w``.  ``legacy``

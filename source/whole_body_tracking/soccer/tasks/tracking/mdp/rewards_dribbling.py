@@ -724,22 +724,10 @@ def _dribbling_s2_proximity_geometry(
     target_side_enabled: bool,
     side_deadzone: float,
     contact_distance_max: float,
-    front_gate_min: float,
-    front_gate_full: float,
 ) -> dict[str, torch.Tensor]:
-    """Return physical reach/side error plus a coarse anti-cheating front gate.
-
-    The gate is deliberately one-sided: it suppresses dense proximity reward
-    behind the expected foot, but imposes no preferred forward coordinate or
-    upper forward bound. Inside/outside remains a lateral half-space label.
-    """
+    """Return physical reach and labelled inside/outside errors."""
     if float(contact_distance_max) <= 0.0:
         raise ValueError("contact_distance_max must be positive")
-    if float(front_gate_full) <= float(front_gate_min):
-        raise ValueError(
-            "front_gate_full must be greater than front_gate_min; "
-            f"got {front_gate_full} and {front_gate_min}"
-        )
 
     physical_distance = torch.linalg.vector_norm(ball_from_foot, dim=-1)
     reach_error = torch.relu(physical_distance - float(contact_distance_max))
@@ -764,20 +752,45 @@ def _dribbling_s2_proximity_geometry(
         side_wrong = torch.zeros_like(side_correct)
 
     target_distance = torch.sqrt(reach_error.square() + side_error.square())
-    front_gate = torch.clamp(
-        (ball_from_foot[:, 0] - float(front_gate_min))
-        / (float(front_gate_full) - float(front_gate_min)),
-        min=0.0,
-        max=1.0,
-    )
     return {
         "target_distance": target_distance,
-        "front_gate": front_gate,
         "physical_distance": physical_distance,
         "lateral": lateral,
         "medial_lateral": medial_lateral,
         "side_correct": side_correct,
         "side_wrong": side_wrong,
+    }
+
+
+def _dribbling_s2_target_event(command: MotionCommand) -> dict[str, torch.Tensor]:
+    """Select the current-window event, otherwise the next event."""
+    contact_event_id = command.s2_contact_event_id_ref
+    contact_event_frame = command.s2_contact_event_frame_ref
+    contact_expected_foot = command.s2_contact_event_foot_ref
+    contact_expected_surface = command.s2_contact_event_surface_ref
+    contact_window = (contact_event_id >= 0) & (
+        (contact_expected_foot == 0) | (contact_expected_foot == 1)
+    )
+    (
+        upcoming_event_id,
+        upcoming_event_frame,
+        upcoming_expected_foot,
+        upcoming_expected_surface,
+    ) = command.s2_upcoming_contact_event_ref()
+    return {
+        "contact_window": contact_window,
+        "upcoming_event_id": upcoming_event_id,
+        "upcoming_event_frame": upcoming_event_frame,
+        "event_id": torch.where(contact_window, contact_event_id, upcoming_event_id),
+        "event_frame": torch.where(
+            contact_window, contact_event_frame, upcoming_event_frame
+        ),
+        "expected_foot": torch.where(
+            contact_window, contact_expected_foot, upcoming_expected_foot
+        ),
+        "expected_surface": torch.where(
+            contact_window, contact_expected_surface, upcoming_expected_surface
+        ),
     }
 
 
@@ -791,8 +804,6 @@ def dribbling_s2_contact_event_state(
     target_side_enabled: bool = True,
     side_deadzone: float = 0.04,
     proximity_contact_distance_max: float = 0.25,
-    proximity_front_gate_min: float = -0.05,
-    proximity_front_gate_full: float = 0.05,
     target_region_std: float = 0.12,
     proximity_approach_seconds: float = 0.30,
     proximity_approach_min_weight: float = 0.20,
@@ -820,7 +831,6 @@ def dribbling_s2_contact_event_state(
             "contact_window": false,
             "contact_proximity": zero,
             "target_region_distance": zero,
-            "proximity_front_gate": zero,
             "physical_foot_ball_distance": zero,
             "touch_occurrence": false,
             "valid_contact_event": false,
@@ -835,6 +845,8 @@ def dribbling_s2_contact_event_state(
             "premature_contact_penalty": zero,
             "missed_valid_contact": false,
             "timing_error_seconds": zero,
+            "event_id": torch.full_like(zero, -1, dtype=torch.long),
+            "expected_foot": torch.full_like(zero, -1, dtype=torch.long),
         }
 
     step = getattr(
@@ -865,28 +877,17 @@ def dribbling_s2_contact_event_state(
     else:
         reset = generation != previous_generation
     setattr(env, "_dribbling_s2_episode_generation", generation.detach().clone())
-    contact_event_id = command.s2_contact_event_id_ref
-    contact_event_frame = command.s2_contact_event_frame_ref
-    contact_expected_foot = command.s2_contact_event_foot_ref
-    contact_expected_surface = command.s2_contact_event_surface_ref
-    active = (contact_event_id >= 0) & (
-        (contact_expected_foot == 0) | (contact_expected_foot == 1)
-    )
-    (
-        upcoming_event_id,
-        upcoming_event_frame,
-        upcoming_expected_foot,
-        upcoming_expected_surface,
-    ) = command.s2_upcoming_contact_event_ref()
+    target_event = _dribbling_s2_target_event(command)
+    active = target_event["contact_window"]
     # During the contact window the current label wins. Before the window,
     # only the next event's time/foot/side label is exposed for approach
     # shaping; no reference ball position participates in the reward.
-    event_id = torch.where(active, contact_event_id, upcoming_event_id)
-    event_frame = torch.where(active, contact_event_frame, upcoming_event_frame)
-    expected_foot = torch.where(active, contact_expected_foot, upcoming_expected_foot)
-    expected_surface = torch.where(
-        active, contact_expected_surface, upcoming_expected_surface
-    )
+    event_id = target_event["event_id"]
+    event_frame = target_event["event_frame"]
+    expected_foot = target_event["expected_foot"]
+    expected_surface = target_event["expected_surface"]
+    upcoming_event_id = target_event["upcoming_event_id"]
+    upcoming_event_frame = target_event["upcoming_event_frame"]
 
     ball_pos_w = env.scene["soccer_ball"].data.root_pos_w[:, :3]
 
@@ -934,12 +935,9 @@ def dribbling_s2_contact_event_state(
         target_side_enabled=target_side_enabled,
         side_deadzone=side_deadzone,
         contact_distance_max=proximity_contact_distance_max,
-        front_gate_min=proximity_front_gate_min,
-        front_gate_full=proximity_front_gate_full,
     )
     current_lateral = proximity_geometry["lateral"]
     target_distance = proximity_geometry["target_distance"]
-    proximity_front_gate = proximity_geometry["front_gate"]
     physical_foot_ball_distance = proximity_geometry["physical_distance"]
     # A rational-quadratic kernel keeps a useful tail when the physical foot
     # starts outside contact reach or on the wrong labelled side. The previous
@@ -972,7 +970,7 @@ def dribbling_s2_contact_event_state(
     approach_weight = torch.where(active, torch.ones_like(approach_weight), approach_weight)
     proximity = (
         1.0 / (1.0 + normalized_distance.square())
-    ) * proximity_front_gate * proximity_active.to(torch.float32) * approach_weight
+    ) * proximity_active.to(torch.float32) * approach_weight
 
     previous_contact = getattr(env, "_dribbling_s2_previous_contact", None)
     if not isinstance(previous_contact, torch.Tensor) or previous_contact.shape[0] != env.num_envs:
@@ -1236,7 +1234,6 @@ def dribbling_s2_contact_event_state(
         "contact_window": active,
         "contact_proximity": proximity,
         "target_region_distance": target_distance,
-        "proximity_front_gate": proximity_front_gate,
         "physical_foot_ball_distance": physical_foot_ball_distance,
         "touch_occurrence": touch_occurrence,
         "valid_contact_event": valid_contact_event,
@@ -1284,21 +1281,82 @@ def dribbling_s2_contact_proximity(
     target_side_enabled: bool = True,
     side_deadzone: float = 0.04,
     proximity_contact_distance_max: float = 0.25,
-    proximity_front_gate_min: float = -0.05,
-    proximity_front_gate_full: float = 0.05,
     target_region_std: float = 0.12,
     proximity_approach_seconds: float = 0.30,
     proximity_approach_min_weight: float = 0.20,
     missed_contact_grace_steps: int = 3,
 ) -> torch.Tensor:
-    """Continuous physical ball/foot reach signal with a coarse front gate."""
+    """Windowed physical reach and labelled-side proximity signal."""
     return dribbling_s2_contact_event_state(
         env, command_name, ball_sensor_name, all_body_cfg, num_ankle_links,
         require_expected_foot, target_side_enabled,
-        side_deadzone, proximity_contact_distance_max,
-        proximity_front_gate_min, proximity_front_gate_full, target_region_std, proximity_approach_seconds,
+        side_deadzone, proximity_contact_distance_max, target_region_std, proximity_approach_seconds,
         proximity_approach_min_weight, missed_contact_grace_steps,
     )["contact_proximity"]
+
+
+def dribbling_s2_global_foot_ball_distance_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    foot_body_names: list[str] | None = None,
+    global_foot_ball_distance_std: float = 0.40,
+) -> torch.Tensor:
+    """Reward actual target-foot/ball distance without a contact-sensor gate."""
+    std = float(global_foot_ball_distance_std)
+    if std <= 0.0:
+        raise ValueError("global_foot_ball_distance_std must be positive")
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    required = (
+        "s2_contact_event_id_ref",
+        "s2_contact_event_frame_ref",
+        "s2_contact_event_foot_ref",
+        "s2_contact_event_surface_ref",
+        "s2_upcoming_contact_event_ref",
+    )
+    if any(not hasattr(command, name) for name in required):
+        score = torch.zeros(env.num_envs, device=env.device)
+        command.metrics["s2_global_foot_ball_distance"] = score
+        command.metrics["s2_global_foot_ball_score"] = score
+        command.metrics["s2_global_foot_ball_expected_foot"] = torch.full_like(score, -1)
+        command.metrics["s2_global_foot_ball_active"] = score
+        return score
+    if foot_body_names is None:
+        foot_body_names = ["left_ankle_roll_link", "right_ankle_roll_link"]
+    if len(foot_body_names) != 2:
+        raise ValueError("S2 global foot-ball distance requires exactly two foot bodies")
+    try:
+        left_slot = foot_body_names.index("left_ankle_roll_link")
+        right_slot = foot_body_names.index("right_ankle_roll_link")
+        body_indices = [command.cfg.body_names.index(name) for name in foot_body_names]
+    except ValueError as exc:
+        raise ValueError(
+            "S2 global foot-ball distance requires left/right ankle roll links in the motion command"
+        ) from exc
+    target_event = _dribbling_s2_target_event(command)
+    expected_foot = target_event["expected_foot"]
+    active = (target_event["event_id"] >= 0) & (
+        (expected_foot == 0) | (expected_foot == 1)
+    )
+    selected_slot = torch.where(
+        expected_foot == 1,
+        torch.full_like(expected_foot, right_slot),
+        torch.full_like(expected_foot, left_slot),
+    )
+    batch = torch.arange(env.num_envs, device=env.device)
+    actual_foot_positions = command.robot_body_pos_w[:, body_indices]
+    actual_foot_position = actual_foot_positions[batch, selected_slot]
+    ball_position = env.scene["soccer_ball"].data.root_pos_w[:, :3]
+    distance = torch.linalg.vector_norm(ball_position - actual_foot_position, dim=-1)
+    score = torch.exp(-torch.square(distance / std)) * active.to(distance.dtype)
+    command.metrics["s2_global_foot_ball_distance"] = torch.where(
+        active, distance, torch.zeros_like(distance)
+    )
+    command.metrics["s2_global_foot_ball_score"] = score
+    command.metrics["s2_global_foot_ball_expected_foot"] = torch.where(
+        active, expected_foot, torch.full_like(expected_foot, -1)
+    ).to(torch.float32)
+    command.metrics["s2_global_foot_ball_active"] = active.to(torch.float32)
+    return score
 
 
 def dribbling_s2_touch_occurrence(
@@ -1311,8 +1369,6 @@ def dribbling_s2_touch_occurrence(
     target_side_enabled: bool = True,
     side_deadzone: float = 0.04,
     proximity_contact_distance_max: float = 0.25,
-    proximity_front_gate_min: float = -0.05,
-    proximity_front_gate_full: float = 0.05,
     target_region_std: float = 0.12,
     proximity_approach_seconds: float = 0.30,
     proximity_approach_min_weight: float = 0.20,
@@ -1322,8 +1378,7 @@ def dribbling_s2_touch_occurrence(
     return dribbling_s2_contact_event_state(
         env, command_name, ball_sensor_name, all_body_cfg, num_ankle_links,
         require_expected_foot, target_side_enabled,
-        side_deadzone, proximity_contact_distance_max,
-        proximity_front_gate_min, proximity_front_gate_full, target_region_std, proximity_approach_seconds,
+        side_deadzone, proximity_contact_distance_max, target_region_std, proximity_approach_seconds,
         proximity_approach_min_weight, missed_contact_grace_steps,
     )["touch_occurrence"].to(torch.float32)
 
@@ -1338,8 +1393,6 @@ def dribbling_s2_valid_contact_bonus(
     target_side_enabled: bool = True,
     side_deadzone: float = 0.04,
     proximity_contact_distance_max: float = 0.25,
-    proximity_front_gate_min: float = -0.05,
-    proximity_front_gate_full: float = 0.05,
     target_region_std: float = 0.12,
     proximity_approach_seconds: float = 0.30,
     proximity_approach_min_weight: float = 0.20,
@@ -1349,8 +1402,7 @@ def dribbling_s2_valid_contact_bonus(
     return dribbling_s2_contact_event_state(
         env, command_name, ball_sensor_name, all_body_cfg, num_ankle_links,
         require_expected_foot, target_side_enabled,
-        side_deadzone, proximity_contact_distance_max,
-        proximity_front_gate_min, proximity_front_gate_full, target_region_std, proximity_approach_seconds,
+        side_deadzone, proximity_contact_distance_max, target_region_std, proximity_approach_seconds,
         proximity_approach_min_weight, missed_contact_grace_steps,
     )["valid_contact_event"].to(torch.float32)
 
@@ -1365,8 +1417,6 @@ def dribbling_s2_nonfoot_ball_contact_penalty(
     target_side_enabled: bool = True,
     side_deadzone: float = 0.04,
     proximity_contact_distance_max: float = 0.25,
-    proximity_front_gate_min: float = -0.05,
-    proximity_front_gate_full: float = 0.05,
     target_region_std: float = 0.12,
     proximity_approach_seconds: float = 0.30,
     proximity_approach_min_weight: float = 0.20,
@@ -1376,8 +1426,7 @@ def dribbling_s2_nonfoot_ball_contact_penalty(
     return dribbling_s2_contact_event_state(
         env, command_name, ball_sensor_name, all_body_cfg, num_ankle_links,
         require_expected_foot, target_side_enabled,
-        side_deadzone, proximity_contact_distance_max,
-        proximity_front_gate_min, proximity_front_gate_full, target_region_std, proximity_approach_seconds,
+        side_deadzone, proximity_contact_distance_max, target_region_std, proximity_approach_seconds,
         proximity_approach_min_weight, missed_contact_grace_steps,
     )["nonfoot_contact_penalty"]
 
@@ -1392,8 +1441,6 @@ def dribbling_s2_wrong_foot_contact_penalty(
     target_side_enabled: bool = True,
     side_deadzone: float = 0.04,
     proximity_contact_distance_max: float = 0.25,
-    proximity_front_gate_min: float = -0.05,
-    proximity_front_gate_full: float = 0.05,
     target_region_std: float = 0.12,
     proximity_approach_seconds: float = 0.30,
     proximity_approach_min_weight: float = 0.20,
@@ -1403,8 +1450,7 @@ def dribbling_s2_wrong_foot_contact_penalty(
     return dribbling_s2_contact_event_state(
         env, command_name, ball_sensor_name, all_body_cfg, num_ankle_links,
         require_expected_foot, target_side_enabled,
-        side_deadzone, proximity_contact_distance_max,
-        proximity_front_gate_min, proximity_front_gate_full, target_region_std, proximity_approach_seconds,
+        side_deadzone, proximity_contact_distance_max, target_region_std, proximity_approach_seconds,
         proximity_approach_min_weight, missed_contact_grace_steps,
     )["wrong_foot_contact_penalty"]
 
@@ -1419,8 +1465,6 @@ def dribbling_s2_premature_contact_penalty(
     target_side_enabled: bool = True,
     side_deadzone: float = 0.04,
     proximity_contact_distance_max: float = 0.25,
-    proximity_front_gate_min: float = -0.05,
-    proximity_front_gate_full: float = 0.05,
     target_region_std: float = 0.12,
     proximity_approach_seconds: float = 0.30,
     proximity_approach_min_weight: float = 0.20,
@@ -1430,8 +1474,7 @@ def dribbling_s2_premature_contact_penalty(
     return dribbling_s2_contact_event_state(
         env, command_name, ball_sensor_name, all_body_cfg, num_ankle_links,
         require_expected_foot, target_side_enabled,
-        side_deadzone, proximity_contact_distance_max,
-        proximity_front_gate_min, proximity_front_gate_full, target_region_std, proximity_approach_seconds,
+        side_deadzone, proximity_contact_distance_max, target_region_std, proximity_approach_seconds,
         proximity_approach_min_weight, missed_contact_grace_steps,
     )["premature_contact_penalty"]
 

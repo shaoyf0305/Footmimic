@@ -988,8 +988,11 @@ def _create_diagnostic(
         "s2_actual_foot_yaw": [],
         "s2_ball_offset_actual_foot": [],
         "s2_target_region_distance": [],
-        "s2_proximity_front_gate": [],
         "s2_physical_foot_ball_distance": [],
+        "s2_global_foot_ball_distance": [],
+        "s2_global_foot_ball_score": [],
+        "s2_global_foot_ball_expected_foot": [],
+        "s2_global_foot_ball_active": [],
         "cg_flow_label_available": [],
         "cg_flow_valid": [],
         "cg_flow_anchor_frame": [],
@@ -1296,6 +1299,10 @@ def _append_diagnostic(
         "s2_correct_side_rate",
         "s2_touch_force_mean",
         "s2_touch_force_max",
+        "s2_global_foot_ball_distance",
+        "s2_global_foot_ball_score",
+        "s2_global_foot_ball_expected_foot",
+        "s2_global_foot_ball_active",
     ):
         metric_value = command.metrics.get(metric_name)
         diagnostic[metric_name].append(
@@ -1311,7 +1318,7 @@ def _append_diagnostic(
         )
         def _s2_proximity_geometry(
             ball_offset: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             physical_distance = torch.linalg.vector_norm(ball_offset, dim=-1)
             reach_error = torch.relu(physical_distance - 0.25)
             signed_lateral = torch.where(
@@ -1319,10 +1326,9 @@ def _append_diagnostic(
             )
             side_error = torch.relu(0.04 - signed_lateral)
             target_distance = torch.sqrt(reach_error.square() + side_error.square())
-            front_gate = torch.clamp((ball_offset[:, 0] + 0.05) / 0.10, 0.0, 1.0)
-            return target_distance, front_gate, physical_distance
+            return target_distance, physical_distance
 
-        reference_region_distance, _, _ = _s2_proximity_geometry(
+        reference_region_distance, _ = _s2_proximity_geometry(
             ball_offset_reference_foot
         )
         expected_foot_value = int(s2_expected_foot[0].item())
@@ -1337,7 +1343,6 @@ def _append_diagnostic(
             )
             (
                 actual_region_distance,
-                actual_front_gate,
                 actual_physical_distance,
             ) = _s2_proximity_geometry(ball_offset_actual_foot)
             actual_yaw = _world_quat_to_rpy(actual_foot_yaw)[:, 2]
@@ -1345,7 +1350,6 @@ def _append_diagnostic(
             diagnostic["s2_actual_foot_yaw"].append(float(actual_yaw[0].item()))
             diagnostic["s2_ball_offset_actual_foot"].append(_cpu(ball_offset_actual_foot))
             diagnostic["s2_target_region_distance"].append(float(actual_region_distance[0].item()))
-            diagnostic["s2_proximity_front_gate"].append(float(actual_front_gate[0].item()))
             diagnostic["s2_physical_foot_ball_distance"].append(
                 float(actual_physical_distance[0].item())
             )
@@ -1354,7 +1358,6 @@ def _append_diagnostic(
             diagnostic["s2_actual_foot_yaw"].append(np.nan)
             diagnostic["s2_ball_offset_actual_foot"].append(np.full(3, np.nan, dtype=np.float32))
             diagnostic["s2_target_region_distance"].append(np.nan)
-            diagnostic["s2_proximity_front_gate"].append(np.nan)
             diagnostic["s2_physical_foot_ball_distance"].append(np.nan)
         diagnostic["s2_contact_window"].append(bool(s2_window[0].item()))
         diagnostic["s2_contact_event_id"].append(int(s2_event_id[0].item()))
@@ -1387,7 +1390,6 @@ def _append_diagnostic(
         diagnostic["s2_actual_foot_yaw"].append(np.nan)
         diagnostic["s2_ball_offset_actual_foot"].append(np.full(3, np.nan, dtype=np.float32))
         diagnostic["s2_target_region_distance"].append(np.nan)
-        diagnostic["s2_proximity_front_gate"].append(np.nan)
         diagnostic["s2_physical_foot_ball_distance"].append(np.nan)
     flow_available = getattr(command, "motion_has_dribble_cg_flow_label", None)
     flow_valid = getattr(command, "dribble_cg_flow_valid_ref", None)
@@ -1840,14 +1842,20 @@ def _save_diagnostic(diagnostic: dict) -> None:
         if np.any(s2_window_mask)
         else np.nan
     )
-    s2_front_gate = (
-        _finite_mean(arrays["s2_proximity_front_gate"][s2_window_mask])
-        if np.any(s2_window_mask)
-        else np.nan
-    )
     s2_physical_distance = (
         _finite_mean(arrays["s2_physical_foot_ball_distance"][s2_window_mask])
         if np.any(s2_window_mask)
+        else np.nan
+    )
+    s2_global_mask = arrays["s2_global_foot_ball_active"].astype(bool)
+    s2_global_distance = (
+        _finite_mean(arrays["s2_global_foot_ball_distance"][s2_global_mask])
+        if np.any(s2_global_mask)
+        else np.nan
+    )
+    s2_global_score = (
+        _finite_mean(arrays["s2_global_foot_ball_score"][s2_global_mask])
+        if np.any(s2_global_mask)
         else np.nan
     )
     torso_rel_tilt = float(
@@ -1961,8 +1969,9 @@ def _save_diagnostic(diagnostic: dict) -> None:
             f"episode_contacts={int(arrays['s2_episode_contact_count'][-1])}  "
             f"window_samples={int(np.count_nonzero(s2_window_mask))}  "
             f"actual_target_distance={s2_region_distance:.3f} m  "
-            f"front_gate={s2_front_gate:.3f}  "
             f"physical_foot_ball_distance={s2_physical_distance:.3f} m  "
+            f"global_foot_ball_distance={s2_global_distance:.3f} m  "
+            f"global_foot_ball_score={s2_global_score:.3f}  "
             f"reference_target_distance={s2_reference_region_distance:.3f} m  "
             "side_ids=(left=0, right=1, dead/unknown=-1)"
         )

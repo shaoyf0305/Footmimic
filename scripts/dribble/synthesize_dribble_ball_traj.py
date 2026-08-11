@@ -14,9 +14,11 @@ Pipeline (XGen-style, football simplification):
    edge of each contact segment is the hand-labelled **contact instant**.  Only
    that anchor is constrained to the shoe surface; the remaining ``+5`` CG
    frames stay labelled for training but do not drag the ball with the foot.
-   Gaps linearly interpolate through the anchors and the tail releases with the
-   incoming ball velocity.  Missing surface labels preserve the legacy
-   contact-adhere behavior.
+   Before the first contact, the ball is held at that first anchor's world
+   position; gaps between later contacts linearly interpolate through the
+   anchors and the tail releases with the incoming ball velocity.  Missing
+   surface labels preserve the same stationary pre-contact rule before their
+   legacy contact-adhere segments.
 
    ``foot_follow``: ball tracks a stepping foot every frame. ``lerp``: legacy gaps +
    anchor spawn (avoid for master data).
@@ -471,11 +473,14 @@ def synthesize_ball_trajectory(
 
             t_first, fid_first, sid_first = surface_anchors[0]
             if t_first > 0:
-                _place_contact_frame(0, fid_first, sid_first)
-                p_start = ball[0, :2].copy()
-                _lerp_gap(-1, t_first, p_start, ball[t_first, :2], fid_first)
-                ball[0, :2] = p_start
-                placement_foot[0] = fid_first
+                # The physical episode starts with a stationary ball at the
+                # first contact's world-space target.  Placing frame 0 against
+                # the future contact foot and interpolating to this anchor made
+                # the ball move without contact and could start it inside the
+                # robot's shoe collision geometry.
+                ball[:t_first, :2] = ball[t_first, :2]
+                ball[:t_first, 2] = ball_radius
+                placement_foot[:t_first] = fid_first
 
             # Release after the final anchor with the incoming anchor-to-anchor
             # velocity.  This avoids both freezing in world space and following
@@ -513,11 +518,11 @@ def synthesize_ball_trajectory(
 
         s0, _, fid0 = segs[0]
         if s0 > 0:
-            _place_contact_frame(0, fid0, _segment_surface_id(*segs[0][:2]))
-            p_start = ball[0, :2].copy()
-            _lerp_gap(-1, s0, p_start, ball[s0, :2], fid0)
-            ball[0, :2] = p_start
-            placement_foot[0] = fid0
+            # Legacy contacts without surface labels use the same physical
+            # pre-contact invariant as the surface-anchor path above.
+            ball[:s0, :2] = ball[s0, :2]
+            ball[:s0, 2] = ball_radius
+            placement_foot[:s0] = fid0
 
         _, e_last, fid_last = segs[-1]
         if e_last < T - 1:

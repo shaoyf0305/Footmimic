@@ -130,7 +130,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
             )
         # Kick-style frozen proximity is not used for dribbling.
         if hasattr(self.rewards, "target_point_proximity"):
-            self.rewards.target_point_proximity.weight = 0.0
+            self.rewards.target_point_proximity = None
 
         # Stronger upright / anti-arch than generic proximity alone
         if hasattr(self.rewards, "pelvis_orientation"):
@@ -140,7 +140,7 @@ class G1FlatDribblingEnvCfg(G1FlatProximityEnvCfg):
         # cones") would otherwise force the policy to copy the S-shape heading pattern.
         # The face-ball reward below replaces it with a task-aligned heading signal.
         if hasattr(self.rewards, "motion_global_anchor_ori"):
-            self.rewards.motion_global_anchor_ori.weight = 0.0
+            self.rewards.motion_global_anchor_ori = None
 
         self.rewards.dribbling_face_ball = RewTerm(
             func=mdp.dribbling_face_ball,
@@ -592,7 +592,7 @@ class G1FlatCGDribblingEnvCfg(G1FlatDribblingEnvCfg):
         )
 
         # CG: no dense "hover foot on ball" between touches — proximity + contact labels suffice.
-        self.rewards.dribbling_approach_foot_ball.weight = 0.0
+        self.rewards.dribbling_approach_foot_ball = None
 
         # Velocity / forward progress use recent sim contact, not only labeled CG frames.
         self.rewards.dribbling_velocity_tracking.params["cg_gated_contact"] = False
@@ -667,9 +667,8 @@ def _remove_unified_kick_only_terms(cfg) -> None:
         observations.target_point_pos = None
         observations.target_destination_pos_local = None
 
-    # G1FlatDribblingEnvCfg already assigns zero weight.  Removing the term
-    # entirely prevents a later parent-config change from reintroducing a
-    # kick-style objective into the frozen unified contract.
+    # Keep the term absent so a later parent-config change cannot reintroduce
+    # a kick-style objective into the frozen unified contract.
     if hasattr(cfg.rewards, "target_point_proximity"):
         cfg.rewards.target_point_proximity = None
 
@@ -706,7 +705,7 @@ def _disable_reference_ball_contact_terms(cfg) -> None:
     # Keep reference gait only between touches. At contact, the task owns the
     # foot, surface, time, and ball position.
     if hasattr(cfg.rewards, "motion_foot_pos"):
-        cfg.rewards.motion_foot_pos.weight = 0.0
+        cfg.rewards.motion_foot_pos = None
     if hasattr(cfg.rewards, "dribbling_legal_foot_touch"):
         cfg.rewards.dribbling_legal_foot_touch.params["cg_gated"] = False
     if hasattr(cfg.rewards, "dribbling_rapid_retouch_penalty"):
@@ -814,11 +813,11 @@ def _apply_local_twist_velocity_rewards(
     """Replace world/task-frame root tracking with the active pelvis-local twist."""
     for reward_name in ("forward_velocity", "lateral_velocity_penalty", "task_heading_alignment"):
         if hasattr(cfg.rewards, reward_name):
-            getattr(cfg.rewards, reward_name).weight = 0.0
+            setattr(cfg.rewards, reward_name, None)
     if hasattr(cfg.rewards, "motion_global_anchor_pos"):
-        cfg.rewards.motion_global_anchor_pos.weight = 0.0
+        cfg.rewards.motion_global_anchor_pos = None
     if hasattr(cfg.rewards, "motion_global_anchor_ori"):
-        cfg.rewards.motion_global_anchor_ori.weight = 0.0
+        cfg.rewards.motion_global_anchor_ori = None
     cfg.rewards.motion_anchor_lin_vel = RewTerm(
         func=mdp.motion_anchor_local_lin_vel_tracking_exp,
         weight=lin_weight,
@@ -830,7 +829,7 @@ def _apply_local_twist_velocity_rewards(
         params={"command_name": "motion", "std": yaw_std},
     )
     if hasattr(cfg.rewards, "dribbling_velocity_tracking"):
-        cfg.rewards.dribbling_velocity_tracking.weight = 0.0
+        cfg.rewards.dribbling_velocity_tracking = None
 
 
 def _apply_local_ball_objectives(cfg, *, disable_pelvis_quat_tracking: bool) -> None:
@@ -842,7 +841,7 @@ def _apply_local_ball_objectives(cfg, *, disable_pelvis_quat_tracking: bool) -> 
     cfg.rewards.dribbling_face_ball.func = mdp.dribbling_pelvis_local_face_ball
     cfg.rewards.dribbling_legal_foot_touch.params["min_pelvis_heading"] = 0.0
     if disable_pelvis_quat_tracking and hasattr(cfg.rewards, "dribbling_pelvis_quat_tracking"):
-        cfg.rewards.dribbling_pelvis_quat_tracking.weight = 0.0
+        cfg.rewards.dribbling_pelvis_quat_tracking = None
 
 
 def _apply_local_task_ball_objectives(cfg) -> None:
@@ -850,23 +849,49 @@ def _apply_local_task_ball_objectives(cfg) -> None:
     _apply_local_ball_objectives(cfg, disable_pelvis_quat_tracking=True)
 
 
-def _apply_local_reference_ball_objectives(cfg) -> None:
-    """S2 version: local geometry while retaining its reference-pose prior."""
-    _apply_local_ball_objectives(cfg, disable_pelvis_quat_tracking=False)
+_S2_REWARD_NAMES = frozenset(
+    {
+        "motion_body_pos",
+        "motion_body_ori",
+        "motion_body_lin_vel",
+        "motion_body_ang_vel",
+        "motion_anchor_lin_vel",
+        "motion_anchor_ang_vel",
+        "action_rate_l2",
+        "waist_action_rate_l2",
+        "joint_limit",
+        "undesired_contacts",
+        "pelvis_orientation",
+        "upper_body_reference_overflow",
+        "upper_body_manifold_nullspace",
+        "s2_windowed_foot_tracking",
+        "s2_global_foot_ball_distance",
+        "s2_contact_proximity",
+        "s2_valid_contact_bonus",
+        "s2_nonfoot_ball_contact",
+        "s2_wrong_foot_contact",
+        "s2_premature_contact",
+    }
+)
 
 
-def _disable_s2_unreliable_ball_penalties(cfg) -> None:
-    """Remove S2 penalties that conflict with reference-local dribbling.
-
-    ``ball_trapped`` is currently a pelvis-distance/height threshold, not a
-    two-foot trap detector, and therefore penalizes normal S2 reference poses.
-    ``orbiting`` also mistakes reference lateral/yaw motion for circling.
-    Keep their implementations for S3/task experiments, but exclude both
-    terms from every S2 reward manager.
-    """
-    for reward_name in ("dribbling_ball_trapped_penalty", "dribbling_orbiting_penalty"):
-        if hasattr(cfg.rewards, reward_name):
+def _prune_s2_reward_manager(cfg) -> None:
+    """Remove every inherited reward outside the final S2 contract."""
+    for reward_name in dir(cfg.rewards):
+        if reward_name.startswith("_") or reward_name in _S2_REWARD_NAMES:
+            continue
+        reward_cfg = getattr(cfg.rewards, reward_name)
+        if isinstance(reward_cfg, RewTerm):
+            # ``None`` removes the term from RewardManager. A zero weight would
+            # keep dead configuration and runtime bookkeeping alive.
             setattr(cfg.rewards, reward_name, None)
+    missing = [
+        reward_name
+        for reward_name in sorted(_S2_REWARD_NAMES)
+        if not isinstance(getattr(cfg.rewards, reward_name, None), RewTerm)
+    ]
+    if missing:
+        raise RuntimeError(f"S2 reward contract is incomplete: {missing}")
 
 
 @configclass
@@ -933,19 +958,11 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         )
         _apply_local_twist_velocity_rewards(self, lin_weight=5.0, lin_std=0.60, yaw_weight=1.0, yaw_std=1.50)
         _apply_unified_local_163_contract(self)
-        _apply_local_reference_ball_objectives(self)
-        _disable_s2_unreliable_ball_penalties(self)
-        if hasattr(self.rewards, "dribbling_pelvis_quat_tracking"):
-            self.rewards.dribbling_pelvis_quat_tracking.weight = 0.0
 
         # S2 keeps normal two-foot imitation outside contact windows. During
         # contact it preserves the support-foot target and nearly releases
         # only the labelled contact foot so physics can determine its final
         # ball-relative placement.
-        self.rewards.motion_foot_pos = None
-        self.rewards.dribbling_gait_foot_tracking = None
-        if hasattr(self.rewards, "foot_distance"):
-            self.rewards.foot_distance = None
         self.rewards.s2_windowed_foot_tracking = RewTerm(
             func=mdp.dribbling_s2_windowed_foot_tracking_exp,
             weight=1.0,
@@ -958,12 +975,10 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
             },
         )
 
-        # The contact detector is shared by the three positive terms, the
-        # undesired-contact penalty, diagnostics, and missed-contact done.
-        legacy_touch = self.rewards.dribbling_legal_foot_touch
-        legacy_body_cfg = legacy_touch.params["all_body_cfg"]
-        num_ankle_links = int(legacy_touch.params["num_ankle_links"])
-        ankle_names = list(legacy_body_cfg.body_names[:num_ankle_links])
+        # Global distance uses only simulated poses plus the current/upcoming
+        # foot label. Contact-dependent terms share the event state below.
+        ankle_names = ["right_ankle_roll_link", "left_ankle_roll_link"]
+        num_ankle_links = len(ankle_names)
         s2_contact_body_cfg = SceneEntityCfg(
             "robot",
             body_names=[
@@ -983,76 +998,55 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
             "require_expected_foot": True,
             "target_side_enabled": True,
             "side_deadzone": 0.04,
-            # Physical reach is measured from the actual expected foot. The
-            # one-sided front ramp only suppresses ball-behind-foot exploits;
-            # it does not prescribe a forward target or an upper bound.
             "proximity_contact_distance_max": 0.25,
-            "proximity_front_gate_min": -0.05,
-            "proximity_front_gate_full": 0.05,
             "target_region_std": 0.12,
             "proximity_approach_seconds": 0.30,
             "proximity_approach_min_weight": 0.20,
             "missed_contact_grace_steps": 3,
         }
+        self.rewards.s2_global_foot_ball_distance = RewTerm(
+            func=mdp.dribbling_s2_global_foot_ball_distance_exp,
+            weight=3.5,
+            params={
+                "command_name": "motion",
+                "foot_body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
+                "global_foot_ball_distance_std": 0.40,
+            },
+        )
         self.rewards.s2_contact_proximity = RewTerm(
             func=mdp.dribbling_s2_contact_proximity,
             # Dense side-aware guidance bridges the released reference foot to
             # the sparse physical event. It is disabled immediately after a
             # side-valid contact succeeds.
-            weight=0.5,
+            weight=1.0,
             params=dict(event_params),
         )
         # Touch occurrence remains telemetry only. The sparse reward is paid
         # exclusively for a physical rising edge on the labelled foot side.
         self.rewards.s2_valid_contact_bonus = RewTerm(
             func=mdp.dribbling_s2_valid_contact_bonus,
-            weight=4.5,
+            weight=5.0,
             params=dict(event_params),
         )
         self.rewards.s2_nonfoot_ball_contact = RewTerm(
             func=mdp.dribbling_s2_nonfoot_ball_contact_penalty,
-            weight=-1.0,
+            weight=-5.0,
             params=dict(event_params),
         )
         self.rewards.s2_wrong_foot_contact = RewTerm(
             func=mdp.dribbling_s2_wrong_foot_contact_penalty,
-            weight=-0.25,
+            weight=-1.0,
             params=dict(event_params),
         )
         self.rewards.s2_premature_contact = RewTerm(
             func=mdp.dribbling_s2_premature_contact_penalty,
-            weight=-0.25,
+            weight=-0.5,
             params=dict(event_params),
         )
 
-        # First S2 pass: all other ball shaping is removed.  Motion imitation,
-        # local reference twist, action/waist regularization, joint limits,
-        # upright pelvis, ordinary body contacts, and upper-body priors remain.
-        disabled_ball_rewards = (
-            "dribbling_face_ball",
-            "dribbling_velocity_tracking",
-            "dribbling_dynamic_proximity",
-            "dribbling_stall_no_touch_penalty",
-            "dribbling_approach_foot_ball",
-            "dribbling_ball_speed_excess",
-            "dribbling_ball_coast_penalty",
-            "dribbling_sustained_contact_penalty",
-            "dribbling_ball_bounce_penalty",
-            "dribbling_ball_forward_progress",
-            "dribbling_chase_ball",
-            "dribbling_rapid_retouch_penalty",
-            "dribbling_legal_foot_touch",
-            "dribbling_micro_contact_filter",
-            "dribbling_undesired_contact_penalty",
-            "dribbling_cg_flow_release",
-            "dribbling_cg_flow_progress",
-            "dribbling_cg_contact_consistency",
-            "dribbling_cg_premature_contact",
-            "dribbling_cg_foot_consistency",
-        )
-        for reward_name in disabled_ball_rewards:
-            if hasattr(self.rewards, reward_name):
-                setattr(self.rewards, reward_name, None)
+        # The inherited dribbling/CG classes define many objectives for other
+        # tasks. S2 exposes only its exact 20-term contract to RewardManager.
+        _prune_s2_reward_manager(self)
 
         # Ball-lost is distance-only and debounced for 0.2 s.  Reference
         # ankle/wrist height and fixed no-touch terminations are removed.
