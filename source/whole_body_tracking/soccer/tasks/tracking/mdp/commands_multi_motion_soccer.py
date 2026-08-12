@@ -435,7 +435,6 @@ class MotionCommand(CommandTerm):
         # Target-point and soccer-ball generation logic.
         self.target_point_pos = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)
         self.soccer_ball_pos = torch.zeros_like(self.target_point_pos)
-        self.target_destination_pos = torch.zeros_like(self.target_point_pos)
         # Save initial target position at resample for kick-direction computation.
         self.initial_target_point_pos = torch.zeros_like(self.target_point_pos)
         
@@ -446,14 +445,6 @@ class MotionCommand(CommandTerm):
         self.last_visible_target_point_base = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)
         # Whether currently in blind zone.
         self.is_in_blind_zone = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        
-        # Height for target_destination.
-        self.destination_height = 0.11
-        
-        # target_destination generation parameters (world-frame based).
-        self.destination_center = torch.tensor([0.0, -5.0, self.destination_height], device=self.device)  # Rectangle center (x, y, z).
-        self.destination_length = 1.0  # Rectangle length (x-axis).
-        self.destination_width = 0.5  # Rectangle width (y-axis).
         
         self.curve_radius_offset = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self._steps_since_resample = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -531,8 +522,6 @@ class MotionCommand(CommandTerm):
         self._target_height = float(curve_cfg.get("height", 0.11))
         marker_cfg = cfg.target_point_marker_cfg
         self.target_point_marker = VisualizationMarkers(marker_cfg) if marker_cfg is not None else None
-        dest_marker_cfg = getattr(cfg, "target_destination_marker_cfg", None)
-        self.target_destination_marker = VisualizationMarkers(dest_marker_cfg) if dest_marker_cfg is not None else None
 
         all_env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         self._sample_soccer_offset(all_env_ids)
@@ -1429,8 +1418,8 @@ class MotionCommand(CommandTerm):
         The released PAiD command placed the ball at the frame-0 anchor plus
         the clip's complete planar anchor displacement.  Its direction was
         optionally perturbed by ``arc_angle``; ``radius`` supplied the radial
-        offset.  Keep this path isolated from the newer task-+X spawn recipes
-        so ``Tracking-CG-G1-Motion-RNN-original`` remains reproducible.
+        offset. This legacy placement mode is retained only as an internal
+        motion-data compatibility path; it is not exposed as a Gym task.
         """
         arc_limit = float(self._target_arc_angle)
         base_height = float(self._target_height)
@@ -1551,27 +1540,6 @@ class MotionCommand(CommandTerm):
 
 
 
-    def _update_destination_points(self, env_ids: Sequence[int] | torch.Tensor):
-        ids = self._to_env_id_tensor(env_ids)
-        if ids.numel() == 0:
-            return
-        
-        # Generate target_destination in world coordinates.
-        # Sample destination uniformly within the rectangle.
-        rand_x = (torch.rand(ids.numel(), device=self.device) - 0.5) * self.destination_length
-        rand_y = (torch.rand(ids.numel(), device=self.device) - 0.5) * self.destination_width
-        destination = self.destination_center.expand(ids.numel(), -1) + torch.stack([rand_x, rand_y, torch.zeros_like(rand_x)], dim=1)
-        self.target_destination_pos[ids] = destination
-
-        if self.target_destination_marker is not None:
-            env_origins = getattr(self._env.scene, "env_origins", None)
-            if env_origins is not None:
-                world_destination = self.target_destination_pos + env_origins
-            else:
-                world_destination = self.target_destination_pos
-            self.target_destination_marker.visualize(world_destination)
-        
-
     def _update_soccer_ball(self, env_ids: Sequence[int] | torch.Tensor):
         if self.soccer_ball is None or not hasattr(self.soccer_ball, "write_root_state_to_sim"):
             return
@@ -1655,7 +1623,6 @@ class MotionCommand(CommandTerm):
         self._compute_soccer_ball_positions(env_ids)
         self._update_soccer_ball(env_ids)
         self._update_target_points(env_ids)
-        self._update_destination_points(env_ids)
         
         # Sample blind-zone min/max thresholds and reset blind-zone state.
         blind_min_low, blind_min_high = self.cfg.blind_distance_min_range
@@ -1915,7 +1882,6 @@ class MotionCommandCfg(CommandTermCfg):
 
     # Target-point marker config; typically overridden in subclasses.
     target_point_marker_cfg: VisualizationMarkersCfg | None = None
-    target_destination_marker_cfg: VisualizationMarkersCfg | None = None
     # Offset configuration for arc distribution and destination height.
     curve_offset_range: dict[str, float | tuple[float, float]] | None = None
     

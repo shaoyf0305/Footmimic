@@ -119,23 +119,7 @@ class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
-        # observation terms (order preserved)
-
-        # obs v0: original obs 160 dims
-        # command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
-        # motion_anchor_pos_b = ObsTerm(
-        #     func=mdp.motion_anchor_pos_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.25, n_max=0.25)
-        # )
-        # motion_anchor_ori_b = ObsTerm(
-        #     func=mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05)
-        # )
-        # base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.5, n_max=0.5))
-        # base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
-        # joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-        # joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5))
-        # actions = ObsTerm(func=mdp.last_action)
-        
-        # obs v1: add_prog, 154 dims
+        # Shared actor base: 154 dims; active task configs append polar ball/command terms.
         command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
         projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
         motion_ref_ang_vel = ObsTerm(func=mdp.motion_anchor_ang_vel, params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05))
@@ -214,20 +198,8 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the MDP."""
+    """Rewards shared by the active Stage-1 and Stage-2 tasks."""
 
-    motion_global_anchor_pos = RewTerm(
-        func=mdp.motion_global_anchor_position_error_exp,
-        # weight=0.5,
-        weight=1.0,
-        params={"command_name": "motion", "std": 0.3},
-    )
-    motion_global_anchor_ori = RewTerm(
-        func=mdp.motion_global_anchor_orientation_error_exp,
-        # weight=0.5,
-        weight=1.0,
-        params={"command_name": "motion", "std": 0.4},
-    )
     motion_body_pos = RewTerm(
         func=mdp.motion_relative_body_position_error_exp,
         weight=1.0,
@@ -238,68 +210,19 @@ class RewardsCfg:
         weight=1.0,
         params={"command_name": "motion", "std": 0.4},
     )
-    motion_body_lin_vel = RewTerm(
-        func=mdp.motion_global_body_linear_velocity_error_exp,
-        weight=1.0,
-        params={"command_name": "motion", "std": 1.0},
-    )
-    motion_body_ang_vel = RewTerm(
-        func=mdp.motion_global_body_angular_velocity_error_exp,
-        weight=1.0,
-        params={"command_name": "motion", "std": 3.14},
-    )
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2_clip, weight=-1e-1)
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-10.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
     )
-    undesired_contacts = RewTerm(
-        func=mdp.undesired_contacts,
-        weight=-0.1,
-        params={
-            "sensor_cfg": SceneEntityCfg(
-                "contact_forces",
-                body_names=[
-                    r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_wrist_yaw_link$)(?!right_wrist_yaw_link$).+$"
-                ],
-            ),
-            "threshold": 1.0,
-        },
-    )
 
 
 @configclass
 class TerminationsCfg:
-    """Termination terms for the MDP."""
+    """Termination shared by the active tasks; Stage-1 adds mimic guards."""
 
-    # motion_finished = DoneTerm(func=mdp.motion_finished, params={"command_name": "motion"}, time_out=True)
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    # anchor_pos = DoneTerm(
-    #     func=mdp.bad_anchor_pos,
-    #     params={"command_name": "motion", "threshold": 0.50},
-    # )
-    anchor_pos_z = DoneTerm(
-        func=mdp.bad_anchor_pos_z_only,
-        params={"command_name": "motion", "threshold": 0.25},
-    )
-    anchor_ori = DoneTerm(
-        func=mdp.bad_anchor_ori,
-        params={"asset_cfg": SceneEntityCfg("robot"), "command_name": "motion", "threshold": 0.8},
-    )
-    ee_body_pos = DoneTerm(
-        func=mdp.bad_motion_body_pos_z_only,
-        params={
-            "command_name": "motion",
-            "threshold": 0.25,
-            "body_names": [
-                "left_ankle_roll_link",
-                "right_ankle_roll_link",
-                "left_wrist_yaw_link",
-                "right_wrist_yaw_link",
-            ],
-        },
-    )
 
 
 @configclass

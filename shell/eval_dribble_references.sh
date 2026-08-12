@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Evaluate per-reference dribbling quality (v1.18+ checkpoints).
+# Evaluate per-reference quality for the active Stage-2 control task.
 #
 # Usage:
 #   bash shell/eval_dribble_references.sh [LOAD_RUN] [CHECKPOINT] [NUM_ROLLOUTS]
@@ -16,7 +16,7 @@ LOAD_RUN="${1:-2026-06-09_23-57-01_resumed}"
 CHECKPOINT="${2:-model_100000.pt}"
 NUM_ROLLOUTS="${3:-3}"
 MOTION_PATH="${DRIBBLE_MOTION_PATH:-motions/dribble-distance}"
-TASK="${EVAL_TASK:-Tracking-CG-G1-Dribbling-RNN-v0}"
+TASK="Tracking-CG-G1-Dribbling-RNN-control"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate isaaclab_211

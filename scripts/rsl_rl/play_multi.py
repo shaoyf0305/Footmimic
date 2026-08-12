@@ -152,7 +152,7 @@ parser.add_argument(
     default=False,
     help=(
         "Save arm and waist reference/actual joints, policy actions, pelvis/torso motion, phase, "
-        "and command values to a .npz file."
+        "command values, and the runtime-resolved reward weights to a .npz file."
     ),
 )
 parser.add_argument(
@@ -452,6 +452,24 @@ def _reward_term_values(base_env, env_idx: int = 0) -> np.ndarray:
     return values[env_idx].detach().cpu().numpy().copy()
 
 
+def _reward_term_weights(base_env) -> np.ndarray:
+    """Snapshot the final runtime reward weights in ``_term_names`` order."""
+    reward_manager = getattr(base_env, "reward_manager", None)
+    term_names = list(getattr(reward_manager, "_term_names", []))
+    term_cfgs = list(getattr(reward_manager, "_term_cfgs", []))
+    weights: list[float] = []
+    for index, name in enumerate(term_names):
+        try:
+            term_cfg = reward_manager.get_term_cfg(name)
+        except (AttributeError, KeyError):
+            term_cfg = term_cfgs[index] if index < len(term_cfgs) else None
+        weight = getattr(term_cfg, "weight", np.nan)
+        if isinstance(weight, torch.Tensor):
+            weight = weight.detach().cpu().item()
+        weights.append(float(weight))
+    return np.asarray(weights, dtype=np.float32)
+
+
 def _resolve_base_env(env):
     """Unwrap gym / RSL-RL wrappers to the underlying Isaac Lab env."""
     base = env
@@ -673,6 +691,8 @@ def _create_diagnostic(
     )
     reward_manager = getattr(base_env, "reward_manager", None)
     reward_term_names = np.asarray(getattr(reward_manager, "_term_names", []))
+    reward_term_weights = _reward_term_weights(base_env)
+    reward_step_dt = float(getattr(base_env, "step_dt", _env_step_s(base_env.cfg)))
     constraint_groups = np.asarray([constraint["group"] for constraint in constraints])
     constraint_margins = np.asarray([constraint["margin"] for constraint in constraints], dtype=np.float32)
     constraint_joint_names = (
@@ -695,6 +715,9 @@ def _create_diagnostic(
         ),
         "trunk_body_names": np.asarray(_TRUNK_DIAGNOSTIC_BODY_NAMES),
         "reward_term_names": reward_term_names,
+        "reward_term_weights": reward_term_weights,
+        "reward_term_step_weights": reward_term_weights * reward_step_dt,
+        "reward_step_dt": reward_step_dt,
         "task_state_names": np.asarray(["idle", "dribble", "stop"]),
         "constraint_group": "none" if not constraints else "+".join(constraint_groups.tolist()),
         "constraint_margin": float(constraint_margins[0]) if len(constraints) == 1 else np.nan,
@@ -1106,7 +1129,8 @@ def _save_diagnostic(diagnostic: dict) -> None:
         print("[WARN] Diagnostic requested but no samples were recorded.")
         return
     metadata_keys = {
-        "path", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names", "task_state_names",
+        "path", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names",
+        "reward_term_weights", "reward_term_step_weights", "reward_step_dt", "task_state_names",
         "trunk_joint_ids", "trunk_joint_names", "trunk_action_ids", "trunk_body_ids",
         "trunk_reference_body_ids", "trunk_body_names",
         "constraint_group", "constraint_margin", "constraint_joint_names", "constraint_groups",
@@ -1122,6 +1146,9 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["trunk_joint_names"] = diagnostic["trunk_joint_names"]
     arrays["trunk_body_names"] = diagnostic["trunk_body_names"]
     arrays["reward_term_names"] = diagnostic["reward_term_names"]
+    arrays["reward_term_weights"] = diagnostic["reward_term_weights"]
+    arrays["reward_term_step_weights"] = diagnostic["reward_term_step_weights"]
+    arrays["reward_step_dt"] = np.asarray(diagnostic["reward_step_dt"])
     arrays["task_state_names"] = diagnostic["task_state_names"]
     arrays["constraint_group"] = np.asarray(diagnostic["constraint_group"])
     arrays["constraint_margin"] = np.asarray(diagnostic["constraint_margin"])
@@ -1286,6 +1313,14 @@ def _apply_play_locomotion_command(env, args_cli) -> bool:
         headings = args_cli.locomotion_cmd_heading
         durations = args_cli.locomotion_cmd_duration
         task_states = args_cli.locomotion_task_state
+        if task_states is not None and not bool(
+            getattr(cmd.cfg, "locomotion_task_state_enabled", False)
+        ):
+            print(
+                "[WARN] This task does not expose the high-level locomotion state to the policy or "
+                "enable state-gated rewards. --locomotion_task_state values are diagnostic labels only; "
+                "IDLE and STOP both reduce to the supplied zero-speed command."
+            )
 
         if speeds is None:
             if task_states is not None:

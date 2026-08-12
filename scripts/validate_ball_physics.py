@@ -69,7 +69,7 @@ from isaaclab.utils import configclass
 from soccer.tasks.tracking.config.g1.soccer_flat_env_cfg import SOCCER_ASSET_PATH, SOCCER_BALL_RADIUS
 
 
-# These match G1FlatDribblingEnvCfg.  Keep the values here explicit so the
+# These match G1FlatCGDribblingControlEnvCfg. Keep the values explicit so the
 # report remains meaningful even when this script is run outside an RL task.
 BALL_MASS_KG = 0.40
 GROUND_STATIC_FRICTION = 1.00

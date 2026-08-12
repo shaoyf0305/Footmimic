@@ -1,12 +1,4 @@
-"""Dribbling-specific reward functions.
-
-Encourages close ball control without strike-the-ball objectives. Contact
-legality is **geometry-based**: the first ``num_ankle_links`` entries in
-``all_body_cfg.body_names`` are ankle links (typically both feet); knees/wrists
-listed after incur ``dribbling_undesired_contact_penalty`` when closest to the
-ball. Trapping between feet is handled by ``dribbling_ball_trapped_penalty`` /
-``dribbling_sustained_contact_penalty``. No ``kick_leg`` labels required.
-"""
+"""Reward functions used by the active Stage-2 dribbling controller."""
 from __future__ import annotations
 
 import torch
@@ -17,8 +9,6 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply, quat_error_magnitude
 
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import (
-    TASK_STATE_DRIBBLE,
-    TASK_STATE_IDLE,
     TASK_STATE_STOP,
     MotionCommand,
     locomotion_task_state_mask,
@@ -26,11 +16,7 @@ from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import (
 from soccer.tasks.tracking.mdp.rewards import motion_relative_foot_position_error_exp
 from soccer.tasks.tracking.mdp.task_frame import (
     forward_dominance_gate,
-    task_forward_offset,
-    task_forward_speed,
-    task_lateral_offset,
     task_pelvis_heading_cos_world_x,
-    task_velocity_forward_dominance,
 )
 
 if TYPE_CHECKING:
@@ -202,29 +188,6 @@ def _command_frame_components(vector_xy: torch.Tensor, direction_xy: torch.Tenso
     return forward, lateral
 
 
-def dribbling_idle_stand_reward(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    linear_speed_std: float = 0.10,
-    angular_speed_std: float = 0.35,
-) -> torch.Tensor:
-    """Reward a quiet robot only while the task explicitly waits in IDLE."""
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    robot = command.robot
-    pelvis_id = robot.body_names.index("pelvis")
-    pelvis_linear_speed = torch.norm(robot.data.body_lin_vel_w[:, pelvis_id, :2], dim=-1)
-    pelvis_angular_speed = torch.norm(robot.data.body_ang_vel_w[:, pelvis_id], dim=-1)
-    reward = torch.exp(
-        -torch.square(pelvis_linear_speed) / max(float(linear_speed_std), 1.0e-6) ** 2
-        -torch.square(pelvis_angular_speed) / max(float(angular_speed_std), 1.0e-6) ** 2
-    )
-    active = locomotion_task_state_mask(command, (TASK_STATE_IDLE,))
-    setattr(env, "_dribbling_idle_active", active)
-    setattr(env, "_dribbling_idle_pelvis_speed", pelvis_linear_speed)
-    setattr(env, "_dribbling_idle_pelvis_angular_speed", pelvis_angular_speed)
-    return reward * active.to(reward.dtype)
-
-
 def dribbling_stop_settle_state(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
@@ -265,204 +228,9 @@ def dribbling_stop_settle_state(
     return active, pelvis_speed, pelvis_angular_speed, ball_speed, forward_offset, lateral_offset, settled
 
 
-def dribbling_stop_settle_reward(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    pelvis_speed_std: float = 0.10,
-    pelvis_angular_speed_std: float = 0.35,
-    settled_pelvis_speed: float = 0.05,
-    settled_pelvis_angular_speed: float = 0.20,
-) -> torch.Tensor:
-    """Reward a stable robot STOP without constraining the ball's outcome."""
-    (
-        active,
-        pelvis_speed,
-        pelvis_angular_speed,
-        ball_speed,
-        forward_offset,
-        lateral_offset,
-        settled,
-    ) = dribbling_stop_settle_state(
-        env,
-        command_name=command_name,
-        settled_pelvis_speed=settled_pelvis_speed,
-        settled_pelvis_angular_speed=settled_pelvis_angular_speed,
-    )
-    speed_score = torch.exp(
-        -torch.square(pelvis_speed) / max(float(pelvis_speed_std), 1.0e-6) ** 2
-        -torch.square(pelvis_angular_speed) / max(float(pelvis_angular_speed_std), 1.0e-6) ** 2
-    )
-    setattr(env, "_dribbling_stop_active", active)
-    setattr(env, "_dribbling_stop_pelvis_speed", pelvis_speed)
-    setattr(env, "_dribbling_stop_pelvis_angular_speed", pelvis_angular_speed)
-    setattr(env, "_dribbling_stop_ball_speed", ball_speed)
-    setattr(env, "_dribbling_stop_forward_offset", forward_offset)
-    setattr(env, "_dribbling_stop_lateral_offset", lateral_offset)
-    setattr(env, "_dribbling_stop_position_score", torch.full_like(pelvis_speed, float("nan")))
-    setattr(env, "_dribbling_stop_speed_score", speed_score)
-    setattr(env, "_dribbling_stop_settled", settled)
-    return speed_score * active.to(speed_score.dtype)
-
-
 # ---------------------------------------------------------------------------
-# 1) Velocity Tracking  — ball vel aligned with pelvis vel
+# Dynamic proximity: keep the ball in a safe command-frame corridor.
 # ---------------------------------------------------------------------------
-
-
-def dribbling_velocity_tracking(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    std: float = 1.0,
-    pelvis_speed_min: float = 0.0,
-    ball_speed_min: float = 0.0,
-    require_contact: bool = False,
-    ball_sensor_name: str = "soccer_ball_contact",
-    contact_force_threshold: float = 1.0,
-    recent_contact_window: int = 0,
-    cg_gated_contact: bool = False,
-    min_forward_dominance: float = 0.55,
-) -> torch.Tensor:
-    """Reward matching task +X (forward) speed between ball and pelvis after a touch.
-
-    Only the forward (+X) velocity components are compared so lateral / crab-walking
-    sync (matching ``v_y`` while ``v_x`` is small) does not score highly.
-
-    Optional **anti-cheese gates**:
-
-    - ``pelvis_speed_min`` / ``ball_speed_min``: multiply the reward by
-      ``clamp(|v_xy| / min, max=1)`` so near-zero speeds do not yield a full
-      score from ``exp(0)==1``.
-    - ``require_contact``: multiply by a contact gate. If
-      ``recent_contact_window > 0``, contact must have occurred within the last
-      N steps (shared counter with forward-progress reward); otherwise the
-      current step must show contact.
-    - ``min_forward_dominance``: both ball and pelvis XY velocities must be
-      sufficiently forward-dominant (task +X share of speed).
-
-    Returns a value in ``[0, 1]`` per environment.
-    """
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-
-    ball_vel_w = soccer_ball.data.root_lin_vel_w[:, :3]
-    pelvis_vel_w = command.robot_anchor_lin_vel_w[:, :3]
-    ball_vel_xy = ball_vel_w[:, :2]
-    pelvis_vel_xy = pelvis_vel_w[:, :2]
-
-    # Task-frame forward speed only — lateral crab sync must not match.
-    ball_fwd = task_forward_speed(ball_vel_w, clamp_forward=False)
-    pelvis_fwd = task_forward_speed(pelvis_vel_w, clamp_forward=False)
-    error = (ball_fwd - pelvis_fwd) ** 2
-    base = torch.exp(-error / (std ** 2))
-
-    pelvis_sp = torch.norm(pelvis_vel_xy, dim=-1)
-    ball_sp = torch.norm(ball_vel_xy, dim=-1)
-
-    gate = torch.ones_like(base)
-    if pelvis_speed_min > 0.0:
-        gate = gate * torch.clamp(pelvis_sp / pelvis_speed_min, max=1.0)
-    if ball_speed_min > 0.0:
-        gate = gate * torch.clamp(ball_sp / ball_speed_min, max=1.0)
-
-    if require_contact:
-        gate = gate * _dribbling_recent_contact_gate(
-            env,
-            ball_sensor_name,
-            contact_force_threshold,
-            recent_contact_window,
-            command=command,
-            cg_gated=cg_gated_contact,
-        )
-
-    if min_forward_dominance > 0.0:
-        pelvis_dom = task_velocity_forward_dominance(pelvis_vel_xy)
-        ball_dom = task_velocity_forward_dominance(ball_vel_xy)
-        gate = gate * forward_dominance_gate(pelvis_dom, min_forward_dominance)
-        gate = gate * forward_dominance_gate(ball_dom, min_forward_dominance)
-
-    return base * gate
-
-
-# ---------------------------------------------------------------------------
-# 2) Dynamic Proximity  — ball inside the "safe zone" in front of the robot
-# ---------------------------------------------------------------------------
-
-def dribbling_dynamic_proximity(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    near_dist: float = 0.2,
-    far_dist: float = 0.5,
-    penalty_std: float = 0.15,
-    pelvis_speed_min: float = 0.0,
-    ball_sensor_name: str = "soccer_ball_contact",
-    contact_force_threshold: float = 1.0,
-    no_contact_zone_damping: float = 1.0,
-    zone_lateral_abs_max: float = 0.18,
-) -> torch.Tensor:
-    """Reward keeping the ball inside a longitudinal safe-zone ahead on task +X.
-
-    Ball offset uses env-local / world-parallel axes (pelvis → ball):
-    - x_task in [near_dist, far_dist] → reward = 1.0
-    - Outside that range → exponential decay with ``penalty_std``
-
-    Lateral deviation (|y_task|) is also penalised with the same decay.
-
-    If ``pelvis_speed_min > 0``, the reward is multiplied by
-    ``clamp(|v_pelvis_xy| / pelvis_speed_min, max=1)`` so standing still in the
-    safe zone is not a local optimum.
-
-    If ``no_contact_zone_damping < 1``, when the ball sits in the forward corridor
-    (longitudinal band + ``|y_task| <= zone_lateral_abs_max``) but the ball
-    sensor reports no contact, the proximity reward is scaled by that factor.
-    This reduces the \"park in front of the ball and wiggle\" optimum.
-
-    Returns a value in [0, 1] per environment.
-    """
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-
-    ball_pos_w = soccer_ball.data.root_pos_w  # (N, 3)
-    pelvis_pos_w = command.robot_pelvis_pos_w  # (N, 3)
-
-    x_task = task_forward_offset(ball_pos_w, pelvis_pos_w)
-    y_task = task_lateral_offset(ball_pos_w, pelvis_pos_w)
-
-    x_error = torch.where(
-        x_task < near_dist,
-        near_dist - x_task,
-        torch.where(
-            x_task > far_dist,
-            x_task - far_dist,
-            torch.zeros_like(x_task),
-        ),
-    )
-
-    y_error = torch.abs(y_task)
-
-    total_error = x_error ** 2 + y_error ** 2
-    proximity_reward = torch.exp(-total_error / (penalty_std ** 2))
-
-    if pelvis_speed_min > 0.0:
-        pelvis_vel_xy = command.robot_anchor_lin_vel_w[:, :2]
-        pelvis_sp = torch.norm(pelvis_vel_xy, dim=-1)
-        proximity_reward = proximity_reward * torch.clamp(pelvis_sp / pelvis_speed_min, max=1.0)
-
-    if no_contact_zone_damping < 1.0 - 1e-6:
-        in_corridor = (
-            (x_task >= near_dist)
-            & (x_task <= far_dist)
-            & (torch.abs(y_task) <= zone_lateral_abs_max)
-        )
-        fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
-        no_touch = fmag <= contact_force_threshold
-        damp = torch.where(
-            in_corridor & no_touch,
-            torch.full_like(proximity_reward, no_contact_zone_damping),
-            torch.ones_like(proximity_reward),
-        )
-        proximity_reward = proximity_reward * damp
-
-    return proximity_reward
 
 
 def dribbling_command_dynamic_proximity(
@@ -505,45 +273,6 @@ def dribbling_command_dynamic_proximity(
         no_touch = soccer_ball_contact_force_magnitude(env, ball_sensor_name) <= contact_force_threshold
         reward = torch.where(in_corridor & no_touch, reward * no_contact_zone_damping, reward)
     return reward
-
-
-# ---------------------------------------------------------------------------
-# 2a) Stall in front of ball without touching — kills "back up, then freeze"
-# ---------------------------------------------------------------------------
-
-
-def dribbling_stall_no_touch_penalty(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    ball_sensor_name: str = "soccer_ball_contact",
-    contact_force_threshold: float = 1.0,
-    max_xy_dist: float = 0.52,
-    pelvis_speed_max: float = 0.16,
-    active_task_states: tuple[int, ...] | None = None,
-) -> torch.Tensor:
-    """Penalty in ``[0, 1]`` when the ball is close in XY but pelvis is nearly static and there is no contact.
-
-    Targets the local optimum: robot brings the ball into a comfortable pose in
-    front of the body, then stops or only sways without registering foot-ball
-    contact on the ball sensor.
-    """
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-
-    pelvis_pos_xy = command.robot_pelvis_pos_w[:, :2]
-    ball_pos_xy = soccer_ball.data.root_pos_w[:, :2]
-    dist_xy = torch.norm(ball_pos_xy - pelvis_pos_xy, dim=-1)
-
-    pelvis_vel_xy = command.robot_anchor_lin_vel_w[:, :2]
-    pelvis_sp = torch.norm(pelvis_vel_xy, dim=-1)
-
-    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
-    no_touch = fmag <= contact_force_threshold
-
-    near = dist_xy <= max_xy_dist
-    slow = pelvis_sp <= pelvis_speed_max
-    active = locomotion_task_state_mask(command, active_task_states)
-    return (near & slow & no_touch & active).to(torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -615,59 +344,61 @@ def _is_dribble_legal_ankle_contact(closest_body_idx: torch.Tensor, num_ankle_li
     return closest_body_idx < num_ankle_links
 
 
-# ---------------------------------------------------------------------------
-# 2b) Dense approach — ankles near ball while force sensor shows no contact
-# ---------------------------------------------------------------------------
-
-
-def dribbling_approach_foot_ball_distance(
+def dribbling_micro_contact_filter(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
-    foot_cfg: SceneEntityCfg | None = None,
     ball_sensor_name: str = "soccer_ball_contact",
-    contact_force_threshold: float = 1.0,
-    std: float = 0.22,
-    pelvis_speed_min: float = 0.08,
+    force_threshold: float = 20.0,
+    max_penalty: float = 2.0,
+    ema_alpha: float = 0.4,
+    all_body_cfg: SceneEntityCfg | None = None,
+    num_ankle_links: int = 2,
 ) -> torch.Tensor:
-    """``[0,1]`` shaping when the ball reports no contact: minimise ankle–ball gap."""
-    if foot_cfg is None:
-        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+    """EMA-smoothed penalty when a legal ankle hits the ball too hard."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    has_contact, force_mag, closest_idx = _identify_contact_body(
+        env, command, ball_sensor_name, all_body_cfg
+    )
+    is_ankle = _is_dribble_legal_ankle_contact(closest_idx, num_ankle_links)
+    legal_hard_force = torch.where(
+        has_contact & is_ankle,
+        force_mag,
+        torch.zeros_like(force_mag),
+    )
 
-    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
-    no_contact = fmag <= contact_force_threshold
+    buf_name = "_dribbling_contact_ema"
+    ema = getattr(env, buf_name, None)
+    if ema is None or ema.shape[0] != env.num_envs:
+        ema = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+    ema = float(ema_alpha) * legal_hard_force + (1.0 - float(ema_alpha)) * ema
 
-    robot = env.scene[foot_cfg.name]
-    soccer_ball = env.scene["soccer_ball"]
+    step_buf = getattr(env, "episode_length_buf", None)
+    if step_buf is not None:
+        ema = torch.where(step_buf == 0, torch.zeros_like(ema), ema)
+    setattr(env, buf_name, ema)
 
-    cache = getattr(env, "_dribbling_foot_ball_idx_cache", None)
-    if cache is None or cache.get("names") != tuple(foot_cfg.body_names):
-        idx = torch.as_tensor(
-            robot.find_bodies(foot_cfg.body_names, preserve_order=True)[0],
-            dtype=torch.long,
-            device=env.device,
-        )
-        cache = {"names": tuple(foot_cfg.body_names), "idx": idx}
-        setattr(env, "_dribbling_foot_ball_idx_cache", cache)
-    body_idx = cache["idx"]
+    excess = torch.clamp(ema - float(force_threshold), min=0.0)
+    return torch.clamp(excess / max(float(force_threshold), 1.0e-6), max=float(max_penalty))
 
-    feet_pos = robot.data.body_pos_w[:, body_idx, :]
-    ball_pos = soccer_ball.data.root_pos_w.unsqueeze(1)
-    dist = torch.norm(feet_pos - ball_pos, dim=-1)
-    min_dist = dist.min(dim=-1).values
 
-    shaping = torch.exp(-(min_dist ** 2) / (std ** 2))
-    out = torch.where(no_contact, shaping, torch.zeros_like(shaping))
-
-    if pelvis_speed_min > 0.0:
-        command: MotionCommand = env.command_manager.get_term(command_name)
-        pelvis_sp = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
-        out = out * torch.clamp(pelvis_sp / pelvis_speed_min, max=1.0)
-
-    return out
+def dribbling_undesired_contact_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    all_body_cfg: SceneEntityCfg | None = None,
+    num_ankle_links: int = 2,
+) -> torch.Tensor:
+    """Return one when the ball contact is caused by a non-ankle body."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    has_contact, _force_mag, closest_idx = _identify_contact_body(
+        env, command, ball_sensor_name, all_body_cfg
+    )
+    is_ankle = _is_dribble_legal_ankle_contact(closest_idx, num_ankle_links)
+    return (has_contact & ~is_ankle).to(torch.float32)
 
 
 # ---------------------------------------------------------------------------
-# 2c) Pelvis orientation vs motion reference (reduces lean-back / arched cheat)
+# Pelvis orientation vs motion reference.
 # ---------------------------------------------------------------------------
 
 
@@ -689,7 +420,7 @@ def dribbling_pelvis_quat_tracking_exp(
 
 
 # ---------------------------------------------------------------------------
-# 2d) Penalise excessive horizontal ball speed (dribble vs kick)
+# Penalize excessive horizontal ball speed.
 # ---------------------------------------------------------------------------
 
 
@@ -736,52 +467,8 @@ def dribbling_ball_coast_without_contact_penalty(
 
 
 # ---------------------------------------------------------------------------
-# 2e) Ball forward progress reward — encourage actual dribble advancement
+# Ball progress along the active command direction.
 # ---------------------------------------------------------------------------
-
-
-def dribbling_ball_forward_progress_reward(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    min_forward_speed: float = 0.2,
-    speed_scale: float = 0.25,
-    pelvis_speed_min: float = 0.06,
-    ball_sensor_name: str = "soccer_ball_contact",
-    contact_force_threshold: float = 0.5,
-    require_recent_contact: bool = True,
-    recent_contact_window: int = 10,
-    cg_gated_contact: bool = False,
-) -> torch.Tensor:
-    """Reward forward ball velocity along task +X (world-parallel).
-
-    This term rewards positive +X ball speed, and can optionally be gated by
-    recent contact to avoid standing
-    exploits where the policy does not engage the ball.
-    """
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-
-    ball_vel_w = soccer_ball.data.root_lin_vel_w[:, :3]
-    forward_speed = task_forward_speed(ball_vel_w)
-    ball_dominance = task_velocity_forward_dominance(ball_vel_w)
-
-    base = torch.clamp((forward_speed - min_forward_speed) / max(speed_scale, 1e-6), min=0.0, max=1.0)
-    base = base * forward_dominance_gate(ball_dominance, 0.4)
-
-    pelvis_speed = torch.norm(command.robot_anchor_lin_vel_w[:, :2], dim=-1)
-    gate = torch.clamp(pelvis_speed / max(pelvis_speed_min, 1e-6), max=1.0)
-
-    if require_recent_contact:
-        gate = gate * _dribbling_recent_contact_gate(
-            env,
-            ball_sensor_name,
-            contact_force_threshold,
-            recent_contact_window,
-            command=command,
-            cg_gated=cg_gated_contact,
-        )
-
-    return base * gate
 
 
 def dribbling_command_ball_progress_reward(
@@ -836,54 +523,7 @@ def dribbling_command_ball_progress_reward(
 
 
 # ---------------------------------------------------------------------------
-# 2f) Contact-graph style phase alignment (approach -> control/push)
-# ---------------------------------------------------------------------------
-
-
-def dribbling_phase_graph_alignment(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    ball_sensor_name: str = "soccer_ball_contact",
-    contact_force_threshold: float = 0.5,
-    approach_xy_dist: float = 0.55,
-    approach_dist_std: float = 0.20,
-    push_speed_threshold: float = 0.22,
-) -> torch.Tensor:
-    """Phase-style shaping without explicit per-frame labels.
-
-    - ``approach`` phase (ball far): reward getting closer while avoiding contact.
-    - ``control/push`` phase (ball near): reward contact, and reward stronger when
-      ball moves forward along task +X (push over static trapping).
-    """
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-
-    pelvis_pos_xy = command.robot_pelvis_pos_w[:, :2]
-    ball_pos_xy = soccer_ball.data.root_pos_w[:, :2]
-    dist_xy = torch.norm(ball_pos_xy - pelvis_pos_xy, dim=-1)
-
-    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
-    has_contact = fmag > contact_force_threshold
-
-    ball_vel_w = soccer_ball.data.root_lin_vel_w[:, :3]
-    forward_speed = task_forward_speed(ball_vel_w)
-
-    phase_approach = dist_xy > approach_xy_dist
-    phase_interact = ~phase_approach
-
-    # Approach: closer is better, but do not touch too early.
-    approach_core = torch.exp(-((dist_xy - approach_xy_dist).clamp(min=0.0) ** 2) / (approach_dist_std ** 2))
-    approach_reward = approach_core * (~has_contact).to(torch.float32)
-
-    # Interact: contact is required; encourage push speed on top of stable contact.
-    push_gain = torch.clamp(forward_speed / max(push_speed_threshold, 1e-6), min=0.0, max=1.0)
-    interact_reward = has_contact.to(torch.float32) * (0.55 + 0.45 * push_gain)
-
-    return torch.where(phase_approach, approach_reward, interact_reward)
-
-
-# ---------------------------------------------------------------------------
-# 2g) Anti-orbit penalty — discourage circling around the ball without touch
+# Discourage circling around the ball without touching it.
 # ---------------------------------------------------------------------------
 
 
@@ -927,7 +567,7 @@ def dribbling_orbiting_penalty(
 
 
 # ---------------------------------------------------------------------------
-# 3a) Legal Foot Gentle Touch — small positive reward
+# Legal gentle foot touch.
 # ---------------------------------------------------------------------------
 
 def dribbling_legal_foot_touch(
@@ -967,163 +607,8 @@ def dribbling_legal_foot_touch(
 
 
 # ---------------------------------------------------------------------------
-# 3b) Micro-Contact Filter — moderate EMA penalty for legal foot hard kicks
+# Annotated contact-graph terms.
 # ---------------------------------------------------------------------------
-
-def dribbling_micro_contact_filter(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    ball_sensor_name: str = "soccer_ball_contact",
-    force_threshold: float = 20.0,
-    max_penalty: float = 2.0,
-    ema_alpha: float = 0.4,
-    all_body_cfg: SceneEntityCfg | None = None,
-    foot_cfg: SceneEntityCfg | None = None,
-    num_ankle_links: int = 2,
-) -> torch.Tensor:
-    """EMA-smoothed penalty when an **ankle** hits the ball too hard."""
-
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    has_contact, force_mag, closest_idx = _identify_contact_body(
-        env, command, ball_sensor_name, all_body_cfg,
-    )
-
-    is_ankle = _is_dribble_legal_ankle_contact(closest_idx, num_ankle_links)
-
-    # Only consider ankle hard contacts for this penalty
-    legal_hard_force = torch.where(
-        has_contact & is_ankle,
-        force_mag,
-        torch.zeros_like(force_mag),
-    )
-
-    # ── 5-frame EMA low-pass filter ──────────────────────────────────
-    buf_name = "_dribbling_contact_ema"
-    ema = getattr(env, buf_name, None)
-    if ema is None or ema.shape[0] != env.num_envs:
-        ema = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
-
-    ema = ema_alpha * legal_hard_force + (1.0 - ema_alpha) * ema
-
-    # Reset EMA for environments that just reset
-    step_buf = getattr(env, "episode_length_buf", None)
-    if step_buf is not None:
-        reset_mask = step_buf == 0
-        if torch.any(reset_mask):
-            ema[reset_mask] = 0.0
-
-    setattr(env, buf_name, ema)
-
-    # ── Clipped penalty ──────────────────────────────────────────────
-    excess = torch.clamp(ema - force_threshold, min=0.0)
-    penalty = (excess / force_threshold).clamp(max=max_penalty)
-
-    return penalty
-
-
-# ---------------------------------------------------------------------------
-# 3c) Undesired Contact Penalty — severe instant penalty for wrong body
-# ---------------------------------------------------------------------------
-
-def dribbling_undesired_contact_penalty(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    ball_sensor_name: str = "soccer_ball_contact",
-    all_body_cfg: SceneEntityCfg | None = None,
-    num_ankle_links: int = 2,
-) -> torch.Tensor:
-    """1.0 when there is contact and the closest body is **not** an ankle link."""
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    has_contact, force_mag, closest_idx = _identify_contact_body(
-        env, command, ball_sensor_name, all_body_cfg,
-    )
-
-    is_ankle = _is_dribble_legal_ankle_contact(closest_idx, num_ankle_links)
-
-    penalty = (has_contact & ~is_ankle).to(torch.float32)
-
-    return penalty
-
-
-# ---------------------------------------------------------------------------
-# 4) Annotated contact-graph (dribbling) — demo ball + label consistency
-# ---------------------------------------------------------------------------
-
-
-def dribbling_support_ankle_roll_tracking_exp(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    std: float = 0.24,
-    deadzone: float = 0.10,
-    error_cap: float = 0.35,
-    left_ankle_roll_joint: str = "left_ankle_roll_joint",
-    right_ankle_roll_joint: str = "right_ankle_roll_joint",
-    active_task_states: tuple[int, ...] | None = None,
-) -> torch.Tensor:
-    """Lightly keep the non-touching ankle roll near its style reference.
-
-    On a labeled right-foot touch, only the left (support) ankle is scored;
-    left-foot touches mirror the selection.  The touching ankle remains fully
-    free.  A deadzone permits normal balance corrections, while the capped
-    error keeps this cosmetic support-foot term from competing with ball
-    control when a recovery needs a larger deviation.
-    """
-    if std <= 0.0 or deadzone < 0.0 or error_cap <= 0.0:
-        raise ValueError("std and error_cap must be positive; deadzone must be non-negative.")
-
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    labeled = getattr(command, "motion_has_dribble_cg_label", None)
-    if not isinstance(labeled, torch.Tensor) or not torch.any(labeled):
-        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
-
-    ref_contact = command.dribble_cg_contact_ref
-    ref_touch_foot = command.dribble_cg_foot_ref
-    active = labeled & ref_contact & (ref_touch_foot >= 0) & locomotion_task_state_mask(
-        command, active_task_states
-    )
-    if not torch.any(active):
-        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
-
-    robot = env.scene[command.cfg.asset_name]
-    joint_cache_name = "_dribbling_support_ankle_roll_joint_ids"
-    joint_ids = getattr(command, joint_cache_name, None)
-    if joint_ids is None:
-        ids, found_names = robot.find_joints(
-            [left_ankle_roll_joint, right_ankle_roll_joint], preserve_order=True
-        )
-        if len(ids) != 2:
-            raise ValueError(
-                "Could not resolve support ankle roll joints: "
-                f"expected {[left_ankle_roll_joint, right_ankle_roll_joint]}, found {found_names}."
-            )
-        joint_ids = torch.as_tensor(ids, device=env.device, dtype=torch.long)
-        setattr(command, joint_cache_name, joint_ids)
-
-    # Ref foot id is 0=left / 1=right, so support is the opposite joint.
-    support_joint_ids = torch.where(ref_touch_foot == 1, joint_ids[0], joint_ids[1])
-    batch_ids = torch.arange(env.num_envs, device=env.device)
-    actual = robot.data.joint_pos[batch_ids, support_joint_ids]
-    reference = command.joint_pos[batch_ids, support_joint_ids]
-    excess = torch.clamp(torch.abs(actual - reference) - deadzone, min=0.0)
-    bounded_excess = torch.clamp(excess, max=error_cap)
-    reward = torch.exp(-torch.square(bounded_excess) / (std**2))
-    return reward * active.to(reward.dtype)
-
-
-def dribbling_cg_demo_ball_tracking_exp(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    std: float = 0.32,
-) -> torch.Tensor:
-    """Shaped tracking of the simulated ball toward the stitched demo trajectory."""
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    goal_w, mask = command.get_dribble_demo_ball_goal_world()
-    if goal_w is None or mask is None:
-        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
-    ball = env.scene["soccer_ball"].data.root_pos_w[:, :3]
-    err = torch.norm(ball - goal_w, dim=-1)
-    rew = torch.exp(-err / max(std, 1e-6))
-    return rew * mask.to(torch.float32)
 
 
 def dribbling_cg_contact_consistency(
@@ -1144,59 +629,6 @@ def dribbling_cg_contact_consistency(
     agree = (ref == sim_c).to(torch.float32)
     active = labeled & locomotion_task_state_mask(command, active_task_states)
     return agree * active.to(torch.float32)
-
-
-def dribbling_cg_premature_contact_penalty(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    ball_sensor_name: str = "soccer_ball_contact",
-    contact_force_threshold: float = 1.0,
-) -> torch.Tensor:
-    """Penalize sensor contact on CG non-contact (approach) frames."""
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    labeled = command.motion_has_dribble_cg_label
-    if not torch.any(labeled):
-        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
-
-    ref = command.dribble_cg_contact_ref
-    sim_c = _dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
-    return (labeled & sim_c & ~ref).to(torch.float32)
-
-
-def dribbling_ball_trapped_penalty(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    min_forward_x: float = 0.18,
-    max_ball_height: float = 0.20,
-) -> torch.Tensor:
-    """Penalize ball under the body, behind the pelvis, or popped up (夹球 / 蹦)."""
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-    ball_pos_w = soccer_ball.data.root_pos_w
-    pelvis_pos_w = command.robot_pelvis_pos_w
-    x_task = task_forward_offset(ball_pos_w, pelvis_pos_w)
-    too_close = x_task < min_forward_x
-    behind = x_task < 0.0
-    popped = ball_pos_w[:, 2] > max_ball_height
-    return (too_close | behind | popped).to(torch.float32)
-
-
-def dribbling_command_ball_trapped_penalty(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    min_forward_x: float = 0.18,
-    max_ball_height: float = 0.20,
-) -> torch.Tensor:
-    """Penalize a trapped ball using the active command axis, not world ``+X``."""
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-    direction_xy, _ = _command_direction_xy(command)
-    offset_xy = soccer_ball.data.root_pos_w[:, :2] - command.robot_pelvis_pos_w[:, :2]
-    forward_offset, _ = _command_frame_components(offset_xy, direction_xy)
-    too_close = forward_offset < min_forward_x
-    behind = forward_offset < 0.0
-    popped = soccer_ball.data.root_pos_w[:, 2] > max_ball_height
-    return (too_close | behind | popped).to(torch.float32)
 
 
 def dribbling_sustained_contact_penalty(
@@ -1225,49 +657,11 @@ def dribbling_ball_bounce_penalty(
     contact_force_threshold: float = 1.0,
     vz_threshold: float = 0.32,
 ) -> torch.Tensor:
-    """Penalize large vertical ball speed while in contact (pinch-bounce)."""
+    """Penalize pinch-bounces with excessive vertical ball speed during contact."""
     soccer_ball = env.scene["soccer_ball"]
     in_contact = _dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
-    vz = torch.abs(soccer_ball.data.root_lin_vel_w[:, 2])
-    return (in_contact & (vz > vz_threshold)).to(torch.float32)
-
-
-def dribbling_cg_foot_consistency(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    ball_sensor_name: str = "soccer_ball_contact",
-    all_body_cfg: SceneEntityCfg | None = None,
-    left_ankle_body_name: str = "left_ankle_roll_link",
-    right_ankle_body_name: str = "right_ankle_roll_link",
-    active_task_states: tuple[int, ...] | None = None,
-) -> torch.Tensor:
-    """When the label specifies a foot during contact, reward matching closest ankle."""
-    if all_body_cfg is None:
-        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
-
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    labeled = command.motion_has_dribble_cg_label
-    if not torch.any(labeled):
-        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
-
-    ref_c = command.dribble_cg_contact_ref
-    ref_f = command.dribble_cg_foot_ref
-    active = labeled & ref_c & (ref_f >= 0) & locomotion_task_state_mask(command, active_task_states)
-
-    has_contact, _fm, closest = _identify_contact_body(env, command, ball_sensor_name, all_body_cfg)
-    names = list(all_body_cfg.body_names)
-    try:
-        li = names.index(left_ankle_body_name)
-        ri = names.index(right_ankle_body_name)
-    except ValueError:
-        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
-
-    expected = torch.full((env.num_envs,), -1, device=env.device, dtype=torch.long)
-    expected[ref_f == 0] = li
-    expected[ref_f == 1] = ri
-
-    match = (closest == expected) & has_contact & active
-    return match.to(torch.float32)
+    vertical_speed = torch.abs(soccer_ball.data.root_lin_vel_w[:, 2])
+    return (in_contact & (vertical_speed > float(vz_threshold))).to(torch.float32)
 
 
 def dribbling_cg_foot_ball_distance_exp(
@@ -1357,49 +751,6 @@ def dribbling_gait_foot_tracking_exp(
     return base * active.to(torch.float32)
 
 
-def dribbling_chase_ball_reward(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    ball_sensor_name: str = "soccer_ball_contact",
-    contact_force_threshold: float = 1.0,
-    min_ball_ahead: float = 0.25,
-    max_chase_xy_dist: float = 1.1,
-    pelvis_forward_speed_min: float = 0.22,
-    forward_speed_scale: float = 0.45,
-) -> torch.Tensor:
-    """Reward running forward to catch a ball that rolled ahead after a touch.
-
-    Active when there is no ball contact, the ball lies on task +X ahead of the
-    pelvis by at least ``min_ball_ahead``, and the robot is within chase range.
-    This shapes kick → run → kick rather than shuffling beside the ball.
-    """
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-
-    no_ball = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
-    pelvis_pos_w = command.robot_pelvis_pos_w
-    ball_pos_w = soccer_ball.data.root_pos_w
-
-    x_ahead = task_forward_offset(ball_pos_w, pelvis_pos_w)
-    dist_xy = torch.norm(ball_pos_w[:, :2] - pelvis_pos_w[:, :2], dim=-1)
-
-    ball_ahead = x_ahead >= min_ball_ahead
-    in_range = dist_xy <= max_chase_xy_dist
-
-    pelvis_vel_w = command.robot_anchor_lin_vel_w[:, :3]
-    forward = task_forward_speed(pelvis_vel_w)
-    dominance = task_velocity_forward_dominance(pelvis_vel_w)
-    speed_rew = torch.clamp(
-        (forward - pelvis_forward_speed_min) / max(forward_speed_scale, 1e-6),
-        min=0.0,
-        max=1.0,
-    )
-    speed_rew = speed_rew * forward_dominance_gate(dominance, 0.45)
-
-    active = no_ball & ball_ahead & in_range
-    return speed_rew * active.to(torch.float32)
-
-
 def dribbling_command_chase_ball_reward(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
@@ -1481,37 +832,6 @@ def dribbling_rapid_retouch_penalty(
     setattr(env, prev_touch_name, touch.detach().clone())
     setattr(env, steps_name, steps_since)
     return too_soon.to(torch.float32)
-
-
-def dribbling_face_ball(
-    env: ManagerBasedRLEnv,
-    command_name: str = "motion",
-    min_distance: float = 0.05,
-) -> torch.Tensor:
-    """Reward ball ahead on task +X **and** pelvis facing task +X.
-
-    Returns the product of (a) cos(angle from task +X to pelvis→ball) and
-    (b) cos(pelvis yaw vs task +X), each clamped to [0, 1]. Sideways crab
-    dribbling (body or ball mostly on ±Y) scores near zero.
-    """
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    soccer_ball = env.scene["soccer_ball"]
-
-    ball_pos_w = soccer_ball.data.root_pos_w[:, :3]
-    pelvis_pos_w = command.robot_pelvis_pos_w
-    pelvis_quat_w = command.robot_pelvis_quat_w
-
-    dx = task_forward_offset(ball_pos_w, pelvis_pos_w)
-    dy = task_lateral_offset(ball_pos_w, pelvis_pos_w)
-    dist = torch.norm(torch.stack([dx, dy], dim=-1), dim=-1)
-    safe = dist > float(min_distance)
-    ball_ahead = torch.where(
-        safe,
-        (dx / dist.clamp(min=1e-4)).clamp(min=0.0, max=1.0),
-        torch.ones_like(dist),
-    )
-    pelvis_forward = task_pelvis_heading_cos_world_x(pelvis_quat_w).clamp(min=0.0, max=1.0)
-    return ball_ahead * pelvis_forward
 
 
 def dribbling_command_face_ball(

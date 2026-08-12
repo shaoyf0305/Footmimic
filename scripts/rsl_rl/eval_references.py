@@ -6,7 +6,7 @@ into a filtered directory for re-training.
 
 Example (dribbling stage-2, dribble-distance references):
   python scripts/rsl_rl/eval_references.py \\
-    --task Tracking-CG-G1-Dribbling-RNN-v0 \\
+    --task Tracking-CG-G1-Dribbling-RNN-control \\
     --experiment_name g1_dribbling \\
     --motion_path motions/dribble-distance \\
     --load_run 2026-06-09_03-45-57_resumed_dribble \\
@@ -40,7 +40,13 @@ from isaaclab.app import AppLauncher
 import cli_args  # isort: skip
 
 parser = argparse.ArgumentParser(description="Evaluate per-reference motion learning quality.")
-parser.add_argument("--task", type=str, required=True, help="Gym task id, e.g. Tracking-CG-G1-Dribbling-RNN-v0.")
+parser.add_argument(
+    "--task",
+    type=str,
+    default="Tracking-CG-G1-Dribbling-RNN-control",
+    choices=["Tracking-CG-G1-Dribbling-RNN-control"],
+    help="Gym task id; only the active Stage-2 control task is supported.",
+)
 parser.add_argument(
     "--motion_path",
     type=str,
@@ -311,7 +317,6 @@ def _detach_cmd_tensors(cmd) -> None:
     for name in (
         "soccer_ball_pos",
         "target_point_pos",
-        "target_destination_pos",
         "initial_target_point_pos",
         "motion_idx",
         "motion_length",
@@ -345,7 +350,6 @@ def _start_motion_rollout(base_env, motion_idx: int) -> None:
     cmd._compute_soccer_ball_positions(env_ids)
     cmd._update_soccer_ball(env_ids)
     cmd._update_target_points(env_ids)
-    cmd._update_destination_points(env_ids)
 
     blind_min_low, blind_min_high = cmd.cfg.blind_distance_min_range
     blind_max_low, blind_max_high = cmd.cfg.blind_distance_max_range

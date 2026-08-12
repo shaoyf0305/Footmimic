@@ -1,4 +1,4 @@
-"""Checkpoint helpers for resuming across envs with extra observation terms."""
+"""Compatibility loader for checkpoints created before the unified input interface."""
 
 from __future__ import annotations
 
@@ -22,60 +22,71 @@ def _get_alg_policy(runner):
     )
 
 
-def _expand_2d_input_weights(old: torch.Tensor, cur: torch.Tensor) -> torch.Tensor:
-    """Append zero columns when input features grew (obs terms appended at end)."""
+# Current observations retain only the polar ball and locomotion commands after
+# the stable actor/critic base blocks. Each legacy layout below lists the exact
+# source ranges whose semantics still exist; missing polar-command values are
+# appended with neutral normalizer statistics and zero model weights.
+_LEGACY_OBSERVATION_KEEP_RANGES: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {
+    # Actor: stable base=154, current tail=ball_polar(3)+locomotion_polar(3).
+    (163, 160): ((0, 154), (160, 163)),
+    (169, 160): ((0, 154), (157, 160), (166, 169)),
+    (172, 160): ((0, 154), (160, 163), (169, 172)),
+    # Critic: stable base=286, current tail=ball_polar(3)+locomotion_polar(3).
+    (295, 292): ((0, 286), (292, 295)),
+    (301, 292): ((0, 286), (289, 292), (298, 301)),
+    (304, 292): ((0, 286), (292, 295), (301, 304)),
+}
+
+
+def _migrate_obs_axis(old: torch.Tensor, cur: torch.Tensor, *, axis: int, fill: float) -> torch.Tensor:
+    """Select still-active legacy observations and append any newly introduced terms."""
     if old.shape == cur.shape:
         return old
-    if old.ndim != 2 or cur.ndim != 2 or old.shape[0] != cur.shape[0] or cur.shape[1] <= old.shape[1]:
-        raise ValueError(f"Cannot expand weight {old.shape} -> {cur.shape}")
-    pad = cur.shape[1] - old.shape[1]
-    zeros = torch.zeros(old.shape[0], pad, dtype=old.dtype, device=old.device)
-    return torch.cat([old, zeros], dim=1)
+    if old.ndim != cur.ndim or axis >= old.ndim:
+        raise ValueError(f"Cannot migrate observation tensor {old.shape} -> {cur.shape}")
+    for index, (old_size, cur_size) in enumerate(zip(old.shape, cur.shape)):
+        if index != axis and old_size != cur_size:
+            raise ValueError(f"Cannot migrate observation tensor {old.shape} -> {cur.shape}")
 
-
-def _expand_1d_tail(old: torch.Tensor, cur: torch.Tensor, *, fill: float) -> torch.Tensor:
-    if old.shape == cur.shape:
-        return old
-    if old.ndim != 1 or cur.ndim != 1 or cur.shape[0] <= old.shape[0]:
-        raise ValueError(f"Cannot expand vector {old.shape} -> {cur.shape}")
-    pad = cur.shape[0] - old.shape[0]
-    tail = torch.full((pad,), fill, dtype=old.dtype, device=old.device)
-    return torch.cat([old, tail], dim=0)
-
-
-def expand_state_dict_for_obs_growth(
-    checkpoint_sd: dict[str, torch.Tensor],
-    current_sd: dict[str, torch.Tensor],
-) -> tuple[dict[str, torch.Tensor], list[str]]:
-    """Pad checkpoint weights along the input-feature axis for new trailing obs dims."""
-    expanded: dict[str, torch.Tensor] = {}
-    notes: list[str] = []
-    for key, cur in current_sd.items():
-        if key not in checkpoint_sd:
-            expanded[key] = cur.clone()
-            notes.append(f"keep init: {key}")
-            continue
-        old = checkpoint_sd[key]
-        if old.shape == cur.shape:
-            expanded[key] = old
-            continue
-        if old.ndim == 2 and cur.ndim == 2:
-            expanded[key] = _expand_2d_input_weights(old, cur)
-            notes.append(f"{key}: {tuple(old.shape)} -> {tuple(expanded[key].shape)}")
-            continue
-        raise ValueError(
-            f"Incompatible checkpoint tensor '{key}': ckpt {tuple(old.shape)} vs env {tuple(cur.shape)}"
+    old_dim = old.shape[axis]
+    cur_dim = cur.shape[axis]
+    keep_ranges = _LEGACY_OBSERVATION_KEEP_RANGES.get((old_dim, cur_dim))
+    migrated = old
+    if keep_ranges is not None:
+        migrated = torch.cat(
+            [old.narrow(axis, start, end - start) for start, end in keep_ranges],
+            dim=axis,
         )
-    return expanded, notes
+    elif cur_dim <= old_dim:
+        raise ValueError(f"Cannot migrate observation tensor {old.shape} -> {cur.shape}")
+
+    pad = cur_dim - migrated.shape[axis]
+    if pad < 0:
+        raise ValueError(f"Cannot migrate observation tensor {old.shape} -> {cur.shape}")
+    if pad:
+        tail_shape = list(migrated.shape)
+        tail_shape[axis] = pad
+        tail = torch.full(tail_shape, fill, dtype=old.dtype, device=old.device)
+        migrated = torch.cat([migrated, tail], dim=axis)
+    return migrated
+
+
+def _migrate_2d_input_weights(old: torch.Tensor, cur: torch.Tensor) -> torch.Tensor:
+    """Migrate input columns; newly appended observations start with zero weight."""
+    if old.ndim != 2 or cur.ndim != 2:
+        raise ValueError(f"Cannot migrate weight {old.shape} -> {cur.shape}")
+    return _migrate_obs_axis(old, cur, axis=1, fill=0.0)
 
 
 def expand_obs_normalizer_state_dict(
     checkpoint_sd: dict[str, torch.Tensor],
     current_sd: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Extend running mean/var for appended observation dimensions.
+    """Migrate running mean/var to the current observation layout.
 
-    Handles both flat ``(N,)`` and row-vector ``(1, N)`` normalizer shapes.
+    Handles both flat ``(N,)`` and row-vector ``(1, N)`` normalizer shapes,
+    including removal of legacy Cartesian ball, destination, and redundant
+    Cartesian linear/angular command observations.
     """
     expanded: dict[str, torch.Tensor] = {}
     for key, cur in current_sd.items():
@@ -89,20 +100,14 @@ def expand_obs_normalizer_state_dict(
 
         fill = 1.0 if "var" in key else 0.0
 
-        # flat 1-D: (N,) -> (N+k,)
+        # Flat 1-D: remove legacy xyz and/or append new terms.
         if old.ndim == 1 and cur.ndim == 1:
-            expanded[key] = _expand_1d_tail(old, cur, fill=fill)
+            expanded[key] = _migrate_obs_axis(old, cur, axis=0, fill=fill)
             continue
 
-        # row-vector 2-D: (1, N) -> (1, N+k)
+        # Row-vector 2-D: remove legacy xyz and/or append new terms.
         if old.ndim == 2 and cur.ndim == 2 and old.shape[0] == 1 and cur.shape[0] == 1:
-            pad = cur.shape[1] - old.shape[1]
-            if pad <= 0:
-                raise ValueError(
-                    f"Incompatible normalizer tensor '{key}': ckpt {tuple(old.shape)} vs env {tuple(cur.shape)}"
-                )
-            tail = torch.full((1, pad), fill, dtype=old.dtype, device=old.device)
-            expanded[key] = torch.cat([old, tail], dim=1)
+            expanded[key] = _migrate_obs_axis(old, cur, axis=1, fill=fill)
             continue
 
         raise ValueError(
@@ -118,8 +123,12 @@ def _state_dict_needs_obs_expand(checkpoint_sd: dict[str, torch.Tensor], current
         old = checkpoint_sd[key]
         if old.shape == cur.shape:
             continue
-        if old.ndim == 2 and cur.ndim == 2 and old.shape[0] == cur.shape[0] and cur.shape[1] > old.shape[1]:
-            return True
+        if old.ndim == 1 and cur.ndim == 1:
+            if (old.shape[0], cur.shape[0]) in _LEGACY_OBSERVATION_KEEP_RANGES or cur.shape[0] > old.shape[0]:
+                return True
+        if old.ndim == 2 and cur.ndim == 2 and old.shape[0] == cur.shape[0]:
+            if (old.shape[1], cur.shape[1]) in _LEGACY_OBSERVATION_KEEP_RANGES or cur.shape[1] > old.shape[1]:
+                return True
         return False
     return False
 
@@ -191,7 +200,7 @@ def _maybe_expand_normalizer_entry(loaded_dict: dict[str, Any], key: str, curren
 
 
 def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> bool:
-    """Adapt smaller-observation and legacy joint-action checkpoints in place."""
+    """Adapt legacy observation layouts and joint-action checkpoints in place."""
     policy = _get_alg_policy(runner)
     model_key = "model_state_dict"
     if model_key not in loaded_dict:
@@ -235,8 +244,17 @@ def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> b
             changed = True
             continue
 
-        if old.ndim == 2 and cur.ndim == 2 and old.shape[0] == cur.shape[0] and cur.shape[1] > old.shape[1]:
-            transformed_sd[key] = _expand_2d_input_weights(old, cur)
+        can_migrate_obs = (
+            old.ndim == 2
+            and cur.ndim == 2
+            and old.shape[0] == cur.shape[0]
+            and (
+                (old.shape[1], cur.shape[1]) in _LEGACY_OBSERVATION_KEEP_RANGES
+                or cur.shape[1] > old.shape[1]
+            )
+        )
+        if can_migrate_obs:
+            transformed_sd[key] = _migrate_2d_input_weights(old, cur)
             notes.append(f"{key}: {tuple(old.shape)} -> {tuple(cur.shape)}")
             changed = True
             continue
@@ -252,7 +270,7 @@ def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> b
     loaded_dict.pop("optimizer_state_dict", None)
     loaded_dict.pop("rnd_optimizer_state_dict", None)
 
-    print("[INFO] Warm-start: adapted checkpoint for observation and/or action-interface growth.")
+    print("[INFO] Warm-start: adapted a legacy checkpoint to the current interface.")
     for note in notes:
         if "->" in note:
             print(f"  {note}")
@@ -270,13 +288,13 @@ def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> b
             ):
                 norm_expanded = True
         if norm_expanded:
-            print("[INFO] Warm-start: expanded obs normalizer(s) for new command inputs.")
+            print("[INFO] Warm-start: migrated legacy obs normalizer(s) to the current input layout.")
 
     return True
 
 
 def load_checkpoint_with_obs_expand(runner, path: str, **load_kwargs) -> Any:
-    """Load a checkpoint, auto-expanding actor/critic inputs when obs grew (forward -> follow/control)."""
+    """Load a checkpoint and migrate legacy observation/action interfaces."""
     map_location = load_kwargs.pop("map_location", getattr(runner, "device", None))
     loaded_dict = torch.load(path, map_location=map_location, weights_only=False)
     expanded = prepare_loaded_dict_for_obs_expand(loaded_dict, runner)
@@ -288,7 +306,7 @@ def load_checkpoint_with_obs_expand(runner, path: str, **load_kwargs) -> Any:
     os.close(fd)
     try:
         torch.save(loaded_dict, tmp_path)
-        # Fresh optimizer after input-dim growth; do not restore old Adam state.
+        # Fresh optimizer after interface migration; do not restore old Adam state.
         load_kwargs.setdefault("load_optimizer", False)
         return BaseOnPolicyRunner.load(runner, tmp_path, **load_kwargs)
     finally:

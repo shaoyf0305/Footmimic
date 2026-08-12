@@ -47,5 +47,5 @@ class MotionOnPolicyRunner(OnPolicyRunner):
                 self.registry_name = None
 
     def load(self, path: str, *args, **kwargs):
-        """Resume training; auto-expand obs when loading forward ckpt into follow/control."""
+        """Resume training, retaining compatibility with legacy smaller-input checkpoints."""
         return load_checkpoint_with_obs_expand(self, path, **kwargs)
