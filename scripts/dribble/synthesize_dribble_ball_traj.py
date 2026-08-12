@@ -4,11 +4,13 @@
 Pipeline (XGen-style, football simplification):
 
 1. **Contact segments** (``dribble_cg_contact==1``, foot from ``dribble_cg_foot``):
-   At a surface-labelled contact instant, transform a calibrated shoe-side point
-   by the ankle-roll link's full quaternion, then offset the ball centre along
-   the transformed side normal. Inside/outside is defined entirely in the
-   ankle-roll link's local frame (right inside = +Y; left inside = -Y), so the
-   complete foot yaw/pitch/roll determines the world-space contact geometry.
+   At a surface-labelled contact instant, transform a calibrated shoe-side
+   collision-capsule centre-line point by the ankle-roll link's full quaternion,
+   then offset the ball centre along the transformed side normal by the sum of
+   the shoe collision radius and ball radius. Inside/outside is defined entirely
+   in the ankle-roll link's local frame (right inside = +Y; left inside = -Y),
+   so the complete foot yaw/pitch/roll determines the world-space contact
+   geometry.
 
 2. **``traj_mode=hybrid``** (recommended): for surface-labelled data, the rising
    edge of each contact segment is the hand-labelled **contact instant**.  Only
@@ -303,7 +305,8 @@ def synthesize_ball_trajectory(
     foot_offset_x: float,
     foot_offset_y: float,
     foot_inner_offset: float,
-    foot_surface_offset: float,
+    foot_surface_offset: float | None,
+    foot_collision_radius: float,
     foot_contact_x: float,
     foot_half_width: float,
     foot_contact_z: float,
@@ -314,6 +317,17 @@ def synthesize_ball_trajectory(
     auto_foot_indices: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
     """Return ``(ball_pos_w [T,3], foot_ball_dist [T], dist_foot [T], L_idx, R_idx)``."""
+    if ball_radius <= 0.0:
+        raise ValueError(f"ball_radius must be positive, got {ball_radius}.")
+    if foot_collision_radius < 0.0:
+        raise ValueError(
+            f"foot_collision_radius must be non-negative, got {foot_collision_radius}."
+        )
+    if foot_surface_offset is not None and foot_surface_offset < 0.0:
+        raise ValueError(
+            f"foot_surface_offset must be non-negative when provided, got {foot_surface_offset}."
+        )
+
     T = int(body_pos_w.shape[0])
     num_bodies = int(body_pos_w.shape[1])
     ball = np.zeros((T, 3), dtype=np.float32)
@@ -413,7 +427,18 @@ def synthesize_ball_trajectory(
                 dtype=np.float64,
             )
             contact_w = foot_p.astype(np.float64) + _quat_rotate_wxyz(foot_q, contact_local)
-            ball_xy = contact_w[:2] + side_normal_xy * foot_surface_offset
+            # ``foot_half_width`` locates the centre line of the G1's outer
+            # collision capsule (local Y=+/-0.026 m), not its physical surface.
+            # The ball centre therefore has to clear both collision radii.  The
+            # old independent 0.11 m default happened to equal the current ball
+            # radius, but omitted the 0.01 m shoe capsule and silently became
+            # wrong whenever ``--ball_radius`` changed.
+            centre_clearance = (
+                ball_radius + foot_collision_radius
+                if foot_surface_offset is None
+                else foot_surface_offset
+            )
+            ball_xy = contact_w[:2] + side_normal_xy * centre_clearance
         else:
             # Preserve the historical inter-foot medial shift for datasets that
             # do not carry dribble_cg_surface.
@@ -696,17 +721,30 @@ def main() -> None:
     parser.add_argument(
         "--foot_surface_offset",
         type=float,
-        default=0.11,
+        default=None,
         help=(
-            "Ball-centre clearance (m) along the ankle-link side normal, measured from the "
-            "shoe edge at a contact anchor (default: ball radius, 0.11 m)."
+            "Legacy absolute ball-centre clearance override (m), measured from the outer "
+            "shoe collision-capsule centre line. By default the clearance is derived as "
+            "--ball_radius + --foot_collision_radius."
+        ),
+    )
+    parser.add_argument(
+        "--foot_collision_radius",
+        type=float,
+        default=0.01,
+        help=(
+            "Radius (m) of the outer G1 shoe collision capsule whose centre line is at "
+            "local Y=+/-foot_half_width (default: 0.01)."
         ),
     )
     parser.add_argument(
         "--foot_contact_x",
         type=float,
-        default=0.04,
-        help="Shoe-side contact point X in ankle-roll local coordinates (m; default: 0.04).",
+        default=0.10,
+        help=(
+            "Forefoot contact point X in ankle-roll local coordinates (m; default: 0.10). "
+            "Inside/outside labels select its lateral side, not a mirrored midfoot anchor."
+        ),
     )
     parser.add_argument(
         "--foot_half_width",
@@ -814,6 +852,7 @@ def main() -> None:
             foot_offset_y=args.foot_offset_y,
             foot_inner_offset=args.foot_inner_offset,
             foot_surface_offset=args.foot_surface_offset,
+            foot_collision_radius=args.foot_collision_radius,
             foot_contact_x=args.foot_contact_x,
             foot_half_width=args.foot_half_width,
             foot_contact_z=args.foot_contact_z,

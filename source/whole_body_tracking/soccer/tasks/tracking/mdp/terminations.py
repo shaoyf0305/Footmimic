@@ -228,6 +228,42 @@ def dribbling_missed_valid_contact(
     return missed & short_episode
 
 
+def dribbling_s2_invalid_acquisition_start(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    ball_sensor_name: str = "soccer_ball_contact",
+    all_body_cfg: SceneEntityCfg | None = None,
+    num_ankle_links: int = 2,
+    require_expected_foot: bool = True,
+    target_side_enabled: bool = True,
+    side_deadzone: float = 0.04,
+    proximity_contact_distance_max: float = 0.25,
+    target_region_std: float = 0.12,
+    proximity_approach_seconds: float = 0.30,
+    proximity_approach_min_weight: float = 0.20,
+    missed_contact_grace_steps: int = 3,
+    acquisition_min_history_steps: int = 20,
+) -> torch.Tensor:
+    """Reject a teacher reset that contacts the ball before recurrent warm-up."""
+    state = dribbling_s2_contact_event_state(
+        env,
+        command_name=command_name,
+        ball_sensor_name=ball_sensor_name,
+        all_body_cfg=all_body_cfg,
+        num_ankle_links=num_ankle_links,
+        require_expected_foot=require_expected_foot,
+        target_side_enabled=target_side_enabled,
+        side_deadzone=side_deadzone,
+        proximity_contact_distance_max=proximity_contact_distance_max,
+        target_region_std=target_region_std,
+        proximity_approach_seconds=proximity_approach_seconds,
+        proximity_approach_min_weight=proximity_approach_min_weight,
+        missed_contact_grace_steps=missed_contact_grace_steps,
+        acquisition_min_history_steps=acquisition_min_history_steps,
+    )
+    return state["acquisition_invalid_early_contact"]
+
+
 def dribbling_no_ball_contact_timeout(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",

@@ -17,8 +17,9 @@ Contact / foot / surface masks come from ``dribble_cg_contact``,
 ``dribble_cg_foot``, and ``dribble_cg_surface`` in ``.npz``.  The legacy
 ``kick_frame`` / ``kick_end_frame`` / ``kick_leg`` metadata remains a fallback
 for contact timing and foot side, but cannot describe an instep surface (see
-:class:`MultiMotionLoader`). ``dribble_cg_flow_*`` stores the outgoing
-contact-to-contact direction, distance, and duration used by Stage 2.
+:class:`MultiMotionLoader`).  Stage 2 derives its outgoing target directly
+from consecutive reference contact anchors; the legacy ``dribble_cg_flow_*``
+labels are not part of the 6.0.3 contract.
 """
 
 from __future__ import annotations
@@ -74,6 +75,20 @@ class DribbleCGMotionCommand(MotionCommand):
         )
         self.s2_episode_first_event_index = torch.full(
             (env.num_envs,), -1, dtype=torch.long, device=env.device
+        )
+        # Reset provenance: 0 = real frame-0 sequence, 1 = teacher-provided
+        # pre-second-touch acquisition state.  Acquisition episodes never
+        # enter promotion statistics.
+        self.s2_episode_reset_mode = torch.zeros(
+            env.num_envs, dtype=torch.int8, device=env.device
+        )
+        self.s2_episode_acquisition_history_steps = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
+        self._s2_acquisition_probability = torch.tensor(
+            float(getattr(cfg, "dribble_cg_acquisition_initial_probability", 0.25)),
+            dtype=torch.float32,
+            device=env.device,
         )
         # The Curriculum Manager owns this scalar. Each sampled episode keeps
         # its originating level so asynchronous resets after a promotion do
@@ -136,6 +151,16 @@ class DribbleCGMotionCommand(MotionCommand):
             "s2_complete_4",
             "s2_complete_8",
             "s2_complete_selected",
+            "s2_approach_progress",
+            "s2_immediate_contact",
+            "s2_release_pending",
+            "s2_release_score",
+            "s2_release_quality_pass",
+            "s2_quality_streak",
+            "s2_second_touch_conditional_success",
+            "s2_reset_mode",
+            "s2_acquisition_success_rate",
+            "s2_acquisition_history_steps_before_contact",
         ):
             self.metrics[metric_name] = torch.zeros(self.num_envs, device=self.device)
         self._validate_fixed_touch_spec()
@@ -214,6 +239,65 @@ class DribbleCGMotionCommand(MotionCommand):
         )
         for motion_idx, frames in enumerate(self._s2_event_frames_by_motion):
             self._s2_event_frames_padded[motion_idx, : frames.numel()] = frames
+
+        # Each non-final touch points directly at the next reference ball
+        # anchor.  The reward maps this raw reference point into the current
+        # episode only when the physical touch occurs, so early/late touches
+        # do not inherit a stale static velocity target.
+        event_table_shape = self._s2_event_frames_padded.shape
+        self._s2_next_event_frame_padded = torch.full(
+            event_table_shape, -1, dtype=torch.long, device=self.device
+        )
+        self._s2_next_anchor_ref_padded = torch.zeros(
+            (*event_table_shape, 3), dtype=torch.float32, device=self.device
+        )
+        self._s2_next_anchor_valid_padded = torch.zeros(
+            event_table_shape, dtype=torch.bool, device=self.device
+        )
+        for motion_idx, frames in enumerate(self._s2_event_frames_by_motion):
+            if frames.numel() < 2 or not bool(self.motion.motion_has_ball_demo[motion_idx]):
+                continue
+            next_frames = frames[1:]
+            slots = torch.arange(frames.numel() - 1, device=self.device)
+            self._s2_next_event_frame_padded[motion_idx, slots] = next_frames
+            self._s2_next_anchor_ref_padded[motion_idx, slots] = self.motion.ball_pos_w[
+                motion_idx, next_frames
+            ]
+            self._s2_next_anchor_valid_padded[motion_idx, slots] = True
+
+        # Safe teacher-reset ranges for the second touch.  Never start inside
+        # the first contact segment: doing so would teleport into an existing
+        # collision and provide no useful recurrent ball-motion history.
+        min_history = max(
+            1, int(getattr(self.cfg, "dribble_cg_acquisition_min_history_steps", 20))
+        )
+        max_history = max(
+            min_history,
+            int(getattr(self.cfg, "dribble_cg_acquisition_max_history_steps", 30)),
+        )
+        acquisition_candidates: list[tuple[int, int, int, int]] = []
+        for motion_idx, frames in enumerate(self._s2_event_frames_by_motion):
+            if frames.numel() < 2 or not bool(self.motion.motion_has_ball_demo[motion_idx]):
+                continue
+            first_frame = int(frames[0].item())
+            second_frame = int(frames[1].item())
+            contact = self.motion.dribble_cg_contact[motion_idx]
+            first_end = first_frame
+            motion_length = int(self.motion.file_lengths[motion_idx].item())
+            while first_end + 1 < motion_length and int(contact[first_end + 1].item()) > 0:
+                first_end += 1
+            start_min = max(first_end + 1, second_frame - max_history)
+            start_max = second_frame - min_history
+            if start_min <= start_max:
+                acquisition_candidates.append((motion_idx, 1, start_min, start_max))
+        if acquisition_candidates:
+            self._s2_acquisition_candidates = torch.as_tensor(
+                acquisition_candidates, dtype=torch.long, device=self.device
+            )
+        else:
+            self._s2_acquisition_candidates = torch.empty(
+                (0, 4), dtype=torch.long, device=self.device
+            )
         # Persistent single-touch statistics drive level-local hard-event
         # replay. They are reset on promotion so clean and disturbed levels do
         # not contaminate one another's reachability estimates.
@@ -377,6 +461,52 @@ class DribbleCGMotionCommand(MotionCommand):
         mapped_yaw = yaw_quat(quat_mul(alignment, raw_quat))
         return mapped_pos, mapped_yaw
 
+    def s2_next_touch_target_w(
+        self, event_id: torch.Tensor, actual_ball_pos_w: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Map the next reference contact anchor at the physical touch time.
+
+        Returns ``(next_anchor_w, next_event_frame, remaining_time, valid)``.
+        The alignment is latched by the reward caller; later pelvis rotation
+        therefore cannot rotate the already-issued world-frame target.
+        """
+        event_id = event_id.to(device=self.device, dtype=torch.long)
+        max_slots = self._s2_next_event_frame_padded.shape[1]
+        safe_event = event_id.clamp(min=0, max=max_slots - 1)
+        motion_idx = self.motion_idx.to(torch.long)
+        next_frame = self._s2_next_event_frame_padded[motion_idx, safe_event]
+        raw_anchor = self._s2_next_anchor_ref_padded[motion_idx, safe_event]
+        valid = (
+            (event_id >= 0)
+            & (event_id < max_slots)
+            & self._s2_next_anchor_valid_padded[motion_idx, safe_event]
+        )
+
+        raw_anchor_w = raw_anchor + self._env.scene.env_origins
+        alignment = self._mimic_target_yaw_delta_quat(
+            self.anchor_quat_w, self.robot_anchor_quat_w
+        )
+        mapped_origin = self.robot_anchor_pos_w.clone()
+        mapped_origin[:, 2] = self.anchor_pos_w[:, 2]
+        next_anchor_w = mapped_origin + quat_apply(
+            alignment, raw_anchor_w - self.anchor_pos_w
+        )
+        fps = max(float(self.motion.fps.reshape(-1)[0]), 1.0e-6)
+        remaining_time = (
+            next_frame - self.time_steps.to(torch.long)
+        ).to(torch.float32) / fps
+        distance = torch.linalg.vector_norm(
+            next_anchor_w[:, :2] - actual_ball_pos_w[:, :2], dim=-1
+        )
+        valid &= (remaining_time > 0.0) & torch.isfinite(distance)
+        invalid_frame = torch.full_like(next_frame, -1)
+        return (
+            next_anchor_w,
+            torch.where(valid, next_frame, invalid_frame),
+            torch.where(valid, remaining_time, torch.zeros_like(remaining_time)),
+            valid,
+        )
+
     def _sample_s2_contact_curriculum(self, env_ids: torch.Tensor) -> bool:
         """Sample a contact-count episode; return false when the feature is off."""
         levels = tuple(getattr(self.cfg, "dribble_cg_curriculum_levels", ()))
@@ -400,11 +530,79 @@ class DribbleCGMotionCommand(MotionCommand):
             0, int(round(float(getattr(self.cfg, "dribble_cg_contact_window_seconds", 0.10)) * fps))
         )
         post_grace = max(0, int(getattr(self.cfg, "dribble_cg_missed_contact_grace_steps", 3)))
+        release_tail = max(
+            0, int(getattr(self.cfg, "dribble_cg_release_window_steps", 8))
+        )
+        self.s2_episode_reset_mode[env_ids] = 0
+        self.s2_episode_acquisition_history_steps[env_ids] = 0
 
         for requested_count_tensor in torch.unique(sampled_counts):
             requested_count = int(requested_count_tensor.item())
             group_mask = sampled_counts == requested_count
             group_env_ids = env_ids[group_mask]
+            group_size = group_env_ids.numel()
+            if group_size == 0:
+                continue
+
+            # Level 0 mixes real frame-0 two-touch episodes with independent
+            # teacher resets before the second event.  Acquisition samples
+            # are diagnostic/training-only and are excluded from promotion.
+            acquisition_probability = min(
+                1.0, max(0.0, float(self._s2_acquisition_probability.item()))
+            )
+            acquisition_mask = torch.zeros(
+                group_size, dtype=torch.bool, device=self.device
+            )
+            if (
+                level == 0
+                and requested_count >= 2
+                and acquisition_probability > 0.0
+                and self._s2_acquisition_candidates.numel() > 0
+            ):
+                acquisition_mask = (
+                    torch.rand(group_size, device=self.device) < acquisition_probability
+                )
+            acquisition_ids = group_env_ids[acquisition_mask]
+            if acquisition_ids.numel() > 0:
+                candidate_rows = self._s2_acquisition_candidates[
+                    torch.randint(
+                        self._s2_acquisition_candidates.shape[0],
+                        (acquisition_ids.numel(),),
+                        device=self.device,
+                    )
+                ]
+                selected_motion = candidate_rows[:, 0]
+                target_event_index = candidate_rows[:, 1]
+                start_min = candidate_rows[:, 2]
+                start_max = candidate_rows[:, 3]
+                span = (start_max - start_min + 1).clamp(min=1)
+                start_frame = start_min + torch.floor(
+                    torch.rand(acquisition_ids.numel(), device=self.device)
+                    * span.to(torch.float32)
+                ).to(torch.long)
+                target_frame = self._s2_event_frames_padded[
+                    selected_motion, target_event_index
+                ]
+                true_length = self.motion.file_lengths[selected_motion]
+                end_frame = torch.minimum(
+                    true_length - 1,
+                    target_frame + half_window + post_grace + release_tail + 1,
+                )
+                self.motion_idx[acquisition_ids] = selected_motion
+                self.motion_length[acquisition_ids] = end_frame + 1
+                self.time_steps[acquisition_ids] = start_frame
+                self.s2_episode_first_contact_frame[acquisition_ids] = target_frame
+                self.s2_episode_last_contact_frame[acquisition_ids] = target_frame
+                self.s2_episode_contact_count[acquisition_ids] = 1
+                self.s2_episode_first_event_index[acquisition_ids] = target_event_index
+                self.s2_episode_curriculum_level[acquisition_ids] = level
+                self.s2_episode_curriculum_audit[acquisition_ids] = False
+                self.s2_episode_reset_mode[acquisition_ids] = 1
+                self.s2_episode_acquisition_history_steps[acquisition_ids] = (
+                    target_frame - start_frame
+                )
+
+            group_env_ids = group_env_ids[~acquisition_mask]
             group_size = group_env_ids.numel()
             if group_size == 0:
                 continue
@@ -520,7 +718,7 @@ class DribbleCGMotionCommand(MotionCommand):
                 start_frame = torch.zeros_like(first_event)
                 end_frame = torch.minimum(
                     true_length - 1,
-                    last_event + half_window + post_grace + 1,
+                    last_event + half_window + post_grace + release_tail + 1,
                 )
 
             self.motion_idx[group_env_ids] = selected_motion
@@ -532,6 +730,8 @@ class DribbleCGMotionCommand(MotionCommand):
             self.s2_episode_first_event_index[group_env_ids] = sequence_start
             self.s2_episode_curriculum_level[group_env_ids] = level
             self.s2_episode_curriculum_audit[group_env_ids] = uniform_audit
+            self.s2_episode_reset_mode[group_env_ids] = 0
+            self.s2_episode_acquisition_history_steps[group_env_ids] = 0
         return True
 
     def _uniform_sampling(self, env_ids: Sequence[int]):
@@ -548,6 +748,8 @@ class DribbleCGMotionCommand(MotionCommand):
         self.s2_episode_first_event_index[ids] = -1
         self.s2_episode_curriculum_level[ids] = int(self.s2_curriculum_level.item())
         self.s2_episode_curriculum_audit[ids] = True
+        self.s2_episode_reset_mode[ids] = 0
+        self.s2_episode_acquisition_history_steps[ids] = 0
 
     def _resample_command(self, env_ids: Sequence[int]):
         ids = self._to_env_id_tensor(env_ids)
@@ -812,8 +1014,11 @@ class DribbleCGMotionCommand(MotionCommand):
         # the robot always resets at source frame 0, so an interior event would
         # put the ball at a future touch while replaying the prefix from frame 0.
         contact_frames = self.motion.first_dribble_contact_frame[mi]
+        acquisition = self.s2_episode_reset_mode[env_ids] == 1
+        source_frames = torch.where(acquisition, self.time_steps[env_ids], contact_frames)
         valid = (contact_frames >= 0) & self.motion.motion_has_ball_demo[mi]
-        safe_frames = contact_frames.clamp(min=0)
+        valid = torch.where(acquisition, self.motion.motion_has_ball_demo[mi], valid)
+        safe_frames = source_frames.clamp(min=0)
         positions = self.motion.ball_pos_w[mi, safe_frames].clone()
         jitter_levels = tuple(
             getattr(self.cfg, "dribble_cg_curriculum_ball_spawn_jitter", ())
@@ -835,7 +1040,7 @@ class DribbleCGMotionCommand(MotionCommand):
                 jitter_max[level_mask] = max(0.0, float(level_jitter_max))
             perturb = (
                 torch.rand(env_ids.numel(), device=self.device) >= clean_probability
-            ) & (jitter_max > 0.0)
+            ) & (jitter_max > 0.0) & ~acquisition
 
             if bool(torch.any(perturb)):
                 contact_foot = self.motion.dribble_cg_foot[mi, safe_frames].to(torch.long)
@@ -924,7 +1129,46 @@ class DribbleCGMotionCommand(MotionCommand):
                 angle = 2.0 * torch.pi * torch.rand(env_ids.numel(), device=self.device)
                 positions[:, 0] += radius * torch.cos(angle)
                 positions[:, 1] += radius * torch.sin(angle)
-        return positions, valid, contact_frames
+        return positions, valid, source_frames
+
+    def _acquisition_ball_velocity_w(
+        self, env_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Finite-difference reference velocity and a rolling-spin fallback."""
+        motion_idx = self.motion_idx[env_ids]
+        frame = self.time_steps[env_ids]
+        last = self.motion.file_lengths[motion_idx] - 1
+        previous = torch.clamp(frame - 1, min=0)
+        following = torch.minimum(frame + 1, last)
+        previous_pos = self.motion.ball_pos_w[motion_idx, previous]
+        following_pos = self.motion.ball_pos_w[motion_idx, following]
+        fps = max(float(self.motion.fps.reshape(-1)[0]), 1.0e-6)
+        elapsed = (following - previous).to(torch.float32).clamp(min=1.0) / fps
+        linear_velocity = (following_pos - previous_pos) / elapsed.unsqueeze(-1)
+        radius = max(float(getattr(self.cfg, "dribble_cg_ball_radius", 0.11)), 1.0e-4)
+        angular_velocity = torch.zeros_like(linear_velocity)
+        angular_velocity[:, 0] = -linear_velocity[:, 1] / radius
+        angular_velocity[:, 1] = linear_velocity[:, 0] / radius
+        return linear_velocity, angular_velocity
+
+    def _update_soccer_ball(self, env_ids: Sequence[int] | torch.Tensor):
+        """Restore reference ball velocity for acquisition teacher resets."""
+        ids = self._to_env_id_tensor(env_ids)
+        super()._update_soccer_ball(ids)
+        acquisition_ids = ids[self.s2_episode_reset_mode[ids] == 1]
+        if acquisition_ids.numel() == 0 or self.soccer_ball is None:
+            return
+        env_origins = getattr(self._env.scene, "env_origins", None)
+        if env_origins is None:
+            return
+        ball_pos = self.soccer_ball_pos[acquisition_ids] + env_origins[acquisition_ids]
+        ball_quat = ball_pos.new_zeros((acquisition_ids.numel(), 4))
+        ball_quat[:, 0] = 1.0
+        ball_lin_vel, ball_ang_vel = self._acquisition_ball_velocity_w(acquisition_ids)
+        ball_state = torch.cat(
+            (ball_pos, ball_quat, ball_lin_vel, ball_ang_vel), dim=-1
+        )
+        self.soccer_ball.write_root_state_to_sim(ball_state, env_ids=acquisition_ids)
 
     def _record_ball_spawn(
         self,
@@ -1070,6 +1314,11 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     dribble_cg_hard_replay_min_attempts: int = 30
     dribble_cg_hard_replay_fraction: float = 0.30
     dribble_cg_curriculum_audit_probability: float = 0.25
+    dribble_cg_acquisition_initial_probability: float = 0.25
+    dribble_cg_acquisition_min_history_steps: int = 20
+    dribble_cg_acquisition_max_history_steps: int = 30
+    dribble_cg_release_window_steps: int = 8
+    dribble_cg_ball_radius: float = 0.11
     dribble_cg_s2_debug_regions_only: bool = False
     # ``None`` preserves the historical mixed-foot CG behavior. Unified
     # training sets this to one side and validates every motion at startup.
@@ -1081,6 +1330,6 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     # S2 uses per-frame inside/outside supervision. Fail early instead of
     # silently treating a legacy foot-only motion as a surface-labelled one.
     dribble_cg_require_surface_labels: bool = False
-    # S2 also requires causal contact-to-contact flow labels. The final contact
-    # is intentionally unlabeled because it has no known outgoing destination.
+    # Legacy tasks may still opt into precomputed causal flow labels.  S2
+    # 6.0.3 keeps this false and derives targets from contact anchors instead.
     dribble_cg_require_flow_labels: bool = False

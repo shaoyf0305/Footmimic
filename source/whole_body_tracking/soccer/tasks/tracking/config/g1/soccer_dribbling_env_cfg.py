@@ -865,9 +865,11 @@ _S2_REWARD_NAMES = frozenset(
         "upper_body_reference_overflow",
         "upper_body_manifold_nullspace",
         "s2_windowed_foot_tracking",
-        "s2_global_foot_ball_distance",
+        "s2_approach_progress",
         "s2_contact_proximity",
-        "s2_valid_contact_bonus",
+        "s2_immediate_contact_bonus",
+        "s2_next_touch_release",
+        "s2_surface_style",
         "s2_nonfoot_ball_contact",
         "s2_wrong_foot_contact",
         "s2_premature_contact",
@@ -975,8 +977,9 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
             },
         )
 
-        # Global distance uses only simulated poses plus the current/upcoming
-        # foot label. Contact-dependent terms share the event state below.
+        # Contact-dependent terms share one event/release state.  The target
+        # body list starts with both legal ankle links; later entries are
+        # explicit non-foot penalties.
         ankle_names = ["right_ankle_roll_link", "left_ankle_roll_link"]
         num_ankle_links = len(ankle_names)
         s2_contact_body_cfg = SceneEntityCfg(
@@ -1004,13 +1007,13 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
             "proximity_approach_min_weight": 0.20,
             "missed_contact_grace_steps": 3,
         }
-        self.rewards.s2_global_foot_ball_distance = RewTerm(
-            func=mdp.dribbling_s2_global_foot_ball_distance_exp,
-            weight=3.5,
+        self.rewards.s2_approach_progress = RewTerm(
+            func=mdp.dribbling_s2_approach_progress,
+            weight=2.0,
             params={
-                "command_name": "motion",
-                "foot_body_names": ["left_ankle_roll_link", "right_ankle_roll_link"],
-                "global_foot_ball_distance_std": 0.40,
+                **dict(event_params),
+                "approach_distance_std": 0.40,
+                "approach_progress_max": 4.0,
             },
         )
         self.rewards.s2_contact_proximity = RewTerm(
@@ -1021,11 +1024,36 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
             weight=1.0,
             params=dict(event_params),
         )
-        # Touch occurrence remains telemetry only. The sparse reward is paid
-        # exclusively for a physical rising edge on the labelled foot side.
-        self.rewards.s2_valid_contact_bonus = RewTerm(
-            func=mdp.dribbling_s2_valid_contact_bonus,
+        # Correct time and foot define contact success.  The source
+        # inside/outside label is deliberately only a style preference.
+        self.rewards.s2_immediate_contact_bonus = RewTerm(
+            func=mdp.dribbling_s2_immediate_contact_bonus,
             weight=5.0,
+            params=dict(event_params),
+        )
+        self.rewards.s2_next_touch_release = RewTerm(
+            func=mdp.dribbling_s2_next_touch_release,
+            # 12 gives a first-release maximum return of 1.92 over eight
+            # 20-ms steps.  It is deliberately below the earlier aggressive
+            # proposal of 20 while remaining large enough to shape touch 1.
+            weight=12.0,
+            params={
+                **dict(event_params),
+                "release_window_steps": 8,
+                "release_speed_lower_ratio": 0.65,
+                "release_speed_upper_ratio": 1.35,
+                "release_lateral_speed_std": 0.35,
+                "release_overspeed_decay_ratio": 0.35,
+                "release_velocity_outlier_scale": 0.75,
+                "release_separation_min": 0.14,
+                "release_separation_full": 0.22,
+                "release_quality_threshold": 0.50,
+                "release_min_target_distance": 0.05,
+            },
+        )
+        self.rewards.s2_surface_style = RewTerm(
+            func=mdp.dribbling_s2_surface_style,
+            weight=1.0,
             params=dict(event_params),
         )
         self.rewards.s2_nonfoot_ball_contact = RewTerm(
@@ -1045,7 +1073,7 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         )
 
         # The inherited dribbling/CG classes define many objectives for other
-        # tasks. S2 exposes only its exact 20-term contract to RewardManager.
+        # tasks. S2 exposes only its exact 22-term contract to RewardManager.
         _prune_s2_reward_manager(self)
 
         # Ball-lost is distance-only and debounced for 0.2 s.  Reference
@@ -1071,9 +1099,16 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
                 "max_required_contact_count": 2,
             },
         )
+        self.terminations.invalid_acquisition_start = DoneTerm(
+            func=mdp.dribbling_s2_invalid_acquisition_start,
+            params={
+                **dict(event_params),
+                "acquisition_min_history_steps": 20,
+            },
+        )
 
         # The ball always follows physics. Only the side-aware event region,
-        # side-valid contact bonus, and split contact penalties supervise it. Its
+        # event approach/contact/release objectives and split penalties supervise it. Its
         # reset location is the selected first event's reference target,
         # represented in the reference pelvis-local frame rather than task +X.
         setattr(self.commands.motion, "dribble_cg_use_task_frame", False)
@@ -1091,6 +1126,10 @@ class G1FlatCGDribblingUnifiedS2LocalReferenceEnvCfg(G1FlatCGDribblingEnvCfg):
         setattr(self.commands.motion, "dribble_cg_curriculum_start_level", 0)
         setattr(self.commands.motion, "dribble_cg_contact_window_seconds", 0.10)
         setattr(self.commands.motion, "dribble_cg_missed_contact_grace_steps", 3)
+        setattr(self.commands.motion, "dribble_cg_release_window_steps", 8)
+        setattr(self.commands.motion, "dribble_cg_acquisition_initial_probability", 0.25)
+        setattr(self.commands.motion, "dribble_cg_acquisition_min_history_steps", 20)
+        setattr(self.commands.motion, "dribble_cg_acquisition_max_history_steps", 30)
         # Per level: (exact-reference probability, maximum initial radius).
         # Levels 0--3 preserve the exact frame-0 reference state. Only the
         # final full-clip level perturbs the ball once at reset; every later

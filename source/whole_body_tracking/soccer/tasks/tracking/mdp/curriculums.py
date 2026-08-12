@@ -38,6 +38,8 @@ def _clear_s2_curriculum_window(command) -> None:
         "_s2_curriculum_side_attempt_count",
         "_s2_curriculum_sequence_success_sum",
         "_s2_curriculum_sequence_episode_count",
+        "_s2_acquisition_episode_count",
+        "_s2_acquisition_success_sum",
     ):
         value = getattr(command, name, None)
         if isinstance(value, torch.Tensor):
@@ -110,6 +112,8 @@ def s2_contact_level_curriculum(
             "plateau_streak": zero,
             "pass_streak": zero,
             "level_entry_iteration": zero,
+            "acquisition_success_rate": zero,
+            "acquisition_probability": zero,
         }
 
     float_stats = (
@@ -127,6 +131,8 @@ def s2_contact_level_curriculum(
         "_s2_curriculum_last_event_coverage",
         "_s2_curriculum_last_evaluation_count",
         "_s2_curriculum_best_contact_success_rate",
+        "_s2_acquisition_episode_count",
+        "_s2_acquisition_success_sum",
     )
     for name in float_stats:
         _s2_curriculum_scalar(command, name, dtype=torch.float32)
@@ -173,6 +179,25 @@ def s2_contact_level_curriculum(
         ids = ids[valid]
 
         if ids.numel() > 0:
+            reset_mode = getattr(command, "s2_episode_reset_mode", None)
+            if isinstance(reset_mode, torch.Tensor):
+                acquisition_mask = reset_mode[ids].to(torch.long) == 1
+            else:
+                acquisition_mask = torch.zeros(
+                    ids.numel(), dtype=torch.bool, device=env.device
+                )
+            acquisition_ids = ids[acquisition_mask]
+            if acquisition_ids.numel() > 0:
+                acquisition_success = command.metrics[
+                    "s2_acquisition_success_rate"
+                ][acquisition_ids].to(torch.float32)
+                command._s2_acquisition_episode_count.add_(
+                    float(acquisition_ids.numel())
+                )
+                command._s2_acquisition_success_sum.add_(
+                    acquisition_success.sum()
+                )
+
             episode_audit = getattr(command, "s2_episode_curriculum_audit", None)
             if isinstance(episode_audit, torch.Tensor):
                 audit_mask = episode_audit[ids].to(torch.bool)
@@ -300,6 +325,10 @@ def s2_contact_level_curriculum(
         / command._s2_curriculum_sequence_episode_count.clamp(min=1.0)
     )
     fall_rate = command._s2_curriculum_fall_count / episode_count.clamp(min=1.0)
+    acquisition_rate = (
+        command._s2_acquisition_success_sum
+        / command._s2_acquisition_episode_count.clamp(min=1.0)
+    )
 
     event_coverage = torch.zeros((), device=env.device, dtype=torch.float32)
     event_attempt_count = getattr(command, "_s2_event_attempt_count", None)
@@ -383,6 +412,26 @@ def s2_contact_level_curriculum(
                 float(sequence_rate.item()) >= float(sequence_completion_threshold)
                 and float(fall_rate.item()) <= float(max_fall_rate)
             )
+            # A deliberately simple, monotonic teacher-reset schedule.  The
+            # real two-touch audit owns these thresholds; acquisition samples
+            # can never reduce their own sampling probability by succeeding.
+            if level == 0:
+                acquisition_probability = getattr(
+                    command, "_s2_acquisition_probability", None
+                )
+                if isinstance(acquisition_probability, torch.Tensor):
+                    if float(sequence_rate.item()) >= 0.50:
+                        target_probability = 0.0
+                    elif float(sequence_rate.item()) >= 0.25:
+                        target_probability = 0.10
+                    else:
+                        target_probability = 0.25
+                    acquisition_probability.fill_(
+                        min(
+                            float(acquisition_probability.item()),
+                            target_probability,
+                        )
+                    )
 
         command._s2_curriculum_last_contact_success_rate.copy_(contact_rate)
         command._s2_curriculum_last_correct_side_rate.copy_(side_rate)
@@ -404,6 +453,11 @@ def s2_contact_level_curriculum(
             pass_streak.zero_()
             plateau_streak.zero_()
             hard_replay.zero_()
+            acquisition_probability = getattr(
+                command, "_s2_acquisition_probability", None
+            )
+            if isinstance(acquisition_probability, torch.Tensor):
+                acquisition_probability.zero_()
             command._s2_curriculum_best_contact_success_rate.zero_()
             if isinstance(event_attempt_count, torch.Tensor):
                 event_attempt_count.zero_()
@@ -441,6 +495,9 @@ def s2_contact_level_curriculum(
     logged_event_coverage = torch.where(
         has_last_window, command._s2_curriculum_last_event_coverage, event_coverage
     )
+    acquisition_probability = getattr(command, "_s2_acquisition_probability", None)
+    if not isinstance(acquisition_probability, torch.Tensor):
+        acquisition_probability = torch.zeros((), device=env.device)
     return {
         "level": level_tensor.to(torch.float32),
         "evaluated_level": last_evaluated_level.to(torch.float32),
@@ -458,4 +515,6 @@ def s2_contact_level_curriculum(
         "plateau_streak": plateau_streak.to(torch.float32),
         "pass_streak": pass_streak.to(torch.float32),
         "level_entry_iteration": level_entry_history[level_tensor].to(torch.float32),
+        "acquisition_success_rate": acquisition_rate,
+        "acquisition_probability": acquisition_probability.to(torch.float32),
     }

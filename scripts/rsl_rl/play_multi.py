@@ -545,7 +545,7 @@ def _diagnostic_contact_settings(base_env) -> dict:
     params = _diagnostic_reward_params(base_env, "dribbling_legal_foot_touch")
     default_force_threshold = 14.0
     if not params:
-        params = _diagnostic_reward_params(base_env, "s2_valid_contact_bonus")
+        params = _diagnostic_reward_params(base_env, "s2_immediate_contact_bonus")
         # S2 deliberately has no force-validity cap. Infinity keeps the generic
         # playback classifier aligned with that contract while raw force is
         # still exported separately.
@@ -969,6 +969,8 @@ def _create_diagnostic(
         "s2_episode_curriculum_level": [],
         "s2_episode_curriculum_audit": [],
         "s2_episode_contact_count": [],
+        "s2_reset_mode": [],
+        "s2_acquisition_history_steps_before_contact": [],
         "s2_premature_contact_count": [],
         "s2_touch_occurrence_rate": [],
         "s2_valid_contact_rate": [],
@@ -989,10 +991,24 @@ def _create_diagnostic(
         "s2_ball_offset_actual_foot": [],
         "s2_target_region_distance": [],
         "s2_physical_foot_ball_distance": [],
-        "s2_global_foot_ball_distance": [],
-        "s2_global_foot_ball_score": [],
-        "s2_global_foot_ball_expected_foot": [],
-        "s2_global_foot_ball_active": [],
+        "s2_approach_progress": [],
+        "s2_immediate_contact": [],
+        "s2_surface_style": [],
+        "s2_release_pending": [],
+        "s2_release_actual_touch_frame": [],
+        "s2_release_next_anchor_w": [],
+        "s2_release_remaining_time": [],
+        "s2_release_target_distance": [],
+        "s2_release_target_direction": [],
+        "s2_release_nominal_speed": [],
+        "s2_release_parallel_speed": [],
+        "s2_release_lateral_speed": [],
+        "s2_release_speed_ratio": [],
+        "s2_release_separation_score": [],
+        "s2_release_score": [],
+        "s2_release_quality_pass": [],
+        "s2_quality_streak": [],
+        "s2_second_touch_conditional_success": [],
         "cg_flow_label_available": [],
         "cg_flow_valid": [],
         "cg_flow_anchor_frame": [],
@@ -1273,6 +1289,7 @@ def _append_diagnostic(
     episode_curriculum_level = getattr(command, "s2_episode_curriculum_level", None)
     episode_curriculum_audit = getattr(command, "s2_episode_curriculum_audit", None)
     episode_contact_count = getattr(command, "s2_episode_contact_count", None)
+    episode_reset_mode = getattr(command, "s2_episode_reset_mode", None)
     diagnostic["s2_curriculum_level"].append(
         int(curriculum_level.item()) if isinstance(curriculum_level, torch.Tensor) else -1
     )
@@ -1288,6 +1305,36 @@ def _append_diagnostic(
         int(episode_contact_count[0].item())
         if isinstance(episode_contact_count, torch.Tensor) else 0
     )
+    diagnostic["s2_reset_mode"].append(
+        int(episode_reset_mode[0].item())
+        if isinstance(episode_reset_mode, torch.Tensor) else 0
+    )
+    for name, default in (
+        ("s2_acquisition_history_steps_before_contact", 0.0),
+        ("s2_approach_progress", 0.0),
+        ("s2_immediate_contact", 0.0),
+        ("s2_surface_style", 0.0),
+        ("s2_release_pending", False),
+        ("s2_release_actual_touch_frame", -1),
+        ("s2_release_remaining_time", 0.0),
+        ("s2_release_target_distance", 0.0),
+        ("s2_release_nominal_speed", 0.0),
+        ("s2_release_parallel_speed", 0.0),
+        ("s2_release_lateral_speed", 0.0),
+        ("s2_release_speed_ratio", 0.0),
+        ("s2_release_separation_score", 0.0),
+        ("s2_release_score", 0.0),
+        ("s2_release_quality_pass", False),
+        ("s2_quality_streak", 0.0),
+        ("s2_second_touch_conditional_success", False),
+    ):
+        diagnostic[name].append(default)
+    diagnostic["s2_release_next_anchor_w"].append(
+        np.full(3, np.nan, dtype=np.float32)
+    )
+    diagnostic["s2_release_target_direction"].append(
+        np.full(2, np.nan, dtype=np.float32)
+    )
     premature_contact_count = command.metrics.get("s2_premature_contact_count")
     diagnostic["s2_premature_contact_count"].append(
         float(premature_contact_count[0].item())
@@ -1299,10 +1346,6 @@ def _append_diagnostic(
         "s2_correct_side_rate",
         "s2_touch_force_mean",
         "s2_touch_force_max",
-        "s2_global_foot_ball_distance",
-        "s2_global_foot_ball_score",
-        "s2_global_foot_ball_expected_foot",
-        "s2_global_foot_ball_active",
     ):
         metric_value = command.metrics.get(metric_name)
         diagnostic[metric_name].append(
@@ -1689,8 +1732,63 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env, dones: torch.T
 
 
 def _complete_cg_flow_diagnostic(diagnostic: dict, env) -> None:
-    """Attach flow-reward telemetry produced by the just-completed transition."""
+    """Attach post-transition S2 release and legacy flow telemetry."""
     base_env = _resolve_base_env(env)
+    s2_telemetry = getattr(base_env, "_dribbling_s2_release_telemetry", None)
+    if isinstance(s2_telemetry, dict):
+        def _s2_scalar(name: str) -> float:
+            value = s2_telemetry.get(name)
+            if not isinstance(value, torch.Tensor) or value.numel() == 0:
+                return np.nan
+            return float(value[0].item())
+
+        def _s2_bool(name: str) -> bool:
+            value = s2_telemetry.get(name)
+            return (
+                isinstance(value, torch.Tensor)
+                and value.numel() > 0
+                and bool(value[0].item())
+            )
+
+        for diagnostic_name, telemetry_name in (
+            ("s2_approach_progress", "approach_progress"),
+            ("s2_immediate_contact", "immediate_contact"),
+            ("s2_surface_style", "surface_style"),
+            ("s2_release_actual_touch_frame", "release_actual_touch_frame"),
+            ("s2_release_remaining_time", "release_remaining_time"),
+            ("s2_release_target_distance", "release_target_distance"),
+            ("s2_release_nominal_speed", "release_nominal_speed"),
+            ("s2_release_parallel_speed", "release_parallel_speed"),
+            ("s2_release_lateral_speed", "release_lateral_speed"),
+            ("s2_release_speed_ratio", "release_speed_ratio"),
+            ("s2_release_separation_score", "release_separation_score"),
+            ("s2_release_score", "release_score"),
+            ("s2_quality_streak", "quality_streak"),
+            (
+                "s2_acquisition_history_steps_before_contact",
+                "acquisition_history_steps_before_contact",
+            ),
+        ):
+            diagnostic[diagnostic_name][-1] = _s2_scalar(telemetry_name)
+        for diagnostic_name, telemetry_name in (
+            ("s2_release_pending", "release_pending"),
+            ("s2_release_quality_pass", "release_quality_pass"),
+            (
+                "s2_second_touch_conditional_success",
+                "second_touch_conditional_success",
+            ),
+        ):
+            diagnostic[diagnostic_name][-1] = _s2_bool(telemetry_name)
+        for diagnostic_name, telemetry_name in (
+            ("s2_release_next_anchor_w", "release_next_anchor_w"),
+            ("s2_release_target_direction", "release_target_direction"),
+        ):
+            value = s2_telemetry.get(telemetry_name)
+            if isinstance(value, torch.Tensor) and value.numel() > 0:
+                diagnostic[diagnostic_name][-1] = (
+                    value[0].detach().cpu().numpy().copy()
+                )
+
     telemetry = getattr(base_env, "_dribbling_cg_flow_telemetry", None)
     if not isinstance(telemetry, dict):
         return
@@ -1847,16 +1945,19 @@ def _save_diagnostic(diagnostic: dict) -> None:
         if np.any(s2_window_mask)
         else np.nan
     )
-    s2_global_mask = arrays["s2_global_foot_ball_active"].astype(bool)
-    s2_global_distance = (
-        _finite_mean(arrays["s2_global_foot_ball_distance"][s2_global_mask])
-        if np.any(s2_global_mask)
+    s2_release_mask = arrays["s2_release_pending"].astype(bool)
+    s2_release_score = (
+        _finite_mean(arrays["s2_release_score"][s2_release_mask])
+        if np.any(s2_release_mask)
         else np.nan
     )
-    s2_global_score = (
-        _finite_mean(arrays["s2_global_foot_ball_score"][s2_global_mask])
-        if np.any(s2_global_mask)
+    s2_release_speed_ratio = (
+        _finite_mean(arrays["s2_release_speed_ratio"][s2_release_mask])
+        if np.any(s2_release_mask)
         else np.nan
+    )
+    s2_release_quality_pulses = int(
+        np.count_nonzero(arrays["s2_release_quality_pass"])
     )
     torso_rel_tilt = float(
         np.mean(np.linalg.norm(arrays["torso_minus_pelvis_rpy"][:, :2], axis=1))
@@ -1970,8 +2071,9 @@ def _save_diagnostic(diagnostic: dict) -> None:
             f"window_samples={int(np.count_nonzero(s2_window_mask))}  "
             f"actual_target_distance={s2_region_distance:.3f} m  "
             f"physical_foot_ball_distance={s2_physical_distance:.3f} m  "
-            f"global_foot_ball_distance={s2_global_distance:.3f} m  "
-            f"global_foot_ball_score={s2_global_score:.3f}  "
+            f"release_score={s2_release_score:.3f}  "
+            f"release_speed_ratio={s2_release_speed_ratio:.3f}  "
+            f"release_quality_pulses={s2_release_quality_pulses}  "
             f"reference_target_distance={s2_reference_region_distance:.3f} m  "
             "side_ids=(left=0, right=1, dead/unknown=-1)"
         )
