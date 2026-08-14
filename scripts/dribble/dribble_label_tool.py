@@ -32,6 +32,11 @@ from typing import Any
 
 import numpy as np
 
+try:
+    from .synthesize_dribble_ball_traj import resolve_foot_body_indices
+except ImportError:
+    from synthesize_dribble_ball_traj import resolve_foot_body_indices
+
 
 def _collect_npz_files(motion_path: Path) -> list[Path]:
     if motion_path.is_file() and motion_path.suffix == ".npz":
@@ -263,11 +268,11 @@ def cmd_autolabel(args: argparse.Namespace) -> None:
         with np.load(f, allow_pickle=True) as d:
             body_pos = np.asarray(d["body_pos_w"], dtype=np.float32)  # [T, B, 3]
         T, B, _ = body_pos.shape
-        if args.right_foot_index >= B or args.left_foot_index >= B:
-            raise ValueError(
-                f"{f.name}: foot index out of range for body_pos_w shape {body_pos.shape}; "
-                f"got right={args.right_foot_index}, left={args.left_foot_index}"
-            )
+        left_foot_index, right_foot_index = resolve_foot_body_indices(
+            body_pos,
+            left_foot_index=args.left_foot_index,
+            right_foot_index=args.right_foot_index,
+        )
 
         sidecar = None
         if sidecar_dir is not None:
@@ -280,8 +285,8 @@ def cmd_autolabel(args: argparse.Namespace) -> None:
             ball_pos = ball_pos[:n]
             T = n
 
-        r_foot = body_pos[:, args.right_foot_index, :3]
-        l_foot = body_pos[:, args.left_foot_index, :3]
+        r_foot = body_pos[:, right_foot_index, :3]
+        l_foot = body_pos[:, left_foot_index, :3]
         ball = ball_pos[:, :3]
 
         # Pseudo sidecar places the ball on the ground (low z) while ankles sit ~0.7–0.9 m up.
@@ -337,7 +342,8 @@ def cmd_autolabel(args: argparse.Namespace) -> None:
         ent["notes"] = (
             "AUTO_PRELABEL: review contact_segments/foot. "
             f"contact_dist={args.contact_dist_threshold} ({contact_mode}), "
-            f"foot_vote_max={foot_vote_max}, default_foot={args.default_foot}.{note_extra}"
+            f"foot_vote_max={foot_vote_max}, default_foot={args.default_foot}, "
+            f"foot_body_indices=L{left_foot_index}/R{right_foot_index}.{note_extra}"
         )
         ent["file"] = f.name
         labels_root["labels"][f.name] = ent
@@ -373,8 +379,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_auto.add_argument("--output", type=str, required=True, help="Output label JSON path")
     p_auto.add_argument("--base_json", type=str, default=None, help="Optional existing label JSON to merge into")
-    p_auto.add_argument("--right_foot_index", type=int, default=6, help="Right ankle index in body_pos_w")
-    p_auto.add_argument("--left_foot_index", type=int, default=3, help="Left ankle index in body_pos_w")
+    p_auto.add_argument(
+        "--right_foot_index",
+        type=int,
+        default=-1,
+        help="Right ankle index in body_pos_w (-1 = detect from a known layout)",
+    )
+    p_auto.add_argument(
+        "--left_foot_index",
+        type=int,
+        default=-1,
+        help="Left ankle index in body_pos_w (-1 = detect from a known layout)",
+    )
     p_auto.add_argument(
         "--contact_dist_3d",
         action="store_true",

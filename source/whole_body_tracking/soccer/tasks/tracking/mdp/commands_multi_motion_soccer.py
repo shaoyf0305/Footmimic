@@ -77,8 +77,115 @@ def locomotion_task_state_mask(command, active_task_states: Sequence[int] | None
     return (state.unsqueeze(-1) == allowed.view(1, -1)).any(dim=-1)
 
 
+def _validate_dribble_distance_labels(
+    motion_file: str,
+    data,
+    foot_body_indexes: tuple[int, int] | None,
+    *,
+    atol: float = 1.0e-4,
+) -> None:
+    """Fail fast when cached foot-ball distances use the wrong anatomical foot bodies."""
+    if "dribble_cg_dist_foot" not in data.files:
+        return
+
+    required = {"body_pos_w", "ball_pos_w", "dribble_cg_foot_ball_dist"}
+    missing = sorted(required.difference(data.files))
+    if missing:
+        raise ValueError(
+            f"{motion_file}: dribble_cg_dist_foot is present but required fields are missing: {missing}"
+        )
+
+    body_pos = np.asarray(data["body_pos_w"])
+    ball_pos = np.asarray(data["ball_pos_w"])
+    distance = np.asarray(data["dribble_cg_foot_ball_dist"]).reshape(-1)
+    distance_foot = np.asarray(data["dribble_cg_dist_foot"]).reshape(-1)
+    if body_pos.ndim != 3 or body_pos.shape[2] < 2:
+        raise ValueError(f"{motion_file}: expected body_pos_w [T, B, 3], got {body_pos.shape}")
+
+    num_frames = int(body_pos.shape[0])
+    if ball_pos.ndim != 2 or ball_pos.shape[0] != num_frames or ball_pos.shape[1] < 2:
+        raise ValueError(
+            f"{motion_file}: ball_pos_w shape {ball_pos.shape} does not match {num_frames} motion frames"
+        )
+    if distance.shape[0] != num_frames or distance_foot.shape[0] != num_frames:
+        raise ValueError(
+            f"{motion_file}: dribble distance labels must have exactly {num_frames} frames; "
+            f"got distance={distance.shape[0]}, foot={distance_foot.shape[0]}"
+        )
+
+    if foot_body_indexes is None:
+        known_layouts = {14: (3, 6), 30: (18, 19)}
+        foot_body_indexes = known_layouts.get(int(body_pos.shape[1]))
+    if foot_body_indexes is None:
+        raise ValueError(
+            f"{motion_file}: cannot validate dribble labels for unknown body layout {body_pos.shape[1]}"
+        )
+    left_index, right_index = (int(foot_body_indexes[0]), int(foot_body_indexes[1]))
+    invalid_indexes = (
+        left_index == right_index
+        or min(left_index, right_index) < 0
+        or max(left_index, right_index) >= body_pos.shape[1]
+    )
+    if invalid_indexes:
+        raise ValueError(
+            f"{motion_file}: invalid anatomical foot body indices L/R={left_index}/{right_index} "
+            f"for {body_pos.shape[1]} bodies"
+        )
+
+    metadata_keys = (
+        ("dribble_cg_left_foot_body_index", left_index),
+        ("dribble_cg_right_foot_body_index", right_index),
+    )
+    for key, expected in metadata_keys:
+        if key not in data.files:
+            continue
+        value = np.asarray(data[key]).reshape(-1)
+        if value.size != 1 or int(value[0]) != expected:
+            raise ValueError(
+                f"{motion_file}: {key}={value.tolist()} does not match runtime body index {expected}"
+            )
+
+    invalid_foot_ids = np.setdiff1d(np.unique(distance_foot), np.asarray([-1, 0, 1]))
+    if invalid_foot_ids.size:
+        raise ValueError(
+            f"{motion_file}: dribble_cg_dist_foot contains invalid ids {invalid_foot_ids.tolist()}"
+        )
+    valid_distance = distance >= 0.0
+    valid_foot = distance_foot >= 0
+    if not np.array_equal(valid_distance, valid_foot):
+        raise ValueError(
+            f"{motion_file}: dribble distance and foot-id validity masks do not match"
+        )
+    if not np.all(np.isfinite(distance[valid_distance])):
+        raise ValueError(f"{motion_file}: dribble_cg_foot_ball_dist contains non-finite values")
+    if not np.any(valid_distance):
+        return
+
+    selected_feet_xy = np.where(
+        (distance_foot[:, None] == 0),
+        body_pos[:, left_index, :2],
+        body_pos[:, right_index, :2],
+    )
+    expected_distance = np.linalg.norm(selected_feet_xy - ball_pos[:, :2], axis=1)
+    error = np.abs(distance[valid_distance] - expected_distance[valid_distance])
+    max_error = float(np.max(error))
+    if max_error > atol:
+        raise ValueError(
+            f"{motion_file}: cached foot-ball distances are bound to the wrong body "
+            f"(expected anatomical L/R={left_index}/{right_index}, "
+            f"mean error={float(np.mean(error)):.6f} m, max error={max_error:.6f} m). "
+            "Regenerate the motion with synthesize_dribble_ball_traj.py."
+        )
+
+
 class MultiMotionLoader:
-    def __init__(self, motion_files: list[str], body_indexes: Sequence[int], device: str = "cpu"):
+    def __init__(
+        self,
+        motion_files: list[str],
+        body_indexes: Sequence[int],
+        dribble_foot_body_indexes: tuple[int, int] | None = None,
+        device: str = "cpu",
+    ):
         assert len(motion_files) > 0, "motion_files must not be empty"
         self.num_files = len(motion_files)
         self._body_indexes = body_indexes
@@ -112,6 +219,7 @@ class MultiMotionLoader:
         for motion_file in motion_files:
             assert os.path.isfile(motion_file), f"Invalid file path: {motion_file}"
             data = np.load(motion_file)
+            _validate_dribble_distance_labels(motion_file, data, dribble_foot_body_indexes)
 
             self.fps_list.append(data["fps"])
             self.motion_name.append(motion_file.split("/")[-1].split(".")[0])  # Store filename without suffix.
@@ -373,7 +481,19 @@ class MotionCommand(CommandTerm):
             self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self.device
         )
 
-        self.motion = MultiMotionLoader(self.cfg.motion_files, self.body_indexes, device=self.device)
+        try:
+            dribble_foot_body_indexes = (
+                self.robot.body_names.index("left_ankle_roll_link"),
+                self.robot.body_names.index("right_ankle_roll_link"),
+            )
+        except ValueError:
+            dribble_foot_body_indexes = None
+        self.motion = MultiMotionLoader(
+            self.cfg.motion_files,
+            self.body_indexes,
+            dribble_foot_body_indexes=dribble_foot_body_indexes,
+            device=self.device,
+        )
         kick_leg_to_id = {"left": 0, "right": 1}
         self._kick_leg_id_to_name = {v: k for k, v in kick_leg_to_id.items()}
         self._kick_leg_id_to_name[-1] = "unknown"

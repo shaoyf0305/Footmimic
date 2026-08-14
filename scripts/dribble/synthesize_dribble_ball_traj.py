@@ -24,11 +24,11 @@ Pipeline (XGen-style, football simplification):
 
 **Foot body indices:** ``pkl_to_npz`` stores all ~30 G1 bodies. Indices 3/6 match the
 14-link *tracking subset*, not ground feet — on full clips index 3 often equals
-pelvis. Use ``--auto_foot_indices`` (default) to pick the lowest, most mobile foot
-links (``LL_FOOT`` / ``LR_FOOT`` class).
+pelvis. Known layouts use fixed anatomical mappings: 3/6 for the 14-body subset
+and 18/19 for full 30-body G1 clips. Unknown layouts require explicit indices.
 
-Writes ``ball_pos_w``, ``dribble_cg_foot_ball_dist``, and ``dribble_cg_dist_foot``
-into each ``.npz``.
+Writes ``ball_pos_w``, ``dribble_cg_foot_ball_dist``, ``dribble_cg_dist_foot``,
+and the resolved left/right body-index metadata into each ``.npz``.
 """
 
 from __future__ import annotations
@@ -104,48 +104,39 @@ def resolve_foot_body_indices(
     """Return ``(left_body_idx, right_body_idx)`` into ``body_pos_w``.
 
     For the 14-body tracking subset (from some exporters), ankles are at 3/6.
-    For full G1 clips (~30 bodies from ``pkl_to_npz``), pick the two ground foot
-    links by median height + horizontal travel (``LL_FOOT`` / ``LR_FOOT``).
+    For full 30-body G1 clips from ``pkl_to_npz``, the ankle-roll links are at
+    18/19.  These are anatomical indices and must not be inferred from world Y:
+    the robot can turn around or cross its feet during a motion.
     """
+    if body_pos_w.ndim != 3 or body_pos_w.shape[2] < 3:
+        raise ValueError(f"Expected body_pos_w [T, B, 3], got {body_pos_w.shape}")
+
     num_bodies = int(body_pos_w.shape[1])
-    if left_foot_index >= 0 and right_foot_index >= 0:
+    has_left = left_foot_index >= 0
+    has_right = right_foot_index >= 0
+    if has_left != has_right:
+        raise ValueError(
+            "Specify both --left_foot_index and --right_foot_index, or leave both at -1 for auto-detection."
+        )
+    if has_left:
+        if left_foot_index == right_foot_index:
+            raise ValueError("Left and right foot body indices must be different.")
+        if left_foot_index >= num_bodies or right_foot_index >= num_bodies:
+            raise ValueError(
+                f"Foot body index out of range for body_pos_w with {num_bodies} bodies: "
+                f"left={left_foot_index}, right={right_foot_index}"
+            )
         return left_foot_index, right_foot_index
 
     if num_bodies == 14:
         return 3, 6
+    if num_bodies == 30:
+        return 18, 19
 
-    # Full G1 from pkl_to_npz: 30 rigid bodies; ground feet are LL_FOOT/LR_FOOT (~18/19).
-    if num_bodies >= 20 and 18 < num_bodies and 19 < num_bodies:
-        mean_y_18 = float(np.mean(body_pos_w[:, 18, 1]))
-        mean_y_19 = float(np.mean(body_pos_w[:, 19, 1]))
-        if mean_y_18 <= mean_y_19:
-            return 18, 19
-        return 19, 18
-
-    med_z = np.median(body_pos_w[:, :, 2], axis=0)
-    travel = np.ptp(body_pos_w[:, :, :2], axis=0)
-    travel = np.hypot(travel[:, 0], travel[:, 1])
-
-    candidates = [
-        i
-        for i in range(num_bodies)
-        if med_z[i] < 0.42 and travel[i] > 1.5
-    ]
-    if len(candidates) < 2:
-        order = np.argsort(med_z)
-        candidates = order[: min(6, num_bodies)].tolist()
-
-    candidates = sorted(candidates, key=lambda i: (-travel[i], med_z[i]))
-    shortlist = candidates[:4]
-    if len(shortlist) < 2:
-        shortlist = candidates[:2]
-
-    mean_y = {i: float(np.mean(body_pos_w[:, i, 1])) for i in shortlist}
-    left_idx = min(shortlist, key=lambda i: mean_y[i])
-    right_idx = max(shortlist, key=lambda i: mean_y[i])
-    if left_idx == right_idx and len(shortlist) >= 2:
-        left_idx, right_idx = shortlist[0], shortlist[1]
-    return left_idx, right_idx
+    raise ValueError(
+        f"Unknown body_pos_w layout with {num_bodies} bodies. "
+        "Pass explicit --left_foot_index and --right_foot_index values."
+    )
 
 
 def _forward_foot_id(
@@ -287,7 +278,17 @@ def synthesize_ball_trajectory(
     dist = np.full(T, -1.0, dtype=np.float32)
     dist_foot = np.full(T, -1, dtype=np.int8)
 
-    if auto_foot_indices and (left_foot_index < 0 or right_foot_index < 0):
+    if auto_foot_indices:
+        left_foot_index, right_foot_index = resolve_foot_body_indices(
+            body_pos_w,
+            left_foot_index=left_foot_index,
+            right_foot_index=right_foot_index,
+        )
+    else:
+        if left_foot_index < 0 or right_foot_index < 0:
+            raise ValueError(
+                "auto_foot_indices=False requires explicit left_foot_index and right_foot_index values."
+            )
         left_foot_index, right_foot_index = resolve_foot_body_indices(
             body_pos_w,
             left_foot_index=left_foot_index,
@@ -465,7 +466,7 @@ def main() -> None:
     parser.add_argument(
         "--no_auto_foot_indices",
         action="store_true",
-        help="Use fixed --left_foot_index/--right_foot_index (default 3/6) instead of auto-detect.",
+        help="Require and use explicit --left_foot_index/--right_foot_index values.",
     )
     parser.add_argument(
         "--traj_mode",
@@ -480,6 +481,10 @@ def main() -> None:
         help="Use anchor/torso yaw for offset (default: foot quaternion yaw).",
     )
     args = parser.parse_args()
+    if args.no_auto_foot_indices and (args.left_foot_index < 0 or args.right_foot_index < 0):
+        parser.error(
+            "--no_auto_foot_indices requires both --left_foot_index and --right_foot_index"
+        )
 
     src_root = Path(args.motion_path)
     out_root = Path(args.output_dir) if args.output_dir else None
@@ -510,8 +515,8 @@ def main() -> None:
             else:
                 cg_foot = np.full(T, -1, dtype=np.int8)
 
-        li = 3 if args.no_auto_foot_indices and args.left_foot_index < 0 else args.left_foot_index
-        ri = 6 if args.no_auto_foot_indices and args.right_foot_index < 0 else args.right_foot_index
+        li = args.left_foot_index
+        ri = args.right_foot_index
 
         ball, dist, dist_foot, li, ri = synthesize_ball_trajectory(
             body_pos,
@@ -537,6 +542,8 @@ def main() -> None:
                 "ball_pos_w": ball.astype(np.float32),
                 "dribble_cg_foot_ball_dist": dist.astype(np.float32),
                 "dribble_cg_dist_foot": dist_foot.astype(np.int8),
+                "dribble_cg_left_foot_body_index": np.asarray(li, dtype=np.int16),
+                "dribble_cg_right_foot_body_index": np.asarray(ri, dtype=np.int16),
             },
         )
         n_labeled = int(np.sum(dist >= 0))
