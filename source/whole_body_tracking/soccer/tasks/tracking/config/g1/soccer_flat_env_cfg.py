@@ -19,6 +19,42 @@ SOCCER_BALL_RADIUS = 0.11
 
 SOCCER_ASSET_PATH = f"{ASSET_DIR}/soccer/soccer.usda"
 
+# Explicit one-to-many filters let the ball sensor expose per-link force
+# matrices.  Rewards fall back to the legacy net-force/nearest-body path when
+# an older IsaacLab runtime does not provide ``force_matrix_w``.
+G1_BALL_CONTACT_BODY_NAMES = [
+    "pelvis",
+    "left_hip_pitch_link",
+    "left_hip_roll_link",
+    "left_hip_yaw_link",
+    "left_knee_link",
+    "left_ankle_pitch_link",
+    "left_ankle_roll_link",
+    "right_hip_pitch_link",
+    "right_hip_roll_link",
+    "right_hip_yaw_link",
+    "right_knee_link",
+    "right_ankle_pitch_link",
+    "right_ankle_roll_link",
+    "waist_yaw_link",
+    "waist_roll_link",
+    "torso_link",
+    "left_shoulder_pitch_link",
+    "left_shoulder_roll_link",
+    "left_shoulder_yaw_link",
+    "left_elbow_link",
+    "left_wrist_roll_link",
+    "left_wrist_pitch_link",
+    "left_wrist_yaw_link",
+    "right_shoulder_pitch_link",
+    "right_shoulder_roll_link",
+    "right_shoulder_yaw_link",
+    "right_elbow_link",
+    "right_wrist_roll_link",
+    "right_wrist_pitch_link",
+    "right_wrist_yaw_link",
+]
+
 
 def _apply_shared_dribble_inputs(cfg) -> None:
     """Give Stage 1 and Stage 2 the same ordered network input interface."""
@@ -81,6 +117,9 @@ class G1FlatSoccerSceneCfg(MySceneCfg):
     )
     soccer_ball_contact = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/SoccerBall",
+        filter_prim_paths_expr=[
+            f"{{ENV_REGEX_NS}}/Robot/{body_name}" for body_name in G1_BALL_CONTACT_BODY_NAMES
+        ],
         history_length=3,
         track_air_time=False,
         force_threshold=0.0,

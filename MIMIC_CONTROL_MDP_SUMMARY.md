@@ -1,6 +1,9 @@
 # Footmimic v5.0 清理后 MDP 总结
 
-本文以当前代码为准，只覆盖两个仍注册的环境：
+> 本文保留“夹球退化修复之前”的清理结果。当前 27-reward MDP、前后差异与新 diagnostics
+> 请以 [`MDP_SUMMARY_03.md`](MDP_SUMMARY_03.md) 为准。
+
+本文以当时清理后的代码为准，只覆盖两个仍注册的环境：
 
 - `Tracking-CG-G1-Motion-RNN-mimic`：Stage 1 Mimic。
 - `Tracking-CG-G1-Dribbling-RNN-control`：Stage 2 Control。

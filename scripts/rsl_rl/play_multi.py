@@ -227,7 +227,10 @@ import pathlib
 import numpy as np
 import torch
 
-from soccer.tasks.tracking.mdp.rewards_dribbling import soccer_ball_contact_force_magnitude
+from soccer.tasks.tracking.mdp.rewards_dribbling import (
+    soccer_ball_body_contact_force_magnitudes,
+    soccer_ball_contact_force_magnitude,
+)
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -693,6 +696,9 @@ def _create_diagnostic(
     reward_term_names = np.asarray(getattr(reward_manager, "_term_names", []))
     reward_term_weights = _reward_term_weights(base_env)
     reward_step_dt = float(getattr(base_env, "step_dt", _env_step_s(base_env.cfg)))
+    _body_force, ball_contact_body_names, ball_contact_filter_available = (
+        soccer_ball_body_contact_force_magnitudes(base_env, _BALL_SENSOR_NAME)
+    )
     constraint_groups = np.asarray([constraint["group"] for constraint in constraints])
     constraint_margins = np.asarray([constraint["margin"] for constraint in constraints], dtype=np.float32)
     constraint_joint_names = (
@@ -719,6 +725,8 @@ def _create_diagnostic(
         "reward_term_step_weights": reward_term_weights * reward_step_dt,
         "reward_step_dt": reward_step_dt,
         "task_state_names": np.asarray(["idle", "dribble", "stop"]),
+        "ball_contact_body_names": np.asarray(ball_contact_body_names),
+        "ball_contact_filter_available": bool(ball_contact_filter_available),
         "constraint_group": "none" if not constraints else "+".join(constraint_groups.tolist()),
         "constraint_margin": float(constraint_margins[0]) if len(constraints) == 1 else np.nan,
         "constraint_joint_names": constraint_joint_names,
@@ -772,7 +780,24 @@ def _create_diagnostic(
         "torso_ang_vel_w": [],
         "torso_minus_pelvis_ang_vel_w": [],
         "ball_pelvis_xy_distance": [],
+        "ball_command_forward_offset": [],
+        "ball_command_lateral_offset": [],
+        "ball_position_z": [],
+        "ball_vertical_speed": [],
         "ball_contact": [],
+        "ball_contact_force": [],
+        "ball_contact_body_force_magnitudes": [],
+        "ball_contact_body_index": [],
+        "ball_undesired_body_contact": [],
+        "ball_contact_duty_ema": [],
+        "ball_contact_duty_penalty": [],
+        "ball_too_close_penalty": [],
+        "cg_label_available": [],
+        "cg_expected_contact": [],
+        "cg_expected_foot": [],
+        "cg_premature_contact": [],
+        "cg_missing_contact": [],
+        "cg_wrong_foot_contact": [],
         "ball_xy_speed": [],
         "ball_command_forward_speed": [],
         "pelvis_xy_speed": [],
@@ -927,15 +952,91 @@ def _append_diagnostic(
     ball_delta_xy = soccer_ball.data.root_pos_w[0, :2] - robot.data.body_pos_w[0, pelvis_id, :2]
     diagnostic["ball_pelvis_xy_distance"].append(float(torch.norm(ball_delta_xy).item()))
     contact_force = soccer_ball_contact_force_magnitude(base_env, _BALL_SENSOR_NAME)[0]
-    diagnostic["ball_contact"].append(bool(contact_force.item() > _CONTACT_FORCE_THRESHOLD))
+    sim_contact = bool(contact_force.item() > _CONTACT_FORCE_THRESHOLD)
+    diagnostic["ball_contact"].append(sim_contact)
+    diagnostic["ball_contact_force"].append(float(contact_force.item()))
     ball_vel_xy = soccer_ball.data.root_lin_vel_w[0, :2]
     diagnostic["ball_xy_speed"].append(float(torch.norm(ball_vel_xy).item()))
     command_dir = torch.stack((
         torch.cos(command.locomotion_cmd_heading[0]),
         torch.sin(command.locomotion_cmd_heading[0]),
     ))
+    command_lateral_dir = torch.stack((-command_dir[1], command_dir[0]))
+    forward_offset = torch.dot(ball_delta_xy, command_dir)
+    lateral_offset = torch.dot(ball_delta_xy, command_lateral_dir)
+    diagnostic["ball_command_forward_offset"].append(float(forward_offset.item()))
+    diagnostic["ball_command_lateral_offset"].append(float(lateral_offset.item()))
+    diagnostic["ball_position_z"].append(float(soccer_ball.data.root_pos_w[0, 2].item()))
+    diagnostic["ball_vertical_speed"].append(float(soccer_ball.data.root_lin_vel_w[0, 2].item()))
     diagnostic["ball_command_forward_speed"].append(float(torch.dot(ball_vel_xy, command_dir).item()))
     diagnostic["pelvis_xy_speed"].append(float(torch.norm(robot.data.body_lin_vel_w[0, pelvis_id, :2]).item()))
+
+    body_force_magnitudes, body_names, filtered_available = (
+        soccer_ball_body_contact_force_magnitudes(
+            base_env,
+            _BALL_SENSOR_NAME,
+            tuple(diagnostic["ball_contact_body_names"].tolist()),
+        )
+    )
+    body_force_env0 = body_force_magnitudes[0]
+    if filtered_available and body_force_env0.numel() > 0:
+        actual_body_force, actual_body_index_tensor = body_force_env0.max(dim=0)
+        actual_body_index = (
+            int(actual_body_index_tensor.item())
+            if actual_body_force.item() > _CONTACT_FORCE_THRESHOLD
+            else -1
+        )
+    else:
+        actual_body_index = -1
+    diagnostic["ball_contact_body_force_magnitudes"].append(
+        body_force_env0.detach().cpu().numpy().copy()
+    )
+    diagnostic["ball_contact_body_index"].append(actual_body_index)
+    ankle_names = {"left_ankle_roll_link", "right_ankle_roll_link"}
+    actual_body_name = body_names[actual_body_index] if actual_body_index >= 0 else ""
+    diagnostic["ball_undesired_body_contact"].append(
+        bool(sim_contact and actual_body_name and actual_body_name not in ankle_names)
+    )
+
+    duty_ema = getattr(base_env, "_dribbling_contact_duty_ema", None)
+    duty_penalty = getattr(base_env, "_dribbling_contact_duty_penalty", None)
+    too_close_penalty = getattr(base_env, "_dribbling_ball_too_close_penalty", None)
+    diagnostic["ball_contact_duty_ema"].append(
+        np.nan if duty_ema is None else float(duty_ema[0].item())
+    )
+    diagnostic["ball_contact_duty_penalty"].append(
+        np.nan if duty_penalty is None else float(duty_penalty[0].item())
+    )
+    diagnostic["ball_too_close_penalty"].append(
+        np.nan if too_close_penalty is None else float(too_close_penalty[0].item())
+    )
+
+    cg_labeled = bool(
+        hasattr(command, "motion_has_dribble_cg_label")
+        and command.motion_has_dribble_cg_label[0].item()
+    )
+    cg_expected_contact = bool(command.dribble_cg_contact_ref[0].item()) if cg_labeled else False
+    cg_expected_foot = int(command.dribble_cg_foot_ref[0].item()) if cg_labeled else -1
+    expected_body_name = (
+        "left_ankle_roll_link" if cg_expected_foot == 0
+        else "right_ankle_roll_link" if cg_expected_foot == 1
+        else ""
+    )
+    diagnostic["cg_label_available"].append(cg_labeled)
+    diagnostic["cg_expected_contact"].append(cg_expected_contact)
+    diagnostic["cg_expected_foot"].append(cg_expected_foot)
+    diagnostic["cg_premature_contact"].append(cg_labeled and sim_contact and not cg_expected_contact)
+    diagnostic["cg_missing_contact"].append(cg_labeled and cg_expected_contact and not sim_contact)
+    diagnostic["cg_wrong_foot_contact"].append(
+        bool(
+            cg_labeled
+            and cg_expected_contact
+            and sim_contact
+            and filtered_available
+            and actual_body_index >= 0
+            and actual_body_name != expected_body_name
+        )
+    )
     foot_ref_ids = [command.cfg.body_names.index(name) for name in _FOOT_DIAGNOSTIC_BODY_NAMES]
     foot_error = torch.norm(
         command.robot_body_pos_w[0, foot_ref_ids] - command.body_pos_relative_w[0, foot_ref_ids], dim=-1
@@ -1131,6 +1232,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
     metadata_keys = {
         "path", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names",
         "reward_term_weights", "reward_term_step_weights", "reward_step_dt", "task_state_names",
+        "ball_contact_body_names", "ball_contact_filter_available",
         "trunk_joint_ids", "trunk_joint_names", "trunk_action_ids", "trunk_body_ids",
         "trunk_reference_body_ids", "trunk_body_names",
         "constraint_group", "constraint_margin", "constraint_joint_names", "constraint_groups",
@@ -1150,6 +1252,10 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["reward_term_step_weights"] = diagnostic["reward_term_step_weights"]
     arrays["reward_step_dt"] = np.asarray(diagnostic["reward_step_dt"])
     arrays["task_state_names"] = diagnostic["task_state_names"]
+    arrays["ball_contact_body_names"] = diagnostic["ball_contact_body_names"]
+    arrays["ball_contact_filter_available"] = np.asarray(
+        diagnostic["ball_contact_filter_available"]
+    )
     arrays["constraint_group"] = np.asarray(diagnostic["constraint_group"])
     arrays["constraint_margin"] = np.asarray(diagnostic["constraint_margin"])
     arrays["constraint_joint_names"] = diagnostic["constraint_joint_names"]
@@ -1166,6 +1272,29 @@ def _save_diagnostic(diagnostic: dict) -> None:
     pelvis_speed = float(np.mean(arrays["pelvis_xy_speed"]))
     foot_error = float(np.mean(arrays["foot_reference_position_error"]))
     heading_error = float(np.mean(np.abs(arrays["heading_error"])))
+    too_close_rate = float(np.mean(arrays["ball_command_forward_offset"] < 0.28))
+    finite_contact_duty = arrays["ball_contact_duty_ema"][
+        np.isfinite(arrays["ball_contact_duty_ema"])
+    ]
+    contact_duty = (
+        float(np.mean(finite_contact_duty)) if finite_contact_duty.size else np.nan
+    )
+    labeled_mask = arrays["cg_label_available"].astype(bool)
+    expected_contact_mask = labeled_mask & arrays["cg_expected_contact"].astype(bool)
+    expected_no_contact_mask = labeled_mask & ~arrays["cg_expected_contact"].astype(bool)
+    observed_expected_contact_mask = expected_contact_mask & arrays["ball_contact"].astype(bool)
+    premature_rate = (
+        float(np.mean(arrays["cg_premature_contact"][expected_no_contact_mask]))
+        if np.any(expected_no_contact_mask) else np.nan
+    )
+    missing_rate = (
+        float(np.mean(arrays["cg_missing_contact"][expected_contact_mask]))
+        if np.any(expected_contact_mask) else np.nan
+    )
+    wrong_foot_rate = (
+        float(np.mean(arrays["cg_wrong_foot_contact"][observed_expected_contact_mask]))
+        if np.any(observed_expected_contact_mask) else np.nan
+    )
     task_state_names = np.asarray(["idle", "dribble", "stop"])
     task_state_counts = np.bincount(arrays["task_state"].astype(np.int64), minlength=3)[:3]
     task_state_summary = ", ".join(
@@ -1260,6 +1389,9 @@ def _save_diagnostic(diagnostic: dict) -> None:
     print(
         "[INFO] Counterfactual metrics: "
         f"contact_rate={contact_rate:.3f}  ball_pelvis_xy={ball_distance:.3f} m  "
+        f"too_close_rate={too_close_rate:.3f}  contact_duty={contact_duty:.3f}  "
+        f"cg_premature={premature_rate:.3f}  cg_missing={missing_rate:.3f}  "
+        f"cg_wrong_foot={wrong_foot_rate:.3f}  "
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
         f"pelvis_xy_speed={pelvis_speed:.3f} m/s  "
         f"task_states=({task_state_summary})  stop_settled={stop_settle_rate:.3f}  "

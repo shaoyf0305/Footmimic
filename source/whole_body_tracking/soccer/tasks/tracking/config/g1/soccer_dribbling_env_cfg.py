@@ -9,7 +9,7 @@ from isaaclab.utils import configclass
 from soccer.tasks.tracking import mdp
 from soccer.tasks.tracking.mdp.commands_dribble_cg import DribbleCGMotionCommand
 
-from .soccer_flat_env_cfg import G1FlatMotionEnvCfg, SOCCER_BALL_RADIUS
+from .soccer_flat_env_cfg import G1_BALL_CONTACT_BODY_NAMES, G1FlatMotionEnvCfg, SOCCER_BALL_RADIUS
 
 
 _CONTROL_TRACK_BODY_NAMES = [
@@ -104,26 +104,19 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             )
         if mode == "right":
             legal_ankles = ["right_ankle_roll_link"]
-            other_ankles = ["left_ankle_roll_link"]
         elif mode == "left":
             legal_ankles = ["left_ankle_roll_link"]
-            other_ankles = ["right_ankle_roll_link"]
         else:
             legal_ankles = ["right_ankle_roll_link", "left_ankle_roll_link"]
-            other_ankles = []
 
         both_feet = ["left_ankle_roll_link", "right_ankle_roll_link"]
         foot_cfg = SceneEntityCfg("robot", body_names=both_feet)
+        other_contact_bodies = [
+            body_name for body_name in G1_BALL_CONTACT_BODY_NAMES if body_name not in legal_ankles
+        ]
         contact_body_cfg = SceneEntityCfg(
             "robot",
-            body_names=[
-                *legal_ankles,
-                *other_ankles,
-                "right_knee_link",
-                "left_knee_link",
-                "right_wrist_yaw_link",
-                "left_wrist_yaw_link",
-            ],
+            body_names=[*legal_ankles, *other_contact_bodies],
         )
         num_ankle_links = len(legal_ankles)
 
@@ -192,6 +185,15 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "zone_lateral_abs_max": 0.14,
             },
         )
+        self.rewards.dribbling_ball_too_close_penalty = RewTerm(
+            func=mdp.dribbling_ball_too_close_penalty,
+            weight=-8.0,
+            params={
+                "command_name": "motion",
+                "min_forward_dist": 0.28,
+                "full_penalty_dist": 0.14,
+            },
+        )
         self.rewards.dribbling_pelvis_quat_tracking = RewTerm(
             func=mdp.dribbling_pelvis_quat_tracking_exp,
             weight=2.0,
@@ -212,6 +214,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "speed_threshold": 0.55,
                 "speed_scale": 0.40,
                 "max_close_xy_dist": 0.50,
+                "recent_contact_grace_steps": 8,
             },
         )
         self.rewards.dribbling_sustained_contact_penalty = RewTerm(
@@ -220,7 +223,9 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             params={
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
-                "max_contact_steps": 3,
+                "ema_window_steps": 20,
+                "duty_threshold": 0.25,
+                "full_penalty_duty": 0.60,
             },
         )
         self.rewards.dribbling_ball_bounce_penalty = RewTerm(
