@@ -68,15 +68,16 @@ contact, vertical ball bounce, and excessive ankle-contact force. The angular
 velocity reward now tracks a bounded yaw-rate target generated from heading
 error instead of rewarding zero yaw rate during a commanded turn.
 
-Current diagnostics also record command-frame ball offsets, per-link robot-ball
-contact forces, the actual contact-link index, recent contact duty, the anti-trap
-penalty, and CG premature/missing/wrong-foot contact events.
+Current diagnostics record both the v5-compatible global net contact force and
+the per-link maximum contact force, plus command-frame ball offsets, the actual
+contact-link index, recent contact duty, the anti-trap penalty, and CG
+premature/missing/wrong-foot contact events.
 
 Use `--diagnostic_stride N` to record every Nth control step.
 
-The current MDP inventory and the anti-trap update are documented in
-[MDP_SUMMARY_03.md](MDP_SUMMARY_03.md). The earlier cleanup inventory remains in
-[MIMIC_CONTROL_MDP_SUMMARY.md](MIMIC_CONTROL_MDP_SUMMARY.md).
+The current MDP inventory and dual-contact-channel update are documented in
+[MDP_SUMMARY_04.md](MDP_SUMMARY_04.md). `MDP_SUMMARY_03.md` is retained as the
+history of the preceding anti-trap implementation.
 
 ## MuJoCo sim2sim
 

@@ -230,6 +230,7 @@ import torch
 from soccer.tasks.tracking.mdp.rewards_dribbling import (
     soccer_ball_body_contact_force_magnitudes,
     soccer_ball_contact_force_magnitude,
+    soccer_ball_max_link_contact_force_magnitude,
 )
 
 from rsl_rl.runners import OnPolicyRunner
@@ -786,6 +787,8 @@ def _create_diagnostic(
         "ball_vertical_speed": [],
         "ball_contact": [],
         "ball_contact_force": [],
+        "ball_link_contact": [],
+        "ball_max_link_contact_force": [],
         "ball_contact_body_force_magnitudes": [],
         "ball_contact_body_index": [],
         "ball_undesired_body_contact": [],
@@ -955,6 +958,12 @@ def _append_diagnostic(
     sim_contact = bool(contact_force.item() > _CONTACT_FORCE_THRESHOLD)
     diagnostic["ball_contact"].append(sim_contact)
     diagnostic["ball_contact_force"].append(float(contact_force.item()))
+    link_contact_force = soccer_ball_max_link_contact_force_magnitude(
+        base_env, _BALL_SENSOR_NAME
+    )[0]
+    link_contact = bool(link_contact_force.item() > _CONTACT_FORCE_THRESHOLD)
+    diagnostic["ball_link_contact"].append(link_contact)
+    diagnostic["ball_max_link_contact_force"].append(float(link_contact_force.item()))
     ball_vel_xy = soccer_ball.data.root_lin_vel_w[0, :2]
     diagnostic["ball_xy_speed"].append(float(torch.norm(ball_vel_xy).item()))
     command_dir = torch.stack((
@@ -995,7 +1004,7 @@ def _append_diagnostic(
     ankle_names = {"left_ankle_roll_link", "right_ankle_roll_link"}
     actual_body_name = body_names[actual_body_index] if actual_body_index >= 0 else ""
     diagnostic["ball_undesired_body_contact"].append(
-        bool(sim_contact and actual_body_name and actual_body_name not in ankle_names)
+        bool(link_contact and actual_body_name and actual_body_name not in ankle_names)
     )
 
     duty_ema = getattr(base_env, "_dribbling_contact_duty_ema", None)
@@ -1266,6 +1275,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["direct_upper_body_latent"] = np.asarray(diagnostic["direct_upper_body_latent"])
     np.savez_compressed(diagnostic["path"], **arrays)
     contact_rate = float(np.mean(arrays["ball_contact"]))
+    link_contact_rate = float(np.mean(arrays["ball_link_contact"]))
     ball_distance = float(np.mean(arrays["ball_pelvis_xy_distance"]))
     ball_speed = float(np.mean(arrays["ball_xy_speed"]))
     ball_forward_speed = float(np.mean(arrays["ball_command_forward_speed"]))
@@ -1388,7 +1398,8 @@ def _save_diagnostic(diagnostic: dict) -> None:
     print(f"[INFO] Diagnostic ({len(diagnostic['step'])} samples) → {diagnostic['path']}")
     print(
         "[INFO] Counterfactual metrics: "
-        f"contact_rate={contact_rate:.3f}  ball_pelvis_xy={ball_distance:.3f} m  "
+        f"contact_rate={contact_rate:.3f}  link_contact_rate={link_contact_rate:.3f}  "
+        f"ball_pelvis_xy={ball_distance:.3f} m  "
         f"too_close_rate={too_close_rate:.3f}  contact_duty={contact_duty:.3f}  "
         f"cg_premature={premature_rate:.3f}  cg_missing={missing_rate:.3f}  "
         f"cg_wrong_foot={wrong_foot_rate:.3f}  "

@@ -148,12 +148,30 @@ def soccer_ball_contact_force_magnitude(
     *,
     horizontal_only: bool = True,
 ) -> torch.Tensor:
-    """Scalar robot-ball contact magnitude, shape ``(num_envs,)``.
+    """Magnitude of the ball's net contact force (the v5 global signal).
 
-    Prefer the maximum filtered per-body force, which cannot be cancelled by
-    simultaneous contacts from opposite sides.  Fall back to the legacy ball
-    net force when filtered contact-pair data is unavailable.  Horizontal force
-    remains the default so ground support is not counted as robot-ball contact.
+    This intentionally preserves the signal used to calibrate the original
+    contact gates, rewards, and no-contact termination.  Per-link forces are a
+    separate anti-trapping/safety channel; see
+    :func:`soccer_ball_max_link_contact_force_magnitude`.
+    """
+    f = soccer_ball_contact_net_force_w(env, ball_sensor_name)
+    if horizontal_only:
+        return torch.norm(f[:, :2], dim=-1)
+    return torch.norm(f, dim=-1)
+
+
+def soccer_ball_max_link_contact_force_magnitude(
+    env: ManagerBasedRLEnv,
+    ball_sensor_name: str = "soccer_ball_contact",
+    *,
+    horizontal_only: bool = True,
+) -> torch.Tensor:
+    """Maximum robot-link force on the ball for anti-trapping and safety.
+
+    Opposing link forces cannot cancel in this channel.  On an older runtime
+    without ``force_matrix_w``, fall back to the v5 global net-force signal so
+    the environment remains usable, albeit without link-level discrimination.
     """
     body_magnitudes, _body_names, filtered_available = soccer_ball_body_contact_force_magnitudes(
         env,
@@ -162,11 +180,11 @@ def soccer_ball_contact_force_magnitude(
     )
     if filtered_available and body_magnitudes.shape[1] > 0:
         return body_magnitudes.max(dim=1).values
-
-    f = soccer_ball_contact_net_force_w(env, ball_sensor_name)
-    if horizontal_only:
-        return torch.norm(f[:, :2], dim=-1)
-    return torch.norm(f, dim=-1)
+    return soccer_ball_contact_force_magnitude(
+        env,
+        ball_sensor_name,
+        horizontal_only=horizontal_only,
+    )
 
 
 def _dribbling_sim_contact(
@@ -174,7 +192,7 @@ def _dribbling_sim_contact(
     ball_sensor_name: str,
     contact_force_threshold: float,
 ) -> torch.Tensor:
-    """Bool per env: horizontal ball contact force above threshold."""
+    """Bool per env from the v5-compatible global net-force channel."""
     fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
     return fmag > contact_force_threshold
 
@@ -797,7 +815,11 @@ def dribbling_sustained_contact_penalty(
         raise ValueError("ema_window_steps must be positive.")
     if not 0.0 <= duty_threshold < full_penalty_duty <= 1.0:
         raise ValueError("Expected 0 <= duty_threshold < full_penalty_duty <= 1.")
-    in_contact = _dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
+    # Sustained trapping is deliberately the exception to the v5 global
+    # contact channel: opposing links can squeeze the ball while their net
+    # forces cancel, so contact duty must use the maximum per-link force.
+    link_force = soccer_ball_max_link_contact_force_magnitude(env, ball_sensor_name)
+    in_contact = link_force > contact_force_threshold
     buf_name = "_dribbling_contact_duty_ema"
     duty = getattr(env, buf_name, None)
     if duty is None or duty.shape[0] != env.num_envs:
