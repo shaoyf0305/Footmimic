@@ -62,3 +62,4 @@ docs/
 *copy*
 logs/
 *.pt
+.codex_tmp/

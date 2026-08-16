@@ -149,7 +149,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 from rsl_rl.runners import OnPolicyRunner
 
 import soccer.tasks  # noqa: F401
-from soccer.tasks.tracking.mdp.rewards_dribbling import soccer_ball_contact_force_magnitude
+from soccer.tasks.tracking.mdp.rewards_dribbling import soccer_ball_robot_contact
 from soccer.utils.checkpoint_loading import load_checkpoint_with_obs_expand
 
 TRACKING_METRIC_KEYS = (
@@ -469,8 +469,13 @@ def _rollout_once(
                 error_sums[key] += float(cmd.metrics[key][0].item())
 
         try:
-            force_mag = soccer_ball_contact_force_magnitude(base_env, _BALL_SENSOR_NAME)
-            if float(force_mag[0].item()) > _CONTACT_FORCE_THRESHOLD:
+            robot_contact = soccer_ball_robot_contact(
+                base_env,
+                _BALL_SENSOR_NAME,
+                contact_force_threshold=_CONTACT_FORCE_THRESHOLD,
+                hold_steps=2,
+            )
+            if bool(robot_contact[0].item()):
                 contact_steps += 1
         except Exception:
             pass

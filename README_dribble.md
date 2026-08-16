@@ -14,9 +14,14 @@ No aliases or historical environment variants are registered.
 Run both stages:
 
 ```bash
-DRIBBLE_MOTION_PATH=motions/dribble \
+MIMIC_MOTION_PATH=motions/master-modified \
+CONTROL_MOTION_PATH=motions/master-v2 \
     bash shell/progressive_dribbling_train.sh my_run
 ```
+
+Stage 1 keeps the existing broad mimic/style bank. Stage 2 sees only the single
+right-foot `master-v2` clip; the script does not mirror it or mix in another
+kick dataset.
 
 Stage 1 and Stage 2 use the same ordered network inputs: 160 actor dimensions
 and 292 critic dimensions. Ball position and locomotion speed/heading each use
@@ -30,7 +35,7 @@ checkpoints can still be warm-started.
 ```bash
 python scripts/rsl_rl/play_multi.py \
     --task Tracking-CG-G1-Dribbling-RNN-control \
-    --motion_path motions/dribble \
+    --motion_path motions/master-v2 \
     --experiment_name g1_dribbling \
     --load_run <RUN_DIR> \
     --checkpoint model_XXXX.pt \
@@ -68,16 +73,22 @@ contact, vertical ball bounce, and excessive ankle-contact force. The angular
 velocity reward now tracks a bounded yaw-rate target generated from heading
 error instead of rewarding zero yaw rate during a commanded turn.
 
-Current diagnostics record both the v5-compatible global net contact force and
-the per-link maximum contact force, plus command-frame ball offsets, the actual
-contact-link index, recent contact duty, the anti-trap penalty, and CG
-premature/missing/wrong-foot contact events.
+The current Control task accepts only right-ankle ball contact as legal. Both
+feet remain in gait tracking, but a left-foot ball touch is an undesired
+contact. No mirrored or additional kick data is required.
+
+Current reward/termination gates use filtered per-link robot contact with a
+two-control-step post-contact hold. Diagnostics separately record this decision
+signal, the instantaneous per-link signal, and the ball's net XY contact force;
+the net force is telemetry only because it also contains ball-ground friction.
+CG contact is scored per annotated contact window instead of rewarding the
+large number of easy no-contact/no-contact frame matches.
 
 Use `--diagnostic_stride N` to record every Nth control step.
 
-The current MDP inventory and dual-contact-channel update are documented in
-[MDP_SUMMARY_04.md](MDP_SUMMARY_04.md). `MDP_SUMMARY_03.md` is retained as the
-history of the preceding anti-trap implementation.
+The current MDP inventory and contact-event update are documented in
+[MDP_SUMMARY_05.md](MDP_SUMMARY_05.md). `MDP_SUMMARY_04.md` is retained as the
+history of the preceding net-force decision implementation.
 
 ## MuJoCo sim2sim
 

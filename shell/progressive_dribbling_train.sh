@@ -9,7 +9,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-g1_dribbling}"
 EXPERIMENT_DIR="${REPO_ROOT}/logs/rsl_rl/${EXPERIMENT_NAME}"
-MOTION_PATH="${DRIBBLE_MOTION_PATH:-motions/dribble}"
+# Stage 1 retains the broad locomotion/style pretraining bank. Stage 2 uses
+# only the verified right-foot CG clip; the two stages share the network
+# interface but do not need to share a motion directory.
+MIMIC_MOTION_PATH="${MIMIC_MOTION_PATH:-motions/master-modified}"
+CONTROL_MOTION_PATH="${CONTROL_MOTION_PATH:-motions/master-v2}"
 RUN_NAME="${1:-dribbling}"
 NUM_ENVS="${NUM_ENVS:-2000}"
 STAGE1_ITERATIONS="${STAGE1_ITERATIONS:-4000}"
@@ -21,12 +25,12 @@ cd "${REPO_ROOT}"
 
 echo "════════════════════════════════════════════════════════════════"
 echo " Stage 1: ${STAGE1_TASK}"
-echo " motion_path: ${MOTION_PATH}"
+echo " motion_path: ${MIMIC_MOTION_PATH}"
 echo " run_name:    ${RUN_NAME}"
 echo "════════════════════════════════════════════════════════════════"
 
 python scripts/rsl_rl/train_multi.py --task "${STAGE1_TASK}" \
-    --motion_path "${MOTION_PATH}" \
+    --motion_path "${MIMIC_MOTION_PATH}" \
     --run_name "${RUN_NAME}" \
     --experiment_name "${EXPERIMENT_NAME}" \
     --num_envs "${NUM_ENVS}" \
@@ -44,11 +48,11 @@ echo
 echo "════════════════════════════════════════════════════════════════"
 echo " Stage 2: ${STAGE2_TASK}"
 echo " resume:      ${LOAD_RUN}"
-echo " motion_path: ${MOTION_PATH}"
+echo " motion_path: ${CONTROL_MOTION_PATH}"
 echo "════════════════════════════════════════════════════════════════"
 
 python scripts/rsl_rl/train_multi.py --task "${STAGE2_TASK}" \
-    --motion_path "${MOTION_PATH}" \
+    --motion_path "${CONTROL_MOTION_PATH}" \
     --load_run "${LOAD_RUN}" \
     --run_name "${RUN_NAME}_control" \
     --experiment_name "${EXPERIMENT_NAME}" \
@@ -59,4 +63,4 @@ python scripts/rsl_rl/train_multi.py --task "${STAGE2_TASK}" \
 echo
 echo "Stage 2 play command:"
 echo "  python scripts/rsl_rl/play_multi.py --task ${STAGE2_TASK} \\"
-echo "    --motion_path \"${MOTION_PATH}\" --load_run \"<RUN_DIR>_control\" --checkpoint model_XXXX.pt"
+echo "    --motion_path \"${CONTROL_MOTION_PATH}\" --load_run \"<RUN_DIR>_control\" --checkpoint model_XXXX.pt"

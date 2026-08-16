@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Shared: net contact force on the ball (world frame)
+# Shared ball-contact signals
 # ---------------------------------------------------------------------------
 
 
@@ -148,11 +148,11 @@ def soccer_ball_contact_force_magnitude(
     *,
     horizontal_only: bool = True,
 ) -> torch.Tensor:
-    """Magnitude of the ball's net contact force (the v5 global signal).
+    """Magnitude of the ball's net contact force for diagnostics.
 
-    This intentionally preserves the signal used to calibrate the original
-    contact gates, rewards, and no-contact termination.  Per-link forces are a
-    separate anti-trapping/safety channel; see
+    The net signal also includes ball-ground contact/friction, so it must not
+    be used as a robot-contact predicate.  Robot-contact decisions use
+    :func:`soccer_ball_robot_contact`; raw safety terms use
     :func:`soccer_ball_max_link_contact_force_magnitude`.
     """
     f = soccer_ball_contact_net_force_w(env, ball_sensor_name)
@@ -187,14 +187,103 @@ def soccer_ball_max_link_contact_force_magnitude(
     )
 
 
+def soccer_ball_robot_contact(
+    env: ManagerBasedRLEnv,
+    ball_sensor_name: str = "soccer_ball_contact",
+    *,
+    contact_force_threshold: float = 1.0,
+    hold_steps: int = 2,
+) -> torch.Tensor:
+    """Temporally stable robot-ball contact from filtered per-link forces.
+
+    ``soccer_ball_contact_force_magnitude`` intentionally remains available as
+    net-force telemetry, but it includes ball-ground friction and therefore is
+    not a reliable robot-contact predicate.  This function thresholds the
+    maximum filtered robot-link force and keeps a detected contact active for
+    ``hold_steps`` additional control steps.  The short hold recovers the
+    temporal stability of the legacy three-frame signal without reintroducing
+    non-robot contacts or force cancellation.
+
+    Results are cached by episode step and parameter tuple so reward terms,
+    terminations, and diagnostics all observe exactly the same contact state
+    without advancing the hold counter multiple times in one control step.
+    """
+    if hold_steps < 0:
+        raise ValueError("hold_steps must be non-negative.")
+
+    raw_force = soccer_ball_max_link_contact_force_magnitude(env, ball_sensor_name)
+    raw_contact = raw_force > float(contact_force_threshold)
+    step_buf = getattr(env, "episode_length_buf", None)
+    if not isinstance(step_buf, torch.Tensor) or step_buf.shape[0] != env.num_envs:
+        step_buf = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    else:
+        step_buf = step_buf.to(device=env.device, dtype=torch.long)
+
+    cache_name = "_soccer_ball_robot_contact_cache"
+    cache = getattr(env, cache_name, None)
+    if not isinstance(cache, dict):
+        cache = {}
+    key = (str(ball_sensor_name), float(contact_force_threshold), int(hold_steps))
+    state = cache.get(key)
+    if (
+        not isinstance(state, dict)
+        or not isinstance(state.get("last_step"), torch.Tensor)
+        or state["last_step"].shape[0] != env.num_envs
+    ):
+        state = {
+            "last_step": torch.full_like(step_buf, -1),
+            "steps_since_contact": torch.full(
+                (env.num_envs,),
+                fill_value=int(hold_steps) + 1,
+                device=env.device,
+                dtype=torch.int32,
+            ),
+        }
+
+    last_step = state["last_step"]
+    steps_since = state["steps_since_contact"]
+    update_mask = last_step != step_buf
+    next_steps_since = torch.where(
+        raw_contact,
+        torch.zeros_like(steps_since),
+        torch.clamp(steps_since + 1, max=int(hold_steps) + 1),
+    )
+    # Never carry a contact hold across an environment reset.  Contact at the
+    # reset pose can be detected normally from the following control step.
+    next_steps_since = torch.where(
+        step_buf == 0,
+        torch.full_like(next_steps_since, int(hold_steps) + 1),
+        next_steps_since,
+    )
+    steps_since = torch.where(update_mask, next_steps_since, steps_since)
+    last_step = torch.where(update_mask, step_buf, last_step)
+    contact = steps_since <= int(hold_steps)
+
+    cache[key] = {
+        "last_step": last_step,
+        "steps_since_contact": steps_since,
+        "contact": contact,
+    }
+    setattr(env, cache_name, cache)
+    setattr(env, "_soccer_ball_max_link_contact_force", raw_force)
+    setattr(env, "_soccer_ball_raw_link_contact", raw_contact)
+    setattr(env, "_soccer_ball_robot_contact", contact)
+    setattr(env, "_soccer_ball_steps_since_link_contact", steps_since)
+    return contact
+
+
 def _dribbling_sim_contact(
     env: ManagerBasedRLEnv,
     ball_sensor_name: str,
     contact_force_threshold: float,
 ) -> torch.Tensor:
-    """Bool per env from the v5-compatible global net-force channel."""
-    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
-    return fmag > contact_force_threshold
+    """Unified robot-contact truth: filtered per-link force with 2-step hold."""
+    return soccer_ball_robot_contact(
+        env,
+        ball_sensor_name,
+        contact_force_threshold=contact_force_threshold,
+        hold_steps=2,
+    )
 
 
 def _dribbling_cg_gated_sim_contact(
@@ -371,7 +460,7 @@ def dribbling_command_dynamic_proximity(
 
     if no_contact_zone_damping < 1.0 - 1.0e-6:
         in_corridor = in_forward_corridor & (torch.abs(lateral_offset) <= zone_lateral_abs_max)
-        no_touch = soccer_ball_contact_force_magnitude(env, ball_sensor_name) <= contact_force_threshold
+        no_touch = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
         reward = torch.where(in_corridor & no_touch, reward * no_contact_zone_damping, reward)
     return reward
 
@@ -600,8 +689,7 @@ def dribbling_ball_coast_without_contact_penalty(
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
     ball_sp = torch.norm(soccer_ball.data.root_lin_vel_w[:, :2], dim=-1)
-    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
-    no_touch = fmag <= contact_force_threshold
+    no_touch = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
 
     steps_name = "_dribbling_coast_steps_since_contact"
     steps_since_contact = getattr(env, steps_name, None)
@@ -646,7 +734,7 @@ def dribbling_command_ball_progress_reward(
     lateral_ratio_max: float = 0.70,
     pelvis_speed_min: float = 0.06,
     ball_sensor_name: str = "soccer_ball_contact",
-    contact_force_threshold: float = 0.5,
+    contact_force_threshold: float = 1.0,
     require_recent_contact: bool = True,
     recent_contact_window: int = 10,
     cg_gated_contact: bool = False,
@@ -724,8 +812,7 @@ def dribbling_orbiting_penalty(
     t_hat = torch.stack((-r_hat[:, 1], r_hat[:, 0]), dim=-1)
     v_tan = torch.abs(torch.sum(pelvis_vel_xy * t_hat, dim=-1))
 
-    fmag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
-    weak_contact = fmag <= contact_force_threshold
+    weak_contact = ~_dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
     near_ball = r_norm <= orbit_radius_max
 
     core = torch.clamp((v_tan - tangential_deadzone) / tangential_scale, min=0.0, max=1.0)
@@ -777,24 +864,101 @@ def dribbling_legal_foot_touch(
 # ---------------------------------------------------------------------------
 
 
+def _dribbling_cg_contact_window_ref(
+    command: MotionCommand,
+    tolerance_steps: int,
+) -> torch.Tensor:
+    """Return the current CG contact window, dilated in reference time."""
+    if tolerance_steps < 0:
+        raise ValueError("tolerance_steps must be non-negative.")
+
+    labels = command.motion.dribble_cg_contact
+    phase = command.time_steps
+    motion_idx = command.motion_idx
+    motion_length = command.motion_length
+    max_frame = labels.shape[1] - 1
+    window = torch.zeros_like(phase, dtype=torch.bool)
+    for offset in range(-int(tolerance_steps), int(tolerance_steps) + 1):
+        frame = phase + offset
+        valid = (frame >= 0) & (frame < motion_length)
+        safe_frame = frame.clamp(min=0, max=max_frame)
+        window |= valid & labels[motion_idx, safe_frame].to(torch.bool)
+    return window
+
+
 def dribbling_cg_contact_consistency(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
     ball_sensor_name: str = "soccer_ball_contact",
     contact_force_threshold: float = 1.0,
+    contact_window_tolerance_steps: int = 2,
+    premature_contact_penalty: float = 1.0,
     active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
-    """1.0 when sim contact presence matches the annotated CG contact bit."""
+    """Score CG contact as an event inside a short annotated time window.
+
+    The former frame-wise equality score was dominated by the much more common
+    no-contact frames, so a policy could obtain most of this reward without
+    touching the ball.  The event score has no true-negative reward:
+
+    - inside a dilated CG contact window, score 1 after the first robot touch;
+    - before the first touch in the window, score 0;
+    - outside all windows, raw premature robot contact scores a negative value.
+
+    A successful hit stays latched only until that contact window ends.  The
+    smoothed robot-contact signal is used to detect the hit, while premature
+    contact deliberately uses the raw per-link signal so its penalty is not
+    extended by the temporal hold.
+    """
+    if premature_contact_penalty < 0.0:
+        raise ValueError("premature_contact_penalty must be non-negative.")
+
     command: MotionCommand = env.command_manager.get_term(command_name)
     labeled = command.motion_has_dribble_cg_label
-    if not torch.any(labeled):
-        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
-
-    ref = command.dribble_cg_contact_ref
-    sim_c = _dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
-    agree = (ref == sim_c).to(torch.float32)
     active = labeled & locomotion_task_state_mask(command, active_task_states)
-    return agree * active.to(torch.float32)
+    window = _dribbling_cg_contact_window_ref(command, contact_window_tolerance_steps) & active
+    sim_contact = _dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
+    raw_contact = (
+        soccer_ball_max_link_contact_force_magnitude(env, ball_sensor_name)
+        > float(contact_force_threshold)
+    )
+
+    prev_window = getattr(env, "_dribbling_cg_contact_window_prev", None)
+    window_hit = getattr(env, "_dribbling_cg_contact_window_hit", None)
+    prev_phase = getattr(env, "_dribbling_cg_contact_window_prev_phase", None)
+    if not isinstance(prev_window, torch.Tensor) or prev_window.shape[0] != env.num_envs:
+        prev_window = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    if not isinstance(window_hit, torch.Tensor) or window_hit.shape[0] != env.num_envs:
+        window_hit = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    if not isinstance(prev_phase, torch.Tensor) or prev_phase.shape[0] != env.num_envs:
+        prev_phase = torch.full_like(command.time_steps, -2)
+
+    step_buf = getattr(env, "episode_length_buf", None)
+    reset = (
+        step_buf == 0
+        if isinstance(step_buf, torch.Tensor)
+        else torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    )
+    contiguous_phase = command.time_steps == (prev_phase + 1)
+    window_start = window & (reset | ~prev_window | ~contiguous_phase)
+    continued_hit = window_hit | sim_contact
+    window_hit = torch.where(
+        window,
+        torch.where(window_start, sim_contact, continued_hit),
+        torch.zeros_like(window_hit),
+    )
+
+    premature = active & ~window & raw_contact
+    score = window_hit.to(torch.float32) * window.to(torch.float32)
+    score -= float(premature_contact_penalty) * premature.to(torch.float32)
+
+    setattr(env, "_dribbling_cg_contact_window_prev", window.detach().clone())
+    setattr(env, "_dribbling_cg_contact_window_hit", window_hit.detach().clone())
+    setattr(env, "_dribbling_cg_contact_window_prev_phase", command.time_steps.detach().clone())
+    setattr(env, "_dribbling_cg_contact_window_active", window)
+    setattr(env, "_dribbling_cg_premature_contact", premature)
+    setattr(env, "_dribbling_cg_contact_event_score", score)
+    return score
 
 
 def dribbling_sustained_contact_penalty(
@@ -849,7 +1013,11 @@ def dribbling_ball_bounce_penalty(
 ) -> torch.Tensor:
     """Penalize pinch-bounces with excessive vertical ball speed during contact."""
     soccer_ball = env.scene["soccer_ball"]
-    in_contact = _dribbling_sim_contact(env, ball_sensor_name, contact_force_threshold)
+    # Safety telemetry must use the instantaneous per-link force.  Extending a
+    # contact via the normal 2-step gate would penalize free-flight frames
+    # after release and would blur the actual pinch/bounce event.
+    link_force = soccer_ball_max_link_contact_force_magnitude(env, ball_sensor_name)
+    in_contact = link_force > float(contact_force_threshold)
     vertical_speed = torch.abs(soccer_ball.data.root_lin_vel_w[:, 2])
     return (in_contact & (vertical_speed > float(vz_threshold))).to(torch.float32)
 

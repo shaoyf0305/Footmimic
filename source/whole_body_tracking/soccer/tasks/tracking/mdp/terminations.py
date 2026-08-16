@@ -14,7 +14,7 @@ from isaaclab.managers import SceneEntityCfg
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import MotionCommand, locomotion_task_state_mask
 from soccer.tasks.tracking.mdp.rewards_dribbling import (
     dribbling_stop_settle_state,
-    soccer_ball_contact_force_magnitude,
+    soccer_ball_robot_contact,
 )
 
 from soccer.tasks.tracking.mdp.rewards import _get_body_indexes
@@ -155,10 +155,11 @@ def dribbling_no_ball_contact_timeout(
 ) -> torch.Tensor:
     """End the episode if the ball sees no robot contact for too long after warm-up.
 
-    Counts simulation steps (post-``grace_steps``) where ball contact force stays
-    at or below ``contact_force_threshold``. Resets the counter on contact or on
-    episode start. Complements ``ball_lost_dribbling`` by discouraging "pose near
-    the ball but never touch" strategies.
+    Counts simulation steps (post-``grace_steps``) without filtered robot-link
+    contact. Resets the counter on contact or on episode start. Complements
+    ``ball_lost_dribbling`` by discouraging "pose near the ball but never touch"
+    strategies. A two-step post-contact hold prevents one physical touch from
+    fragmenting because of contact-sensor timing.
 
     A task-specific recovery window can slow (not clear) the counter after a
     locomotion command change.  A second, bounded recovery allowance applies
@@ -167,8 +168,12 @@ def dribbling_no_ball_contact_timeout(
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
     active_task_state = locomotion_task_state_mask(command, active_task_states)
-    force_mag = soccer_ball_contact_force_magnitude(env, ball_sensor_name)
-    has_contact = force_mag > contact_force_threshold
+    has_contact = soccer_ball_robot_contact(
+        env,
+        ball_sensor_name,
+        contact_force_threshold=contact_force_threshold,
+        hold_steps=2,
+    )
 
     step_buf = getattr(env, "episode_length_buf", torch.zeros(env.num_envs, device=env.device))
     past_grace = step_buf > grace_steps
@@ -244,7 +249,10 @@ def dribbling_no_ball_contact_timeout(
     )
     setattr(env, buf_name, cnt)
     # Compact diagnostics for the play HUD and evaluation collectors.
-    setattr(env, "_dribbling_no_contact_force", force_mag)
+    raw_link_force = getattr(env, "_soccer_ball_max_link_contact_force", None)
+    if isinstance(raw_link_force, torch.Tensor):
+        setattr(env, "_dribbling_no_contact_force", raw_link_force)
+    setattr(env, "_dribbling_no_contact_contact", has_contact)
     setattr(env, "_dribbling_no_contact_task_active", active_task_state)
     setattr(env, "_dribbling_no_contact_count", cnt)
     setattr(env, "_dribbling_no_contact_recovery_active", recovery_active)

@@ -15,7 +15,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 LOAD_RUN="${1:-2026-06-09_23-57-01_resumed}"
 CHECKPOINT="${2:-model_100000.pt}"
 NUM_ROLLOUTS="${3:-3}"
-MOTION_PATH="${DRIBBLE_MOTION_PATH:-motions/dribble-distance}"
+MOTION_PATH="${CONTROL_MOTION_PATH:-motions/master-v2}"
 TASK="Tracking-CG-G1-Dribbling-RNN-control"
 
 source "$(conda info --base)/etc/profile.d/conda.sh"

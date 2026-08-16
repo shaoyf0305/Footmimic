@@ -49,8 +49,6 @@ _CONTROL_UPPER_BODY_JOINT_NAMES = [
 class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
     """Active Stage-2 speed/heading/duration dribbling controller."""
 
-    dribble_contact_mode: str = "both"
-
     def __post_init__(self):
         super().__post_init__()
 
@@ -96,19 +94,10 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
         self.commands.motion.locomotion_cmd_turn_slowdown_angle = 0.55
         self.commands.motion.locomotion_cmd_turn_min_speed_scale = 0.60
 
-        mode = str(self.dribble_contact_mode).lower().strip()
-        if mode not in {"right", "left", "both"}:
-            raise ValueError(
-                f"Unsupported dribble_contact_mode={self.dribble_contact_mode}. "
-                "Expected one of: right, left, both."
-            )
-        if mode == "right":
-            legal_ankles = ["right_ankle_roll_link"]
-        elif mode == "left":
-            legal_ankles = ["left_ankle_roll_link"]
-        else:
-            legal_ankles = ["right_ankle_roll_link", "left_ankle_roll_link"]
-
+        # The active motion bank contains right-foot ball contacts only.  Both
+        # feet remain in gait/mimic tracking, but only the right ankle is a
+        # legal ball-contact link; a left-foot touch is an undesired contact.
+        legal_ankles = ["right_ankle_roll_link"]
         both_feet = ["left_ankle_roll_link", "right_ankle_roll_link"]
         foot_cfg = SceneEntityCfg("robot", body_names=both_feet)
         other_contact_bodies = [
@@ -248,7 +237,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "lateral_ratio_max": 0.70,
                 "pelvis_speed_min": 0.25,
                 "ball_sensor_name": "soccer_ball_contact",
-                "contact_force_threshold": 0.5,
+                "contact_force_threshold": 1.0,
                 "require_recent_contact": True,
                 "recent_contact_window": 8,
             },
@@ -348,6 +337,8 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
+                "contact_window_tolerance_steps": 2,
+                "premature_contact_penalty": 1.0,
             },
         )
 
