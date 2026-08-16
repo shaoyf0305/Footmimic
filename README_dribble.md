@@ -23,12 +23,14 @@ Stage 1 keeps the existing broad mimic/style bank. Stage 2 sees only the single
 right-foot `master-v2` clip; the script does not mirror it or mix in another
 kick dataset.
 
-Stage 1 and Stage 2 use the same ordered network inputs: 160 actor dimensions
-and 292 critic dimensions. Ball position and locomotion speed/heading each use
-one polar representation. The unused destination plus redundant Cartesian
-linear/angular command inputs have been removed. The checkpoint loader selects
-the corresponding legacy columns by meaning, so older Stage 1 and Stage 2
-checkpoints can still be warm-started.
+Stage 1 and Stage 2 use the same ordered network inputs: 163 actor dimensions
+and 295 critic dimensions. Ball position, locomotion speed/heading, and the
+simulation ball velocity relative to command heading each use one polar
+representation. The unused destination plus redundant Cartesian linear/angular
+command inputs have been removed. The checkpoint loader appends the new
+velocity inputs with zero model weights and neutral normalizer statistics, so
+the preceding 160/292-D Stage 1 and Stage 2 checkpoints can still be
+warm-started.
 
 ## Play
 
@@ -67,9 +69,13 @@ run's `diagnostics/` directory. New archives include:
 - `step_reward`
 - actions, joint tracking, command, ball, contact, manifold, torque, and termination telemetry
 
-The cleaned Control environment records 27 active reward terms. Three low-use
-guardrails are intentionally retained for early training: illegal-body ball
-contact, vertical ball bounce, and excessive ankle-contact force. The angular
+The cleaned Control environment records 28 active reward terms. The new
+`dribbling_ball_velocity_tracking` term rewards command-relative speed and
+direction tracking during right-foot possession. The existing ball-speed
+penalty is now a command-relative Huber safety envelope that retains a gradient
+at high speed. Three low-use guardrails are intentionally retained for early
+training: illegal-body ball contact, vertical ball bounce, and excessive
+ankle-contact force. The angular
 velocity reward now tracks a bounded yaw-rate target generated from heading
 error instead of rewarding zero yaw rate during a commanded turn.
 
@@ -92,9 +98,9 @@ timing retains the continuous-Control behavior used by the v5 baseline.
 
 Use `--diagnostic_stride N` to record every Nth control step.
 
-The current MDP inventory and possession/recovery update are documented in
-[MDP_SUMMARY_06.md](MDP_SUMMARY_06.md). `MDP_SUMMARY_05.md` and
-`MDP_SUMMARY_04.md` retain the preceding contact implementations.
+The current MDP inventory and speed-feedback update are documented in
+[MDP_SUMMARY_07.md](MDP_SUMMARY_07.md). `MDP_SUMMARY_06.md` retains the
+preceding possession/recovery implementation.
 
 ## MuJoCo sim2sim
 

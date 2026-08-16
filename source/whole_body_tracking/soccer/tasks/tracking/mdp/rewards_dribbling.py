@@ -9,6 +9,7 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply, quat_error_magnitude
 
 from soccer.tasks.tracking.mdp.commands_multi_motion_soccer import (
+    TASK_STATE_DRIBBLE,
     TASK_STATE_STOP,
     MotionCommand,
     locomotion_task_state_mask,
@@ -726,16 +727,104 @@ def dribbling_pelvis_quat_tracking_exp(
 # ---------------------------------------------------------------------------
 
 
+def dribbling_command_ball_velocity_tracking_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    absolute_tolerance: float = 0.15,
+    relative_tolerance: float = 0.10,
+    speed_error_std: float = 0.30,
+    lateral_speed_std: float = 0.35,
+    ball_sensor_name: str = "soccer_ball_contact",
+    contact_force_threshold: float = 1.0,
+    possession_window_steps: int = 30,
+) -> torch.Tensor:
+    """Track the commanded ball speed and direction during right-foot possession.
+
+    The previous progress objective only imposed a lower speed bound, so every
+    sufficiently fast ball received the same score.  This term instead has a
+    command-relative target band: the full reward is available near the active
+    locomotion speed and decays smoothly for both underspeed and overspeed.
+    Lateral velocity receives its own direction score.
+    """
+    if speed_error_std <= 0.0 or lateral_speed_std <= 0.0:
+        raise ValueError("speed_error_std and lateral_speed_std must be positive.")
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    soccer_ball = env.scene["soccer_ball"]
+    direction_xy, target_speed = _command_direction_xy(command)
+    ball_vel_xy = soccer_ball.data.root_lin_vel_w[:, :2]
+    forward_speed, lateral_speed = _command_frame_components(ball_vel_xy, direction_xy)
+
+    tolerance = float(absolute_tolerance) + float(relative_tolerance) * target_speed
+    signed_speed_error = forward_speed - target_speed
+    error_outside_band = torch.relu(torch.abs(signed_speed_error) - tolerance)
+    forward_score = torch.exp(-error_outside_band.square() / float(speed_error_std) ** 2)
+    lateral_score = torch.exp(-lateral_speed.square() / float(lateral_speed_std) ** 2)
+
+    active = locomotion_task_state_mask(command, (TASK_STATE_DRIBBLE,))
+    if possession_window_steps > 0:
+        possession = _dribbling_recent_contact_gate(
+            env,
+            ball_sensor_name,
+            contact_force_threshold,
+            possession_window_steps,
+            buf_name="_dribbling_possession_steps_since_contact",
+        ).to(torch.bool)
+    else:
+        possession = torch.ones_like(active)
+
+    reward = forward_score * lateral_score * (active & possession).to(forward_score.dtype)
+    setattr(env, "_dribbling_ball_speed_target", target_speed)
+    setattr(env, "_dribbling_ball_speed_error", signed_speed_error)
+    setattr(
+        env,
+        "_dribbling_ball_velocity_heading_error",
+        torch.atan2(lateral_speed, forward_speed),
+    )
+    setattr(env, "_dribbling_ball_velocity_tracking_reward", reward)
+    return reward
+
+
 def dribbling_ball_xy_speed_excess_penalty(
     env: ManagerBasedRLEnv,
-    speed_cap: float = 3.5,
-    linear_scale: float = 1.5,
+    command_name: str = "motion",
+    speed_margin: float = 0.20,
+    min_speed_cap: float = 0.35,
+    huber_scale: float = 0.45,
+    max_penalty: float = 6.0,
 ) -> torch.Tensor:
-    """Penalty in ``[0, 1]`` for ``|v_ball,xy|`` above ``speed_cap``."""
+    """Command-relative, non-saturating safety penalty for excessive ball speed.
+
+    The legacy fixed-cap penalty saturated at one, giving zero gradient above
+    2.55 m/s under the active configuration.  A Huber tail keeps a finite,
+    direct speed-reduction gradient throughout the relevant high-speed range,
+    while ``max_penalty`` bounds the worst early-training contribution.
+    """
+    if huber_scale <= 0.0 or max_penalty <= 0.0:
+        raise ValueError("huber_scale and max_penalty must be positive.")
+
+    command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
-    sp = torch.norm(soccer_ball.data.root_lin_vel_w[:, :2], dim=-1)
-    excess = torch.relu(sp - speed_cap)
-    return torch.clamp(excess / linear_scale, max=1.0)
+    _, target_speed = _command_direction_xy(command)
+    ball_speed = torch.norm(soccer_ball.data.root_lin_vel_w[:, :2], dim=-1)
+    speed_cap = torch.maximum(
+        torch.full_like(target_speed, float(min_speed_cap)),
+        target_speed + float(speed_margin),
+    )
+    normalized_excess = torch.relu(ball_speed - speed_cap) / float(huber_scale)
+    penalty = torch.where(
+        normalized_excess <= 1.0,
+        0.5 * normalized_excess.square(),
+        normalized_excess - 0.5,
+    )
+    penalty = torch.clamp(penalty, max=float(max_penalty))
+    active = locomotion_task_state_mask(command, (TASK_STATE_DRIBBLE,))
+    penalty = penalty * active.to(penalty.dtype)
+
+    setattr(env, "_dribbling_ball_speed_target", target_speed)
+    setattr(env, "_dribbling_ball_speed_cap", speed_cap)
+    setattr(env, "_dribbling_ball_speed_excess_penalty", penalty)
+    return penalty
 
 
 def dribbling_ball_coast_without_contact_penalty(

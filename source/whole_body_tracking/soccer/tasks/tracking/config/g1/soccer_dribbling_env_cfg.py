@@ -189,10 +189,30 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             weight=2.0,
             params={"command_name": "motion", "std": 0.45},
         )
+        self.rewards.dribbling_ball_velocity_tracking = RewTerm(
+            func=mdp.dribbling_command_ball_velocity_tracking_reward,
+            weight=2.5,
+            params={
+                "command_name": "motion",
+                "absolute_tolerance": 0.15,
+                "relative_tolerance": 0.10,
+                "speed_error_std": 0.30,
+                "lateral_speed_std": 0.35,
+                "ball_sensor_name": "soccer_ball_contact",
+                "contact_force_threshold": 1.0,
+                "possession_window_steps": 30,
+            },
+        )
         self.rewards.dribbling_ball_speed_excess = RewTerm(
             func=mdp.dribbling_ball_xy_speed_excess_penalty,
             weight=-2.5,
-            params={"speed_cap": 1.35, "linear_scale": 1.2},
+            params={
+                "command_name": "motion",
+                "speed_margin": 0.20,
+                "min_speed_cap": 0.35,
+                "huber_scale": 0.45,
+                "max_penalty": 6.0,
+            },
         )
         self.rewards.dribbling_ball_coast_penalty = RewTerm(
             func=mdp.dribbling_ball_coast_without_contact_penalty,

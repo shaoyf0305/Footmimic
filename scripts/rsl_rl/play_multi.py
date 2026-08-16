@@ -833,6 +833,12 @@ def _create_diagnostic(
         "cg_wrong_foot_contact": [],
         "ball_xy_speed": [],
         "ball_command_forward_speed": [],
+        "ball_speed_target": [],
+        "ball_speed_error": [],
+        "ball_velocity_heading_error": [],
+        "ball_speed_cap": [],
+        "ball_velocity_tracking_reward": [],
+        "ball_speed_excess_penalty": [],
         "pelvis_xy_speed": [],
         "command_target_speed": [],
         "command_target_heading": [],
@@ -1019,7 +1025,15 @@ def _append_diagnostic(
     diagnostic["ball_command_lateral_offset"].append(float(lateral_offset.item()))
     diagnostic["ball_position_z"].append(float(soccer_ball.data.root_pos_w[0, 2].item()))
     diagnostic["ball_vertical_speed"].append(float(soccer_ball.data.root_lin_vel_w[0, 2].item()))
-    diagnostic["ball_command_forward_speed"].append(float(torch.dot(ball_vel_xy, command_dir).item()))
+    ball_forward_speed = torch.dot(ball_vel_xy, command_dir)
+    ball_lateral_speed = torch.dot(ball_vel_xy, command_lateral_dir)
+    speed_target = command.locomotion_cmd_speed[0]
+    diagnostic["ball_command_forward_speed"].append(float(ball_forward_speed.item()))
+    diagnostic["ball_speed_target"].append(float(speed_target.item()))
+    diagnostic["ball_speed_error"].append(float((ball_forward_speed - speed_target).item()))
+    diagnostic["ball_velocity_heading_error"].append(
+        float(torch.atan2(ball_lateral_speed, ball_forward_speed).item())
+    )
     diagnostic["pelvis_xy_speed"].append(float(torch.norm(robot.data.body_lin_vel_w[0, pelvis_id, :2]).item()))
 
     body_force_magnitudes, body_names, filtered_available = (
@@ -1055,6 +1069,9 @@ def _append_diagnostic(
     too_close_distance = getattr(base_env, "_dribbling_ball_too_close_distance_xy", None)
     possession_active = getattr(base_env, "_dribbling_possession_active", None)
     possession_steps = getattr(base_env, "_dribbling_possession_steps_since_contact", None)
+    speed_cap = getattr(base_env, "_dribbling_ball_speed_cap", None)
+    velocity_tracking_reward = getattr(base_env, "_dribbling_ball_velocity_tracking_reward", None)
+    speed_excess_penalty = getattr(base_env, "_dribbling_ball_speed_excess_penalty", None)
     diagnostic["ball_contact_duty_ema"].append(
         np.nan if duty_ema is None else float(duty_ema[0].item())
     )
@@ -1072,6 +1089,15 @@ def _append_diagnostic(
     )
     diagnostic["possession_steps_since_contact"].append(
         -1 if possession_steps is None else int(possession_steps[0].item())
+    )
+    diagnostic["ball_speed_cap"].append(
+        np.nan if speed_cap is None else float(speed_cap[0].item())
+    )
+    diagnostic["ball_velocity_tracking_reward"].append(
+        np.nan if velocity_tracking_reward is None else float(velocity_tracking_reward[0].item())
+    )
+    diagnostic["ball_speed_excess_penalty"].append(
+        np.nan if speed_excess_penalty is None else float(speed_excess_penalty[0].item())
     )
 
     cg_labeled = bool(
@@ -1362,6 +1388,29 @@ def _save_diagnostic(diagnostic: dict) -> None:
     ball_distance = float(np.mean(arrays["ball_pelvis_xy_distance"]))
     ball_speed = float(np.mean(arrays["ball_xy_speed"]))
     ball_forward_speed = float(np.mean(arrays["ball_command_forward_speed"]))
+    ball_speed_error = float(np.mean(np.abs(arrays["ball_speed_error"])))
+    finite_speed_cap = np.isfinite(arrays["ball_speed_cap"])
+    ball_overspeed_rate = (
+        float(
+            np.mean(
+                arrays["ball_xy_speed"][finite_speed_cap]
+                > arrays["ball_speed_cap"][finite_speed_cap]
+            )
+        )
+        if np.any(finite_speed_cap) else np.nan
+    )
+    finite_velocity_tracking = arrays["ball_velocity_tracking_reward"][
+        np.isfinite(arrays["ball_velocity_tracking_reward"])
+    ]
+    velocity_tracking_score = (
+        float(np.mean(finite_velocity_tracking)) if finite_velocity_tracking.size else np.nan
+    )
+    finite_speed_penalty = arrays["ball_speed_excess_penalty"][
+        np.isfinite(arrays["ball_speed_excess_penalty"])
+    ]
+    speed_excess_score = (
+        float(np.mean(finite_speed_penalty)) if finite_speed_penalty.size else np.nan
+    )
     pelvis_speed = float(np.mean(arrays["pelvis_xy_speed"]))
     foot_error = float(np.mean(arrays["foot_reference_position_error"]))
     heading_error = float(np.mean(np.abs(arrays["heading_error"])))
@@ -1502,6 +1551,8 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"cg_missing_window={missing_rate:.3f}  "
         f"cg_wrong_foot={wrong_foot_rate:.3f}  "
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
+        f"ball_speed_mae={ball_speed_error:.3f} m/s  overspeed_rate={ball_overspeed_rate:.3f}  "
+        f"velocity_track={velocity_tracking_score:.3f}  speed_excess={speed_excess_score:.3f}  "
         f"pelvis_xy_speed={pelvis_speed:.3f} m/s  "
         f"task_states=({task_state_summary})  stop_settled={stop_settle_rate:.3f}  "
         f"stop_successes={stop_successes}  "

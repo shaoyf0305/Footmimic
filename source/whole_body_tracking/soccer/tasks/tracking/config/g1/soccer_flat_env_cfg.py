@@ -74,6 +74,14 @@ def _apply_shared_dribble_inputs(cfg) -> None:
         func=mdp.motion_locomotion_polar_command,
         params={"command_name": "motion"},
     )
+    cfg.observations.policy.anchor_ball_velocity_polar_cmd = ObsTerm(
+        func=obs_anchor.anchor_ball_velocity_polar_command,
+        params={"command_name": "motion"},
+    )
+    cfg.observations.critic.anchor_ball_velocity_polar_cmd = ObsTerm(
+        func=obs_anchor.anchor_ball_velocity_polar_command,
+        params={"command_name": "motion"},
+    )
 
     # Both stages expose the normalized joint command that the action term
     # actually executes. The Stage-1 action falls back to its raw action.

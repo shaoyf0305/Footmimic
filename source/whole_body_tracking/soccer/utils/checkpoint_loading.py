@@ -22,19 +22,27 @@ def _get_alg_policy(runner):
     )
 
 
-# Current observations retain only the polar ball and locomotion commands after
-# the stable actor/critic base blocks. Each legacy layout below lists the exact
-# source ranges whose semantics still exist; missing polar-command values are
-# appended with neutral normalizer statistics and zero model weights.
+# Current observations retain polar ball position, polar locomotion command,
+# and command-relative polar ball velocity after the stable actor/critic base
+# blocks. Each legacy layout below lists the exact source ranges whose semantics
+# still exist; missing current values are appended with neutral normalizer
+# statistics and zero model weights.
 _LEGACY_OBSERVATION_KEEP_RANGES: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {
-    # Actor: stable base=154, current tail=ball_polar(3)+locomotion_polar(3).
+    # Previous active actor layout (160) appends ball_velocity_polar(3)
+    # through the generic expansion path. Older layouts additionally need
+    # obsolete Cartesian fields removed before the velocity tail is appended.
     (163, 160): ((0, 154), (160, 163)),
     (169, 160): ((0, 154), (157, 160), (166, 169)),
     (172, 160): ((0, 154), (160, 163), (169, 172)),
-    # Critic: stable base=286, current tail=ball_polar(3)+locomotion_polar(3).
+    (169, 163): ((0, 154), (157, 160), (166, 169)),
+    (172, 163): ((0, 154), (160, 163), (169, 172)),
+    # Previous active critic layout (292) appends ball_velocity_polar(3)
+    # generically; these entries cover older Cartesian layouts.
     (295, 292): ((0, 286), (292, 295)),
     (301, 292): ((0, 286), (289, 292), (298, 301)),
     (304, 292): ((0, 286), (292, 295), (301, 304)),
+    (301, 295): ((0, 286), (289, 292), (298, 301)),
+    (304, 295): ((0, 286), (292, 295), (301, 304)),
 }
 
 
