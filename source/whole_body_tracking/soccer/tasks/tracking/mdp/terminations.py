@@ -151,12 +151,15 @@ def dribbling_no_ball_contact_timeout(
     proximity_recovery_max_distance: float = 0.0,
     proximity_recovery_max_relative_speed: float = 0.0,
     proximity_recovery_counter_increment: float = 1.0,
+    contact_body_names: tuple[str, ...] | list[str] | None = None,
     active_task_states: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """End the episode if the ball sees no robot contact for too long after warm-up.
 
     Counts simulation steps (post-``grace_steps``) without filtered robot-link
-    contact. Resets the counter on contact or on episode start. Complements
+    contact. ``contact_body_names`` can restrict which links refresh the
+    counter; the active right-foot task accepts only its right ankle. Resets the
+    counter on contact or on episode start. Complements
     ``ball_lost_dribbling`` by discouraging "pose near the ball but never touch"
     strategies. A two-step post-contact hold prevents one physical touch from
     fragmenting because of contact-sensor timing.
@@ -173,6 +176,7 @@ def dribbling_no_ball_contact_timeout(
         ball_sensor_name,
         contact_force_threshold=contact_force_threshold,
         hold_steps=2,
+        body_names=contact_body_names,
     )
 
     step_buf = getattr(env, "episode_length_buf", torch.zeros(env.num_envs, device=env.device))

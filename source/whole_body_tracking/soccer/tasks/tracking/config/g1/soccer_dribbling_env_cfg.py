@@ -172,6 +172,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "contact_force_threshold": 1.0,
                 "no_contact_zone_damping": 0.12,
                 "zone_lateral_abs_max": 0.14,
+                "possession_window_steps": 30,
             },
         )
         self.rewards.dribbling_ball_too_close_penalty = RewTerm(
@@ -179,7 +180,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             weight=-8.0,
             params={
                 "command_name": "motion",
-                "min_forward_dist": 0.28,
+                "min_xy_dist": 0.28,
                 "full_penalty_dist": 0.14,
             },
         )
@@ -203,7 +204,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "speed_threshold": 0.55,
                 "speed_scale": 0.40,
                 "max_close_xy_dist": 0.50,
-                "recent_contact_grace_steps": 8,
+                "recent_contact_grace_steps": 30,
             },
         )
         self.rewards.dribbling_sustained_contact_penalty = RewTerm(
@@ -239,7 +240,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
                 "require_recent_contact": True,
-                "recent_contact_window": 8,
+                "recent_contact_window": 30,
             },
         )
         self.rewards.dribbling_orbiting_penalty = RewTerm(
@@ -252,6 +253,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "orbit_radius_max": 0.9,
                 "tangential_deadzone": 0.08,
                 "tangential_scale": 0.35,
+                "possession_window_steps": 30,
             },
         )
         self.rewards.dribbling_gait_foot_tracking = RewTerm(
@@ -263,6 +265,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "foot_body_names": both_feet,
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
+                "possession_window_steps": 30,
             },
         )
         self.rewards.dribbling_chase_ball = RewTerm(
@@ -356,12 +359,17 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             params={
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
+                "contact_body_names": ("right_ankle_roll_link",),
                 "grace_steps": 50,
                 "max_steps_without_contact": 50,
                 "recovery_window_steps": 75,
                 "recovery_max_distance": 0.85,
                 "recovery_min_closing_speed": 0.05,
                 "recovery_counter_increment": 0.25,
+                "proximity_recovery_max_steps": 30,
+                "proximity_recovery_max_distance": 0.65,
+                "proximity_recovery_max_relative_speed": 0.8,
+                "proximity_recovery_counter_increment": 0.25,
             },
         )
         self.terminations.locomotion_manual_sequence_end = DoneTerm(

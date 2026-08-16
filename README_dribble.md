@@ -77,18 +77,24 @@ The current Control task accepts only right-ankle ball contact as legal. Both
 feet remain in gait tracking, but a left-foot ball touch is an undesired
 contact. No mirrored or additional kick data is required.
 
-Current reward/termination gates use filtered per-link robot contact with a
-two-control-step post-contact hold. Diagnostics separately record this decision
-signal, the instantaneous per-link signal, and the ball's net XY contact force;
-the net force is telemetry only because it also contains ball-ground friction.
-CG contact is scored per annotated contact window instead of rewarding the
-large number of easy no-contact/no-contact frame matches.
+Current contact truth uses filtered per-link robot contact with a two-control-step
+sensor hold. A real right-ankle touch also starts a 30-control-step possession
+window shared by progress, proximity, coast, orbit, and gait reward gates. This
+restores task coverage between discrete touches without treating ball-ground
+friction as robot contact. Diagnostics record both contact channels, possession,
+and the ball's net XY contact force; net force remains telemetry only. CG contact
+is scored per annotated contact window instead of rewarding easy no-contact matches.
+
+After an episode termination, playback clears the recurrent policy hidden state
+while leaving the active manual speed/heading segment unchanged. Thus a physical
+scene reset cannot inherit a failed episode's LSTM memory, but command-sequence
+timing retains the continuous-Control behavior used by the v5 baseline.
 
 Use `--diagnostic_stride N` to record every Nth control step.
 
-The current MDP inventory and contact-event update are documented in
-[MDP_SUMMARY_05.md](MDP_SUMMARY_05.md). `MDP_SUMMARY_04.md` is retained as the
-history of the preceding net-force decision implementation.
+The current MDP inventory and possession/recovery update are documented in
+[MDP_SUMMARY_06.md](MDP_SUMMARY_06.md). `MDP_SUMMARY_05.md` and
+`MDP_SUMMARY_04.md` retain the preceding contact implementations.
 
 ## MuJoCo sim2sim
 

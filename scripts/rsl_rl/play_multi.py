@@ -251,7 +251,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
-from soccer.utils.checkpoint_loading import load_checkpoint_with_obs_expand
+from soccer.utils.checkpoint_loading import _get_alg_policy, load_checkpoint_with_obs_expand
 
 def motion_frame_count(motion_file: str) -> int:
     """Return the number of frames in a motion .npz file."""
@@ -268,6 +268,27 @@ def motion_frame_count(motion_file: str) -> int:
 def _env_step_s(env_cfg) -> float:
     """Wall-clock seconds per env step."""
     return float(env_cfg.decimation) * float(env_cfg.sim.dt)
+
+
+def _reset_recurrent_policy_on_done(runner, dones: torch.Tensor) -> None:
+    """Clear recurrent hidden state for environments reset by ``env.step``.
+
+    The environment owns the physical reset, but inference playback bypasses
+    the training runner's usual done-processing path.  Without this explicit
+    call, a new robot/ball scene receives the LSTM state of the failed episode.
+    """
+    if dones is None or not bool(torch.any(dones).item()):
+        return
+    policy_module = _get_alg_policy(runner)
+    reset = getattr(policy_module, "reset", None)
+    if reset is None:
+        return
+    try:
+        reset(dones)
+    except TypeError:
+        # Older rsl-rl versions expose only a full-batch reset.  Playback uses
+        # one environment by default, so resetting the batch is still correct.
+        reset()
 
 
 def _disable_play_terminations(env_cfg) -> list[str]:
@@ -798,6 +819,9 @@ def _create_diagnostic(
         "ball_contact_duty_ema": [],
         "ball_contact_duty_penalty": [],
         "ball_too_close_penalty": [],
+        "ball_too_close_distance_xy": [],
+        "possession_active": [],
+        "possession_steps_since_contact": [],
         "cg_label_available": [],
         "cg_expected_contact": [],
         "cg_expected_foot": [],
@@ -1028,6 +1052,9 @@ def _append_diagnostic(
     duty_ema = getattr(base_env, "_dribbling_contact_duty_ema", None)
     duty_penalty = getattr(base_env, "_dribbling_contact_duty_penalty", None)
     too_close_penalty = getattr(base_env, "_dribbling_ball_too_close_penalty", None)
+    too_close_distance = getattr(base_env, "_dribbling_ball_too_close_distance_xy", None)
+    possession_active = getattr(base_env, "_dribbling_possession_active", None)
+    possession_steps = getattr(base_env, "_dribbling_possession_steps_since_contact", None)
     diagnostic["ball_contact_duty_ema"].append(
         np.nan if duty_ema is None else float(duty_ema[0].item())
     )
@@ -1036,6 +1063,15 @@ def _append_diagnostic(
     )
     diagnostic["ball_too_close_penalty"].append(
         np.nan if too_close_penalty is None else float(too_close_penalty[0].item())
+    )
+    diagnostic["ball_too_close_distance_xy"].append(
+        np.nan if too_close_distance is None else float(too_close_distance[0].item())
+    )
+    diagnostic["possession_active"].append(
+        False if possession_active is None else bool(possession_active[0].item())
+    )
+    diagnostic["possession_steps_since_contact"].append(
+        -1 if possession_steps is None else int(possession_steps[0].item())
     )
 
     cg_labeled = bool(
@@ -1329,7 +1365,8 @@ def _save_diagnostic(diagnostic: dict) -> None:
     pelvis_speed = float(np.mean(arrays["pelvis_xy_speed"]))
     foot_error = float(np.mean(arrays["foot_reference_position_error"]))
     heading_error = float(np.mean(np.abs(arrays["heading_error"])))
-    too_close_rate = float(np.mean(arrays["ball_command_forward_offset"] < 0.28))
+    too_close_rate = float(np.mean(arrays["ball_too_close_penalty"] > 0.0))
+    possession_rate = float(np.mean(arrays["possession_active"]))
     finite_contact_duty = arrays["ball_contact_duty_ema"][
         np.isfinite(arrays["ball_contact_duty_ema"])
     ]
@@ -1459,7 +1496,8 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"contact_rate={contact_rate:.3f}  raw_link_contact_rate={link_contact_rate:.3f}  "
         f"net_contact_rate={net_contact_rate:.3f}  "
         f"ball_pelvis_xy={ball_distance:.3f} m  "
-        f"too_close_rate={too_close_rate:.3f}  contact_duty={contact_duty:.3f}  "
+        f"too_close_rate={too_close_rate:.3f}  possession_rate={possession_rate:.3f}  "
+        f"contact_duty={contact_duty:.3f}  "
         f"cg_window_hit={window_hit_rate:.3f}  cg_premature={premature_rate:.3f}  "
         f"cg_missing_window={missing_rate:.3f}  "
         f"cg_wrong_foot={wrong_foot_rate:.3f}  "
@@ -2106,6 +2144,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 diagnostic["termination_reason"].append(
                     _active_failure_termination_reason(base_env) if bool(dones[0].item()) else ""
                 )
+            _reset_recurrent_policy_on_done(ppo_runner, dones)
 
         if video_recorder is not None:
             overlay = _get_play_overlay(env)
