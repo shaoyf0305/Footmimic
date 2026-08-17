@@ -194,10 +194,11 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             weight=2.5,
             params={
                 "command_name": "motion",
-                "absolute_tolerance": 0.15,
-                "relative_tolerance": 0.10,
+                "absolute_tolerance": 0.10,
+                "relative_tolerance": 0.05,
                 "speed_error_std": 0.30,
                 "lateral_speed_std": 0.35,
+                "velocity_ema_window_steps": 10,
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
                 "possession_window_steps": 30,
@@ -249,7 +250,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
         )
         self.rewards.dribbling_ball_forward_progress = RewTerm(
             func=mdp.dribbling_command_ball_progress_reward,
-            weight=7.5,
+            weight=5.0,
             params={
                 "command_name": "motion",
                 "min_forward_speed": 0.42,

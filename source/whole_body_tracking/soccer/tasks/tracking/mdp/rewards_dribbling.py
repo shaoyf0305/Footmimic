@@ -434,6 +434,65 @@ def _command_frame_components(vector_xy: torch.Tensor, direction_xy: torch.Tenso
     return forward, lateral
 
 
+def _low_pass_ball_velocity_xy(
+    env: ManagerBasedRLEnv,
+    ball_velocity_xy: torch.Tensor,
+    window_steps: int,
+    buf_name: str = "_dribbling_ball_velocity_ema_state",
+) -> torch.Tensor:
+    """Return a reset-safe EMA of ball XY velocity, updated once per control step.
+
+    ``alpha = 1 / window_steps`` gives the filter an approximately
+    ``window_steps``-long time constant.  With the active 50 Hz controller,
+    ten steps correspond to 0.2 s: long enough to reject the impact spike from
+    one kick, but short enough to close the speed loop within a gait cycle.
+    """
+    if window_steps <= 0:
+        raise ValueError("window_steps must be positive.")
+
+    step_buf = getattr(env, "episode_length_buf", None)
+    if not isinstance(step_buf, torch.Tensor):
+        step_buf = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+
+    state = getattr(env, buf_name, None)
+    if (
+        not isinstance(state, dict)
+        or not isinstance(state.get("last_step"), torch.Tensor)
+        or state["last_step"].shape[0] != env.num_envs
+        or not isinstance(state.get("velocity_xy"), torch.Tensor)
+        or state["velocity_xy"].shape != ball_velocity_xy.shape
+        or int(state.get("window_steps", -1)) != int(window_steps)
+    ):
+        state = {
+            "last_step": torch.full_like(step_buf, -1),
+            "velocity_xy": ball_velocity_xy.detach().clone(),
+            "window_steps": int(window_steps),
+        }
+
+    last_step = state["last_step"]
+    filtered_velocity_xy = state["velocity_xy"]
+    update_mask = last_step != step_buf
+    # A decreasing episode counter means this environment was reset since its
+    # last reward evaluation.  ``step == 0`` covers explicit reset-time calls.
+    reset_mask = (step_buf == 0) | (step_buf < last_step)
+    alpha = 1.0 / float(window_steps)
+    next_velocity_xy = filtered_velocity_xy + alpha * (
+        ball_velocity_xy - filtered_velocity_xy
+    )
+    next_velocity_xy = torch.where(
+        reset_mask.unsqueeze(-1), ball_velocity_xy, next_velocity_xy
+    )
+    filtered_velocity_xy = torch.where(
+        update_mask.unsqueeze(-1), next_velocity_xy, filtered_velocity_xy
+    )
+    last_step = torch.where(update_mask, step_buf, last_step)
+
+    state["last_step"] = last_step
+    state["velocity_xy"] = filtered_velocity_xy.detach().clone()
+    setattr(env, buf_name, state)
+    return filtered_velocity_xy
+
+
 def dribbling_stop_settle_state(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
@@ -730,10 +789,11 @@ def dribbling_pelvis_quat_tracking_exp(
 def dribbling_command_ball_velocity_tracking_reward(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
-    absolute_tolerance: float = 0.15,
-    relative_tolerance: float = 0.10,
+    absolute_tolerance: float = 0.10,
+    relative_tolerance: float = 0.05,
     speed_error_std: float = 0.30,
     lateral_speed_std: float = 0.35,
+    velocity_ema_window_steps: int = 10,
     ball_sensor_name: str = "soccer_ball_contact",
     contact_force_threshold: float = 1.0,
     possession_window_steps: int = 30,
@@ -744,7 +804,10 @@ def dribbling_command_ball_velocity_tracking_reward(
     sufficiently fast ball received the same score.  This term instead has a
     command-relative target band: the full reward is available near the active
     locomotion speed and decays smoothly for both underspeed and overspeed.
-    Lateral velocity receives its own direction score.
+    Tracking uses a short velocity EMA rather than the instantaneous impact
+    spike, so the policy is rewarded for gait-scale speed regulation instead
+    of making abrupt whole-body corrections at every kick.  Lateral velocity
+    receives its own direction score.
     """
     if speed_error_std <= 0.0 or lateral_speed_std <= 0.0:
         raise ValueError("speed_error_std and lateral_speed_std must be positive.")
@@ -752,7 +815,11 @@ def dribbling_command_ball_velocity_tracking_reward(
     command: MotionCommand = env.command_manager.get_term(command_name)
     soccer_ball = env.scene["soccer_ball"]
     direction_xy, target_speed = _command_direction_xy(command)
-    ball_vel_xy = soccer_ball.data.root_lin_vel_w[:, :2]
+    ball_vel_xy = _low_pass_ball_velocity_xy(
+        env,
+        soccer_ball.data.root_lin_vel_w[:, :2],
+        velocity_ema_window_steps,
+    )
     forward_speed, lateral_speed = _command_frame_components(ball_vel_xy, direction_xy)
 
     tolerance = float(absolute_tolerance) + float(relative_tolerance) * target_speed
@@ -776,6 +843,11 @@ def dribbling_command_ball_velocity_tracking_reward(
     reward = forward_score * lateral_score * (active & possession).to(forward_score.dtype)
     setattr(env, "_dribbling_ball_speed_target", target_speed)
     setattr(env, "_dribbling_ball_speed_error", signed_speed_error)
+    setattr(env, "_dribbling_filtered_ball_velocity_xy", ball_vel_xy)
+    setattr(env, "_dribbling_filtered_ball_forward_speed", forward_speed)
+    setattr(env, "_dribbling_filtered_ball_lateral_speed", lateral_speed)
+    setattr(env, "_dribbling_filtered_ball_speed_error", signed_speed_error)
+    setattr(env, "_dribbling_ball_velocity_ema_window_steps", int(velocity_ema_window_steps))
     setattr(
         env,
         "_dribbling_ball_velocity_heading_error",

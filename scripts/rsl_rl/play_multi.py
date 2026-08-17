@@ -836,6 +836,11 @@ def _create_diagnostic(
         "ball_speed_target": [],
         "ball_speed_error": [],
         "ball_velocity_heading_error": [],
+        "ball_filtered_xy_speed": [],
+        "ball_filtered_command_forward_speed": [],
+        "ball_filtered_command_lateral_speed": [],
+        "ball_filtered_speed_error": [],
+        "ball_velocity_ema_window_steps": [],
         "ball_speed_cap": [],
         "ball_velocity_tracking_reward": [],
         "ball_speed_excess_penalty": [],
@@ -1070,6 +1075,7 @@ def _append_diagnostic(
     possession_active = getattr(base_env, "_dribbling_possession_active", None)
     possession_steps = getattr(base_env, "_dribbling_possession_steps_since_contact", None)
     speed_cap = getattr(base_env, "_dribbling_ball_speed_cap", None)
+    filtered_ball_velocity = getattr(base_env, "_dribbling_filtered_ball_velocity_xy", None)
     velocity_tracking_reward = getattr(base_env, "_dribbling_ball_velocity_tracking_reward", None)
     speed_excess_penalty = getattr(base_env, "_dribbling_ball_speed_excess_penalty", None)
     diagnostic["ball_contact_duty_ema"].append(
@@ -1092,6 +1098,30 @@ def _append_diagnostic(
     )
     diagnostic["ball_speed_cap"].append(
         np.nan if speed_cap is None else float(speed_cap[0].item())
+    )
+    if filtered_ball_velocity is None:
+        diagnostic["ball_filtered_xy_speed"].append(np.nan)
+        diagnostic["ball_filtered_command_forward_speed"].append(np.nan)
+        diagnostic["ball_filtered_command_lateral_speed"].append(np.nan)
+        diagnostic["ball_filtered_speed_error"].append(np.nan)
+    else:
+        filtered_velocity_env0 = filtered_ball_velocity[0]
+        filtered_forward_speed = torch.dot(filtered_velocity_env0, command_dir)
+        filtered_lateral_speed = torch.dot(filtered_velocity_env0, command_lateral_dir)
+        diagnostic["ball_filtered_xy_speed"].append(
+            float(torch.norm(filtered_velocity_env0).item())
+        )
+        diagnostic["ball_filtered_command_forward_speed"].append(
+            float(filtered_forward_speed.item())
+        )
+        diagnostic["ball_filtered_command_lateral_speed"].append(
+            float(filtered_lateral_speed.item())
+        )
+        diagnostic["ball_filtered_speed_error"].append(
+            float((filtered_forward_speed - speed_target).item())
+        )
+    diagnostic["ball_velocity_ema_window_steps"].append(
+        int(getattr(base_env, "_dribbling_ball_velocity_ema_window_steps", -1))
     )
     diagnostic["ball_velocity_tracking_reward"].append(
         np.nan if velocity_tracking_reward is None else float(velocity_tracking_reward[0].item())
@@ -1389,6 +1419,13 @@ def _save_diagnostic(diagnostic: dict) -> None:
     ball_speed = float(np.mean(arrays["ball_xy_speed"]))
     ball_forward_speed = float(np.mean(arrays["ball_command_forward_speed"]))
     ball_speed_error = float(np.mean(np.abs(arrays["ball_speed_error"])))
+    finite_filtered_speed_error = arrays["ball_filtered_speed_error"][
+        np.isfinite(arrays["ball_filtered_speed_error"])
+    ]
+    filtered_ball_speed_error = (
+        float(np.mean(np.abs(finite_filtered_speed_error)))
+        if finite_filtered_speed_error.size else np.nan
+    )
     finite_speed_cap = np.isfinite(arrays["ball_speed_cap"])
     ball_overspeed_rate = (
         float(
@@ -1551,7 +1588,9 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"cg_missing_window={missing_rate:.3f}  "
         f"cg_wrong_foot={wrong_foot_rate:.3f}  "
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
-        f"ball_speed_mae={ball_speed_error:.3f} m/s  overspeed_rate={ball_overspeed_rate:.3f}  "
+        f"ball_speed_mae={ball_speed_error:.3f} m/s  "
+        f"filtered_ball_speed_mae={filtered_ball_speed_error:.3f} m/s  "
+        f"overspeed_rate={ball_overspeed_rate:.3f}  "
         f"velocity_track={velocity_tracking_score:.3f}  speed_excess={speed_excess_score:.3f}  "
         f"pelvis_xy_speed={pelvis_speed:.3f} m/s  "
         f"task_states=({task_state_summary})  stop_settled={stop_settle_rate:.3f}  "
