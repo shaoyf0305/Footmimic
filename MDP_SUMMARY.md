@@ -2,6 +2,24 @@
 
 > **维护约定：本文件是当前 S1/S2 MDP 的唯一持续更新总表。** 后续 input、reward、termination、reset 或 diagnostics 发生变化时，直接修改 `MDP_SUMMARY.md`，不再新建 `MDP_SUMMARY_09.md` 等编号文件；旧的编号版中间总结已删除。
 
+## 0. Essay 10：reset 与 no-contact 修复
+
+`diagnostic_20260818_131135.npz` 中第一轮在 `+0.65 rad` 和 `-0.65 rad` 转向时分别触发 `dribbling_no_contact`。旧 reset 保留失败时的手动 segment，却沿 task `+X` 重生球，导致球在当前 command frame 中瞬间侧偏 `-0.267 m` / `+0.230 m`；完整 sequence 结束后回到 heading 0，第二轮才明显变好。首帧还出现过 `876.8 N` 的左膝--球初始化接触。
+
+本次修改 reset、no-contact 和 reference action bound，并对 `useful_touch` 做一项局部语义修正；不开展大规模 reward 平衡：
+
+- 普通失败 reset 保留当前手动 segment、目标 heading 和剩余 duration，避免后续段永远走不到；
+- 只有完整 command sequence 使用 `reset_on_end` 结束时才回到 segment 0；
+- resampled command 和 manual segment 都先更新 command，再生成球；
+- robot yaw 与球都沿当前有效 command heading 重置；球以实际 randomized reset pelvis 为原点生成；
+- S2 初始前向距离收窄为 `0.53 ± 0.05 m`，侧向 jitter 收窄为 `±0.08 m`，降低腿内穿透概率；
+- play 在安装 CLI manual command 后立即同步 robot yaw 和球，修复第一次 rollout 仍使用 constructor command frame 的问题；
+- `no_contact` 只在 DRIBBLE 生效。普通失控每步 `+1`，距离 `<=0.75 m` 且相对 XY 速度 `<=0.9 m/s` 时每步 `+0.5`，command-change closing recovery 每步 `+0.25`；所有增量都为正，任何有效右 ankle 接触直接清零；
+- `useful_touch` 对右脚 `<=14 N` 的新轻触立即给 25% 基础分，剩余 75% 根据 5 steps 后的控制误差改善给出；单次触球 raw score 总上限仍为 1.0。
+- 上身 `q_ref ± 0.25 rad` 硬 clamp 改为 `q_ref + 0.25*tanh((q_raw-q_ref)/0.25)`；删除只看 clamp 前溢出的 `upper_body_reference_overflow` reward，保留饱和度 diagnostics。
+
+网络接口保持 Actor 163 / Critic 295 / Action 29，不需要重训 S1；可以继续 resume 当前 S2。S2 的 `actions` observation 是 action term 真正执行的 normalized action：上身反馈位于 smooth reference bound、manifold projection 和低通滤波之后，腰部还包含 stabilizer；未受约束的下肢维度仍等于 policy raw action。
+
 ## 1. 本次更新解决什么问题
 
 Essay 08 已经把球速压到安全范围，但 `diagnostic_20260818_003056.npz` 表明动作并未恢复到 5.0 水平：
@@ -45,7 +63,7 @@ p_target = [0.45, 0.00] m
 - pelvis 速度目标就是 locomotion command；
 - `dribbling_dynamic_proximity` 平滑跟踪预测球位 `[0.45, 0]`；
 - `dribbling_ball_velocity_tracking` 让 EMA 球速跟踪 `[command_speed, 0]`；
-- 右脚触球只承担离散误差修正，不因“碰到球”本身得分；
+- 右脚轻触承担离散误差修正；新轻触本身获得一个较小的即时基础分；
 - 期望循环是“右脚轻触 → 球自由滚动 → 人跟随 → 误差增大后再次轻触”。
 
 “控球”不等于接触为真，也不等于 30-step possession timer 为真；它表示当前球的位置和速度仍允许下一次正常步态触球完成修正。
@@ -74,10 +92,11 @@ v_pelvis_target     = (1 - recovery_gate) * v_command
 `dribbling_legal_foot_touch` 改写为 `dribbling_useful_foot_touch`：
 
 1. 检测右 ankle、`<=14 N` 的新接触上升沿；
-2. 保存触球前一控制步的综合位置--速度误差；
-3. 等待 5 steps（0.1 s），避开碰撞尖峰；
-4. 只有误差下降才给正奖励，下降 `0.50` 达到满分；
-5. 位于 CG 标注接触窗口内时系数为 1，窗口外为 0.35。CG 只保留为软风格约束，不再独立给 reward。
+2. 立即给 `0.25` raw 基础分，承认不改变球速的温和轻触也是合法动作；
+3. 同时保存触球前一控制步的综合位置--速度误差；
+4. 等待 5 steps（0.1 s）避开碰撞尖峰，再按误差改善给最多 `0.75` raw 附加分；误差下降 `0.50` 时附加分达到上限；
+5. 基础分与改善分合计不超过原来的 `1.0` raw 上限；
+6. 位于 CG 标注接触窗口内时系数为 1，窗口外为 0.35。CG 只保留为软风格约束，不再独立给 reward。
 
 快速重复触球阈值由 26 steps 降到 14 steps，force 条件同步为 `<=14 N`。06 的成功节奏中位数是 18 steps，因此正常的 18--22 step 触球不再被惩罚，14 steps 内的高频碎点仍受抑制。
 
@@ -95,7 +114,7 @@ S1 与 S2 的 Actor、Critic 输入顺序和维度完全一致；本次 reward �
 | 4 | `base_ang_vel` | 3 | 机器人 base angular velocity |
 | 5 | `joint_pos` | 29 | 相对默认位姿的关节位置 |
 | 6 | `joint_vel` | 29 | 关节速度 |
-| 7 | `actions` | 29 | 上一帧真正执行的 normalized joint action |
+| 7 | `actions` | 29 | 上一帧真正执行的 normalized joint action；S2 上身是 smooth reference bound、manifold projection、低通滤波之后的结果 |
 | 8 | `anchor_ball_polar` | 3 | pelvis 到球的 `[distance, cos(heading), sin(heading)]` |
 | 9 | `motion_locomotion_polar_cmd` | 3 | `[speed, cos(command_heading), sin(command_heading)]` |
 | 10 | `anchor_ball_velocity_polar_cmd` | 3 | `[ball_xy_speed, cos(delta_heading), sin(delta_heading)]`；静止球为 `[0,0,0]` |
@@ -144,7 +163,7 @@ S1 与 S2 的 Actor、Critic 输入顺序和维度完全一致；本次 reward �
 
 S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作为共享输入存在，以保证 S1 checkpoint 可以直接初始化 S2。
 
-### 4.2 Stage 2 control：21 项
+### 4.2 Stage 2 control：20 项
 
 任务：`Tracking-CG-G1-Dribbling-RNN-control`
 
@@ -164,13 +183,12 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 | 12 | `dribbling_sustained_contact_penalty` | -6.0 | -0.120 | 20-step per-link contact duty EMA；25% 起罚、60% 满罚 |
 | 13 | `dribbling_ball_bounce_penalty` | -3.0 | -0.060 | 接触时球垂直速度绝对值超过 `0.32 m/s` 起罚 |
 | 14 | `dribbling_rapid_retouch_penalty` | -6.0 | -0.120 | 两次右脚 `<=14 N` 触球间隔 `<14 steps` 时惩罚 |
-| 15 | `dribbling_useful_foot_touch` | +5.5 | +0.110 | 5 steps 后综合控制误差下降才奖励；CG 窗口作为软系数 |
+| 15 | `dribbling_useful_foot_touch` | +5.5 | +0.110 | 新轻触立即给 25% 基础分，5 steps 后按控制改善给其余 75%；总 raw 上限不变，CG 窗口作为软系数 |
 | 16 | `dribbling_micro_contact_filter` | -4.0 | -0.080 | 右 ankle force EMA 超过 `22 N` 后连续惩罚，raw 上限 2 |
 | 17 | `dribbling_undesired_contact_penalty` | -12.0 | -0.240 | 右 ankle 以外所有机器人 link 触球均惩罚，包括左脚 |
 | 18 | `dribbling_cg_foot_ball_distance` | +3.5 | +0.070 | 仅在 CG reference foot--ball distance `<=0.55 m` 的接近/触球窗口跟踪，`std=0.22` |
 | 19 | `action_rate_l2` | -0.1 | -0.002 | 对 effective action 做变化率惩罚 |
 | 20 | `joint_limit` | -10.0 | -0.200 | soft joint limit 越界惩罚 |
-| 21 | `upper_body_reference_overflow` | -0.05 | -0.001 | 上肢 reference 超出 action manifold 包络时惩罚 |
 
 球速正预算仍为 `+7.5`，没有比 5.0/06 扩张。区别是 Essay 08 的 `progress +5.0` 和 `velocity +2.5` 已合并为一个 `velocity +7.5`：它同时惩罚过慢、过快和侧向速度，不再存在只要求“至少够快”的单边目标。
 
@@ -185,8 +203,9 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 | `dribbling_gait_foot_tracking` | +1.4 | 删除 | 与常驻 `motion_foot_pos` 重复，而且恰在追球时把策略拉回 demo gait |
 | `dribbling_chase_ball` | +2.0 | 删除并入 pelvis 闭环 | 只奖励绝对 pelvis 前向速度，不能判断是否真正接近运动中的球 |
 | `dribbling_cg_contact_consistency` | +1.0 | 合并进 useful touch | 独立 CG 事件分数不判断触球结果；现在只对物理上有效的触球做 timing 调制 |
+| `upper_body_reference_overflow` | -0.05 | 删除 | 读取 hard clamp 前的 raw overflow，但策略输入是执行后的 action；会持续惩罚 checkpoint 的旧输出却不能提供清晰闭环。现由 smooth tanh bound 直接定义执行语义 |
 
-这些项不是权重设为 0，而是已从 Stage 2 配置及 `rewards_dribbling.py` 的对应旧实现中删除。S2 reward 数量由 28 降为 21。
+这些项不是权重设为 0，而是已从 Stage 2 配置及对应实现中删除。S2 reward 数量由 28 降为 20。
 
 ## 6. Termination
 
@@ -204,18 +223,19 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 | Termination | 条件 |
 |---|---|
 | `time_out` | 10 s，即 500 control steps |
-| `ball_lost` | 50-step grace 后，pelvis--ball XY 距离 `>1.0 m` 或瞬时 XY 速度差 `>2.0 m/s` |
-| `dribbling_no_contact` | 50-step grace 后，仅由右 ankle 接触清零；累计无接触达到 50 时结束。command-change recovery 与近球 recovery 可把计数增量降到 0.25，但都有有限预算 |
+| `ball_lost` | 仅 DRIBBLE：50-step grace 后，pelvis--ball XY 距离 `>1.0 m` 或瞬时 XY 速度差 `>2.0 m/s` |
+| `dribbling_no_contact` | 仅 DRIBBLE：50-step grace 后，任何有效右 ankle 接触直接清零。普通状态 `+1/step`（1 s 到阈值），近球且相对速度可控时 `+0.5/step`（2 s），command-change 且正在 closing 时 `+0.25/step`（4 s）；累计到 50 结束，永不冻结或倒减 |
 | `locomotion_manual_sequence_end` | play 使用 `--locomotion_cmd_reset_on_end` 且手动 command sequence 完成 |
 
-本次没有修改 termination 或 reset。新的 recovery 闭环负责在 termination 之前真正缩短球距，而不是继续放宽失败条件。
+除删除与新 smooth bound 冲突的 `upper_body_reference_overflow`、以及上述 `useful_touch` 局部语义修正外，本次没有重排或整体缩放 reward。`no_contact` 现在要求策略持续做温和触球，但根据物理可控性给予不同时间预算。
 
 ## 7. Reset 与 command 行为
 
 - control step 为 0.02 s；默认 episode 10 s。
-- reset 时 robot 和 ball 一起重置，球位于 pelvis 前方约 `0.45 m`，robot/ball 初始速度清零。
+- reset 时 robot 和 ball 一起重置，robot/ball 初始速度清零；球从实际 randomized pelvis 出发，沿 active command heading 生成，前向距离为 `0.48--0.58 m`、侧向 jitter 为 `±0.08 m`。
 - S2 的 motion clip 作为循环 style phase 使用，clip 结束不会单独重置场景。
-- play 中 episode termination 会清空 RNN hidden state，但保持当前手动 speed/heading segment；`--locomotion_cmd_reset_on_end` 只在完整 sequence 结束时回到 segment 0。
+- play 中任意 episode termination 都会清空 RNN hidden state；普通失败保留当前手动 segment、heading 和剩余 duration，重置后的 robot yaw 与球使用当前有效 heading。只有完整 sequence 的 `reset_on_end` 会回到 segment 0。
+- CLI manual command 安装后会立即同步 robot yaw 和球，因此第一次 rollout 与之后的 reset 使用相同 command frame。
 - command 训练范围保持 speed `0.40--1.50 m/s`、heading `-0.75--0.75 rad`、duration `3--6 s`。
 - 输入与 action 维度不变：Actor 163、Critic 295、Action 29，因此现有 S1/S2 checkpoint 在结构上兼容；本次不需要重训 S1。
 
@@ -242,9 +262,15 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 - `pelvis_recovery_target_velocity_xy`
 - `pelvis_blended_target_velocity_xy`
 - `closed_loop_pelvis_velocity_reward`
+- `no_contact_count`、`no_contact_increment`
 - `useful_touch_new_event`、`useful_touch_evaluated`、`useful_touch_pending`
 - `useful_touch_pre_error`、`useful_touch_current_error`、`useful_touch_improvement`
-- `useful_touch_cg_aligned`、`useful_touch_reward`
+- `useful_touch_cg_aligned`、`useful_touch_base_reward`
+- `useful_touch_improvement_reward`、`useful_touch_reward`
+- `manifold_reference_raw_deviation`
+- `manifold_reference_bounded_deviation`
+- `manifold_reference_post_projection_deviation`
+- `manifold_reference_saturation_fraction`
 
 旧 possession timer 和独立 CG contact-consistency telemetry 已删除，避免把不再参与当前 MDP 的状态误认为有效门控。
 
@@ -259,7 +285,7 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 | 1800-step 实际失败 termination | `<=2` |
 | 右脚接触间隔中位数 | 回到约 `18--24 steps`，同时 `<14 steps` 高频触球受控 |
 | recovery 中 closing speed | 大部分为正，不再出现 chase reward 满分但距离持续增大 |
-| useful touch 成功率 | 随训练上升；触球次数与有效触球必须分开看 |
+| useful touch 改善成功率 | 随训练上升；轻触基础分与延迟改善分必须分开看 |
 | 手臂、腰部参考误差 | 至少保持 06 水平，并继续向 5.0 靠近 |
 
 由于网络结构不变，可以从当前 Essay 08 的 S2 checkpoint warm resume；但 reward 语义发生了实质变化，需要新的 S2 训练适应。推荐保留旧 run 作为只读基线，使用新的 experiment/run 名称，避免混淆 diagnostic。

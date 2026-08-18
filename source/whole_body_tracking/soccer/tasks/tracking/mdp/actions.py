@@ -214,8 +214,14 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         # add a second action constraint.
         self.manifold_nullspace_residual = torch.zeros(self.num_envs, device=self.device)
         self.manifold_latent_clip_fraction = torch.zeros(self.num_envs, device=self.device)
-        self.manifold_reference_overflow = torch.zeros_like(self._filtered_upper_target)
-        self.manifold_reference_clamp_fraction = torch.zeros(self.num_envs, device=self.device)
+        self.manifold_reference_raw_deviation = torch.zeros(self.num_envs, device=self.device)
+        self.manifold_reference_bounded_deviation = torch.zeros(self.num_envs, device=self.device)
+        self.manifold_reference_post_projection_deviation = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.manifold_reference_saturation_fraction = torch.zeros(
+            self.num_envs, device=self.device
+        )
         self.manifold_policy_latent = torch.zeros(self.num_envs, rank, device=self.device)
         self.trunk_pitch_raw_target = torch.full((self.num_envs,), torch.nan, device=self.device)
         self.trunk_pitch_reference_target = torch.full((self.num_envs,), torch.nan, device=self.device)
@@ -410,21 +416,22 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             clipped = None
 
         # The reference envelope remains the physical/style safety guard in
-        # both interfaces.  In direct-latent mode it constrains decoded targets,
-        # not an arbitrary 14-D policy target.
+        # both interfaces.  Use a monotonic smooth bound instead of a hard
+        # clamp: every raw target maps to a distinct bounded target, and the
+        # policy observes the final executed action rather than a permanently
+        # clipped pre-bound request.
+        reference_deviation = upper_raw_target - reference_target
         if reference_margin is None:
             constrained_target = upper_raw_target
-            reference_overflow = torch.zeros_like(upper_raw_target)
+            reference_bounded_deviation = reference_deviation
+            reference_saturated = torch.zeros_like(reference_deviation, dtype=torch.bool)
         else:
-            reference_overflow = torch.clamp(
-                torch.abs(upper_raw_target - reference_target) - reference_margin,
-                min=0.0,
-            )
-            constrained_target = torch.clamp(
-                upper_raw_target,
-                min=reference_target - reference_margin,
-                max=reference_target + reference_margin,
-            )
+            safe_reference_margin = max(float(reference_margin), 1.0e-6)
+            normalized_deviation = reference_deviation / safe_reference_margin
+            bounded_unit_deviation = torch.tanh(normalized_deviation)
+            reference_bounded_deviation = safe_reference_margin * bounded_unit_deviation
+            constrained_target = reference_target + reference_bounded_deviation
+            reference_saturated = torch.abs(bounded_unit_deviation) >= 0.95
 
         if self._use_direct_upper_body_latent:
             filtered_target = torch.clamp(constrained_target, min=soft_limits[..., 0], max=soft_limits[..., 1])
@@ -664,8 +671,16 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         )
         self.manifold_nullspace_residual[:] = nullspace_residual
         self.manifold_latent_clip_fraction[:] = clipped.float().mean(dim=1)
-        self.manifold_reference_overflow[:] = reference_overflow
-        self.manifold_reference_clamp_fraction[:] = (reference_overflow > 0.0).float().mean(dim=1)
+        self.manifold_reference_raw_deviation[:] = torch.mean(
+            torch.abs(reference_deviation), dim=1
+        )
+        self.manifold_reference_bounded_deviation[:] = torch.mean(
+            torch.abs(reference_bounded_deviation), dim=1
+        )
+        self.manifold_reference_post_projection_deviation[:] = torch.mean(
+            torch.abs(filtered_target - reference_target), dim=1
+        )
+        self.manifold_reference_saturation_fraction[:] = reference_saturated.float().mean(dim=1)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         super().reset(env_ids)
@@ -687,6 +702,10 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.trunk_pitch_active_cutoff_frequency_hz[env_ids] = torch.nan
         self.manifold_policy_latent[env_ids] = 0.0
         self.manifold_nullspace_residual[env_ids] = 0.0
+        self.manifold_reference_raw_deviation[env_ids] = 0.0
+        self.manifold_reference_bounded_deviation[env_ids] = 0.0
+        self.manifold_reference_post_projection_deviation[env_ids] = 0.0
+        self.manifold_reference_saturation_fraction[env_ids] = 0.0
         self.effective_raw_actions[env_ids] = 0.0
         self.prev_effective_raw_actions[env_ids] = 0.0
 

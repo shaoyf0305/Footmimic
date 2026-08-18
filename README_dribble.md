@@ -69,7 +69,7 @@ run's `diagnostics/` directory. New archives include:
 - `step_reward`
 - actions, joint tracking, command, ball, contact, manifold, torque, and termination telemetry
 
-The cleaned Control environment records 21 active reward terms. Normal control
+The cleaned Control environment records 20 active reward terms. Normal control
 and ball recovery share one predicted position--velocity state. Inside the
 controllable region the pelvis follows the locomotion command; outside it, a
 smooth recovery gate blends toward the filtered ball velocity plus a bounded
@@ -84,18 +84,36 @@ feet remain in gait tracking, but a left-foot ball touch is an undesired
 contact. No mirrored or additional kick data is required.
 
 Current contact truth uses filtered per-link robot contact with a two-control-step
-sensor hold. There is no reward possession timer. A gentle right-ankle touch is
-rewarded only if the combined predicted-position and ball-velocity error is
-lower five control steps later; the CG contact window is a soft timing
-multiplier on that useful-touch score. Diagnostics record the recovery gate,
-predicted ball position, closing speed, blended pelvis target, useful-touch
-improvement, both contact channels, and the ball's net XY contact force. Net
-force remains telemetry only.
+sensor hold. There is no reward possession timer. A new gentle right-ankle
+touch receives 25% of the useful-touch score immediately; the remaining 75%
+depends on whether combined predicted-position and ball-velocity error is lower
+five control steps later. The two parts still sum to at most the original unit
+raw score, and the CG contact window remains a soft timing multiplier.
+Diagnostics record the base and improvement components separately, together
+with the recovery gate, predicted ball position, closing speed, blended pelvis
+target, both contact channels, and the ball's net XY contact force. Net force
+remains telemetry only.
 
-After an episode termination, playback clears the recurrent policy hidden state
-while leaving the active manual speed/heading segment unchanged. Thus a physical
-scene reset cannot inherit a failed episode's LSTM memory, but command-sequence
-timing retains the continuous-Control behavior used by the v5 baseline.
+After any Control episode termination, playback clears the recurrent policy
+hidden state. An ordinary failure preserves the active manual segment, target
+heading, and remaining duration; only a completed sequence using `reset_on_end`
+restarts from segment one. Robot yaw and the stationary ball are reset in the
+current effective command frame, with the ball at a safe `0.48--0.58 m` forward
+distance. A manual command installed after environment construction performs
+the same robot-and-ball synchronization before the first rollout.
+
+`dribbling_no_contact` is active only during DRIBBLE and always accumulates
+positively without a valid right-ankle contact. Its normal rate is `1.0` per
+control step, reduced to `0.5` while the nearby ball has a similar XY velocity,
+or `0.25` during a command-transition window while the pelvis closes on the
+ball. Any valid right-ankle contact clears it. IDLE and STOP do not accumulate
+this counter, and `ball_lost` is likewise gated to DRIBBLE.
+
+The upper-body reference envelope uses a smooth tanh bound instead of a hard
+clip. The policy still observes the final post-bound, post-manifold, filtered
+29-D effective action. The old pre-bound `upper_body_reference_overflow` reward
+has been deleted; diagnostics now record raw, bounded, and post-projection
+reference deviations plus the tanh saturation fraction.
 
 Use `--diagnostic_stride N` to record every Nth control step.
 

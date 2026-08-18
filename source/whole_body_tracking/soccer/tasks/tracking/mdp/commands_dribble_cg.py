@@ -107,21 +107,32 @@ class DribbleCGMotionCommand(MotionCommand):
 
         return spawn_ball_ahead_env_local(first_anchor, distance, lateral_offset, height)
 
-    def _compute_soccer_ball_positions(self, env_ids: Sequence[int] | torch.Tensor):
+    def _compute_soccer_ball_positions(
+        self,
+        env_ids: Sequence[int] | torch.Tensor,
+        anchor_pos_override: torch.Tensor | None = None,
+    ) -> None:
         ids = self._to_env_id_tensor(env_ids)
         if ids.numel() == 0:
             return
+        if anchor_pos_override is not None and anchor_pos_override.shape[0] != ids.numel():
+            raise ValueError(
+                "anchor_pos_override must contain one position for each requested environment."
+            )
 
         has_demo = self._should_snap_demo_ball(ids)
         demo_ids = ids[has_demo]
         fallback_ids = ids[~has_demo]
+        fallback_anchor = None if anchor_pos_override is None else anchor_pos_override[~has_demo]
 
         if fallback_ids.numel() > 0:
-            fallback_mode = str(getattr(self.cfg, "dribble_cg_fallback_ball_mode", "arc_endpoint")).lower().strip()
-            if fallback_mode == "front":
-                self.soccer_ball_pos[fallback_ids] = self._front_ball_positions(fallback_ids)
-            else:
-                super()._compute_soccer_ball_positions(fallback_ids)
+            # No-demo environments use the canonical base spawn configuration.
+            # Active Control therefore inherits the randomized pelvis,
+            # configured distance/jitter, and active command heading.
+            super()._compute_soccer_ball_positions(
+                fallback_ids,
+                anchor_pos_override=fallback_anchor,
+            )
         if demo_ids.numel() > 0:
             # Spawn on task +X; per-step demo snap (_sync_demo_ball_after_step) may still move the ball.
             self.soccer_ball_pos[demo_ids] = self._front_ball_positions(demo_ids)
@@ -178,7 +189,6 @@ class DribbleCGMotionCommandCfg(MotionCommandCfg):
     dribble_cg_snap_mode: str = "full"
     dribble_cg_use_demo_ball: bool = True
     dribble_cg_use_task_frame: bool = True
-    dribble_cg_fallback_ball_mode: str = "arc_endpoint"
     dribble_cg_front_ball_distance: float = 0.45
     dribble_cg_front_ball_lateral_offset: float = 0.0
     dribble_cg_front_ball_height: float = 0.11

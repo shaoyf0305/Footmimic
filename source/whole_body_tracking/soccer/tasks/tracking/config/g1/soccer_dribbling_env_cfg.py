@@ -70,14 +70,20 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
         self.commands.motion.mimic_align_task_frame = True
         self.commands.motion.mimic_align_locomotion_heading = True
         self.commands.motion.motion_clip_end_resample = False
+        # Reset into a collision-safe command-aligned scene.  The previous
+        # inherited +/-0.25 m radius range could place a ground ball inside a
+        # randomized leg pose, and a failure during a turn respawned the ball
+        # along task +X instead of the active command heading.
+        self.commands.motion.soccer_ball_start_ahead_distance = 0.53
+        self.commands.motion.soccer_ball_spawn_align_locomotion_heading = True
+        self.commands.motion.reset_face_locomotion_heading = True
         self.commands.motion.curve_offset_range = {
-            "radius": (-0.25, 0.25),
-            "lateral_spawn_jitter": 0.12,
+            "radius": (-0.05, 0.05),
+            "lateral_spawn_jitter": 0.08,
             "height": SOCCER_BALL_RADIUS,
         }
         setattr(self.commands.motion, "dribble_cg_use_demo_ball", False)
         setattr(self.commands.motion, "dribble_cg_use_task_frame", True)
-        setattr(self.commands.motion, "dribble_cg_fallback_ball_mode", "front")
         setattr(self.commands.motion, "dribble_cg_front_ball_distance", 0.45)
         setattr(self.commands.motion, "dribble_cg_front_ball_lateral_offset", 0.0)
         setattr(self.commands.motion, "dribble_cg_front_ball_height", SOCCER_BALL_RADIUS)
@@ -261,6 +267,9 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "all_body_cfg": contact_body_cfg,
                 "num_ankle_links": num_ankle_links,
                 "evaluation_delay_steps": 5,
+                # Give a neutral gentle touch immediate credit while reserving
+                # most of the unchanged unit score budget for better control.
+                "base_touch_score": 0.25,
                 "improvement_scale": 0.50,
                 "contact_window_tolerance_steps": 2,
                 "off_window_reward_scale": 0.35,
@@ -308,6 +317,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "max_distance": 1.0,
                 "max_vel_divergence": 2.0,
                 "grace_steps": 50,
+                "active_task_states": (mdp.TASK_STATE_DRIBBLE,),
             },
         )
         self.terminations.dribbling_no_contact = DoneTerm(
@@ -316,16 +326,18 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "ball_sensor_name": "soccer_ball_contact",
                 "contact_force_threshold": 1.0,
                 "contact_body_names": ("right_ankle_roll_link",),
+                "active_task_states": (mdp.TASK_STATE_DRIBBLE,),
                 "grace_steps": 50,
                 "max_steps_without_contact": 50,
                 "recovery_window_steps": 75,
                 "recovery_max_distance": 0.85,
                 "recovery_min_closing_speed": 0.05,
                 "recovery_counter_increment": 0.25,
-                "proximity_recovery_max_steps": 30,
-                "proximity_recovery_max_distance": 0.65,
-                "proximity_recovery_max_relative_speed": 0.8,
-                "proximity_recovery_counter_increment": 0.25,
+                # A controllable ball gets two seconds to make a light touch;
+                # the counter still grows and can never be restored by coasting.
+                "proximity_recovery_max_distance": 0.75,
+                "proximity_recovery_max_relative_speed": 0.9,
+                "proximity_recovery_counter_increment": 0.5,
             },
         )
         self.terminations.locomotion_manual_sequence_end = DoneTerm(
@@ -356,8 +368,3 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
 
         self.rewards.action_rate_l2.func = mdp.effective_action_rate_l2_clip
         self.rewards.action_rate_l2.params = {"action_name": "joint_pos"}
-        self.rewards.upper_body_reference_overflow = RewTerm(
-            func=mdp.upper_body_reference_overflow_penalty,
-            weight=-0.05,
-            params={"action_name": "joint_pos"},
-        )

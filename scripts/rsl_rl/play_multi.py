@@ -835,6 +835,8 @@ def _create_diagnostic(
         "useful_touch_current_error": [],
         "useful_touch_improvement": [],
         "useful_touch_cg_aligned": [],
+        "useful_touch_base_reward": [],
+        "useful_touch_improvement_reward": [],
         "useful_touch_reward": [],
         "ball_xy_speed": [],
         "ball_command_forward_speed": [],
@@ -867,6 +869,7 @@ def _create_diagnostic(
         "no_contact_task_active": [],
         "no_contact_recovery_active": [],
         "no_contact_proximity_recovery_active": [],
+        "no_contact_increment": [],
         "no_contact_relative_speed": [],
         "idle_active": [],
         "idle_pelvis_speed": [],
@@ -891,8 +894,10 @@ def _create_diagnostic(
         "manifold_projection_error_after_reference_constraint": [],
         "manifold_nullspace_residual": [],
         "manifold_latent_clip_fraction": [],
-        "manifold_reference_overflow": [],
-        "manifold_reference_clamp_fraction": [],
+        "manifold_reference_raw_deviation": [],
+        "manifold_reference_bounded_deviation": [],
+        "manifold_reference_post_projection_deviation": [],
+        "manifold_reference_saturation_fraction": [],
         "trunk_pitch_raw_target": [],
         "trunk_pitch_reference_target": [],
         "trunk_pitch_soft_target": [],
@@ -1218,6 +1223,13 @@ def _append_diagnostic(
         "useful_touch_improvement", "_dribbling_useful_touch_improvement"
     )
     _append_bool_attr("useful_touch_cg_aligned", "_dribbling_useful_touch_cg_aligned")
+    _append_scalar_attr(
+        "useful_touch_base_reward", "_dribbling_useful_touch_base_reward"
+    )
+    _append_scalar_attr(
+        "useful_touch_improvement_reward",
+        "_dribbling_useful_touch_improvement_reward",
+    )
     _append_scalar_attr("useful_touch_reward", "_dribbling_useful_touch_reward")
     foot_ref_ids = [command.cfg.body_names.index(name) for name in _FOOT_DIAGNOSTIC_BODY_NAMES]
     foot_error = torch.norm(
@@ -1244,6 +1256,10 @@ def _append_diagnostic(
     proximity_recovery = getattr(base_env, "_dribbling_no_contact_proximity_recovery_active", None)
     diagnostic["no_contact_proximity_recovery_active"].append(
         False if proximity_recovery is None else bool(proximity_recovery[0].item())
+    )
+    no_contact_increment = getattr(base_env, "_dribbling_no_contact_increment", None)
+    diagnostic["no_contact_increment"].append(
+        np.nan if no_contact_increment is None else float(no_contact_increment[0].item())
     )
     relative_speed = getattr(base_env, "_dribbling_no_contact_relative_speed", None)
     diagnostic["no_contact_relative_speed"].append(
@@ -1314,11 +1330,17 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
     diagnostic["manifold_latent_clip_fraction"].append(
         float(_env0("manifold_latent_clip_fraction", ()).item())
     )
-    diagnostic["manifold_reference_overflow"].append(
-        _env0("manifold_reference_overflow", (upper_dim,))
+    diagnostic["manifold_reference_raw_deviation"].append(
+        float(_env0("manifold_reference_raw_deviation", ()).item())
     )
-    diagnostic["manifold_reference_clamp_fraction"].append(
-        float(_env0("manifold_reference_clamp_fraction", ()).item())
+    diagnostic["manifold_reference_bounded_deviation"].append(
+        float(_env0("manifold_reference_bounded_deviation", ()).item())
+    )
+    diagnostic["manifold_reference_post_projection_deviation"].append(
+        float(_env0("manifold_reference_post_projection_deviation", ()).item())
+    )
+    diagnostic["manifold_reference_saturation_fraction"].append(
+        float(_env0("manifold_reference_saturation_fraction", ()).item())
     )
     diagnostic["trunk_pitch_raw_target"].append(
         float(_env0("trunk_pitch_raw_target", ()).item())
@@ -1510,12 +1532,21 @@ def _save_diagnostic(diagnostic: dict) -> None:
     useful_touch_eval_mask = arrays["useful_touch_evaluated"].astype(bool)
     useful_touch_evaluations = int(np.count_nonzero(useful_touch_eval_mask))
     useful_touch_success_rate = (
-        float(np.mean(arrays["useful_touch_reward"][useful_touch_eval_mask] > 0.0))
+        float(
+            np.mean(
+                arrays["useful_touch_improvement_reward"][useful_touch_eval_mask]
+                > 0.0
+            )
+        )
         if useful_touch_evaluations else np.nan
     )
     useful_touch_improvement = (
         float(np.mean(arrays["useful_touch_improvement"][useful_touch_eval_mask]))
         if useful_touch_evaluations else np.nan
+    )
+    useful_touch_base_score_sum = float(np.nansum(arrays["useful_touch_base_reward"]))
+    useful_touch_improvement_score_sum = float(
+        np.nansum(arrays["useful_touch_improvement_reward"])
     )
     useful_event_mask = arrays["useful_touch_new_event"].astype(bool)
     useful_touch_cg_alignment = (
@@ -1609,6 +1640,16 @@ def _save_diagnostic(diagnostic: dict) -> None:
     projection_error = float(np.mean(finite_projection)) if finite_projection.size else np.nan
     nullspace_residual = float(np.mean(finite_nullspace)) if finite_nullspace.size else np.nan
     latent_clip = float(np.mean(finite_clip)) if finite_clip.size else np.nan
+    reference_raw_deviation = float(np.nanmean(arrays["manifold_reference_raw_deviation"]))
+    reference_bounded_deviation = float(
+        np.nanmean(arrays["manifold_reference_bounded_deviation"])
+    )
+    reference_post_projection_deviation = float(
+        np.nanmean(arrays["manifold_reference_post_projection_deviation"])
+    )
+    reference_saturation = float(
+        np.nanmean(arrays["manifold_reference_saturation_fraction"])
+    )
     term_reasons = arrays["termination_reason"][arrays["termination_reason"] != ""]
     unique_reasons, reason_counts = np.unique(term_reasons, return_counts=True)
     reason_summary = ", ".join(f"{name}={count}" for name, count in zip(unique_reasons, reason_counts)) or "none"
@@ -1625,6 +1666,8 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"useful_touches={useful_touch_events}/{useful_touch_evaluations}  "
         f"useful_success={useful_touch_success_rate:.3f}  "
         f"useful_improvement={useful_touch_improvement:.3f}  "
+        f"touch_base_raw_sum={useful_touch_base_score_sum:.3f}  "
+        f"touch_improve_raw_sum={useful_touch_improvement_score_sum:.3f}  "
         f"touch_cg_alignment={useful_touch_cg_alignment:.3f}  "
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
         f"ball_speed_mae={ball_speed_error:.3f} m/s  "
@@ -1642,6 +1685,10 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"torso_rel_tilt_err={torso_rel_tilt_error:.3f} rad  "
         f"torso_rel_ang_vel={torso_rel_ang_vel:.3f} rad/s  manifold_projection={projection_error:.3f} rad  "
         f"manifold_nullspace={nullspace_residual:.3f} rad  "
+        f"reference_raw_dev={reference_raw_deviation:.3f} rad  "
+        f"reference_bounded_dev={reference_bounded_deviation:.3f} rad  "
+        f"reference_post_dev={reference_post_projection_deviation:.3f} rad  "
+        f"reference_saturation={reference_saturation:.3f}  "
         f"waist_target_err={trunk_target_error:.3f} rad  "
         f"waist_target_ref_offset={trunk_target_reference_offset:.3f} rad  "
         f"waist_pitch_filter_delta={trunk_pitch_filter_delta:.3f} rad  "
@@ -1976,10 +2023,12 @@ def _get_play_overlay(env) -> str:
             closing = float(base_env._dribbling_no_contact_closing_speed[i].item())
             relative_speed_tensor = getattr(base_env, "_dribbling_no_contact_relative_speed", None)
             relative_speed = 0.0 if relative_speed_tensor is None else float(relative_speed_tensor[i].item())
+            increment_tensor = getattr(base_env, "_dribbling_no_contact_increment", None)
+            increment = 0.0 if increment_tensor is None else float(increment_tensor[i].item())
             recovery = "CMD" if command_recovery else "PROX" if proximity_recovery else "NO"
             lines.append(
                 f"No-contact: count={no_contact_count:5.1f}"
-                f"  recovery={recovery}"
+                f"  recovery={recovery}  increment={increment:.2f}"
                 f"  closing={closing:+.2f} m/s  relative={relative_speed:.2f} m/s"
             )
 
@@ -2123,7 +2172,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
 
-    _apply_play_locomotion_command(env, args_cli)
+    manual_locomotion_applied = _apply_play_locomotion_command(env, args_cli)
+    if manual_locomotion_applied:
+        base_env = _resolve_base_env(env)
+        motion_command = base_env.command_manager.get_term("motion")
+        reset_scene = getattr(motion_command, "reset_scene_for_locomotion_command", None)
+        if callable(reset_scene):
+            reset_scene()
+            print("[INFO] Robot yaw and soccer ball aligned with the active command frame.")
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)

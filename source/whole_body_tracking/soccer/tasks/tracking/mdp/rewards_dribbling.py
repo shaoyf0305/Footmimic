@@ -240,6 +240,8 @@ def soccer_ball_robot_contact(
     if (
         not isinstance(state, dict)
         or not isinstance(state.get("last_step"), torch.Tensor)
+        or not isinstance(state.get("base_reward"), torch.Tensor)
+        or not isinstance(state.get("improvement_reward"), torch.Tensor)
         or state["last_step"].shape[0] != env.num_envs
     ):
         state = {
@@ -1046,6 +1048,7 @@ def dribbling_useful_foot_touch(
     all_body_cfg: SceneEntityCfg | None = None,
     num_ankle_links: int = 2,
     evaluation_delay_steps: int = 5,
+    base_touch_score: float = 0.25,
     improvement_scale: float = 0.50,
     contact_window_tolerance_steps: int = 2,
     off_window_reward_scale: float = 0.35,
@@ -1064,16 +1067,21 @@ def dribbling_useful_foot_touch(
     max_recovery_target_speed: float = 2.20,
     velocity_ema_window_steps: int = 10,
 ) -> torch.Tensor:
-    """Reward a gentle right-foot touch only when it improves ball control.
+    """Reward a gentle right-foot touch, with an extra control-improvement bonus.
 
     A new touch stores the position--velocity error from the preceding control
-    step.  After a short impact-settling delay, reward is proportional to the
-    decrease in that error.  This removes the old incentive to touch merely to
-    collect an event bonus.  CG timing is retained as a soft style multiplier,
-    not as a separate reward that can dominate physical usefulness.
+    step and immediately receives ``base_touch_score``.  After a short
+    impact-settling delay, the remaining score budget is proportional to the
+    decrease in that error.  A neutral light touch is therefore valid and
+    rewarded, while a touch that improves control still receives the full
+    score.  The base and improvement components sum to at most one per touch,
+    so this does not expand the term's original maximum reward budget.  CG
+    timing remains a soft style multiplier, not a separate reward.
     """
     if evaluation_delay_steps <= 0 or improvement_scale <= 0.0:
         raise ValueError("touch delay and improvement scale must be positive.")
+    if not 0.0 <= base_touch_score <= 1.0:
+        raise ValueError("base_touch_score must be in [0, 1].")
     if not 0.0 <= off_window_reward_scale <= 1.0:
         raise ValueError("off_window_reward_scale must be in [0, 1].")
     if touch_speed_error_std <= 0.0 or touch_lateral_speed_std <= 0.0:
@@ -1146,6 +1154,8 @@ def dribbling_useful_foot_touch(
             "pre_error": control_error.detach().clone(),
             "last_error": control_error.detach().clone(),
             "event_scale": torch.ones_like(control_error),
+            "base_reward": torch.zeros_like(control_error),
+            "improvement_reward": torch.zeros_like(control_error),
             "reward": torch.zeros_like(control_error),
         }
 
@@ -1154,10 +1164,23 @@ def dribbling_useful_foot_touch(
     new_touch = touch & ~state["previous_touch"] & active & ~reset_mask
     matured = state["pending"] & (state["remaining"] <= 1) & ~reset_mask
     improvement = torch.relu(state["pre_error"] - control_error)
-    candidate_reward = (
-        torch.clamp(improvement / float(improvement_scale), max=1.0)
+    immediate_base_reward = (
+        float(base_touch_score)
+        * event_scale
+        * new_touch.to(control_error.dtype)
+    )
+    delayed_improvement_reward = (
+        (1.0 - float(base_touch_score))
+        * torch.clamp(improvement / float(improvement_scale), max=1.0)
         * state["event_scale"]
         * matured.to(control_error.dtype)
+    )
+    candidate_reward = immediate_base_reward + delayed_improvement_reward
+    base_reward = torch.where(update_mask, immediate_base_reward, state["base_reward"])
+    improvement_reward = torch.where(
+        update_mask,
+        delayed_improvement_reward,
+        state["improvement_reward"],
     )
     reward = torch.where(update_mask, candidate_reward, state["reward"])
 
@@ -1180,6 +1203,12 @@ def dribbling_useful_foot_touch(
     next_remaining = torch.where(reset_mask, torch.zeros_like(next_remaining), next_remaining)
     next_pre_error = torch.where(reset_mask, control_error, next_pre_error)
     next_event_scale = torch.where(reset_mask, torch.ones_like(next_event_scale), next_event_scale)
+    base_reward = torch.where(reset_mask, torch.zeros_like(base_reward), base_reward)
+    improvement_reward = torch.where(
+        reset_mask,
+        torch.zeros_like(improvement_reward),
+        improvement_reward,
+    )
     reward = torch.where(reset_mask, torch.zeros_like(reward), reward)
 
     state["last_step"] = torch.where(update_mask, step_buf, state["last_step"])
@@ -1189,6 +1218,8 @@ def dribbling_useful_foot_touch(
     state["pre_error"] = torch.where(update_mask, next_pre_error, state["pre_error"])
     state["last_error"] = torch.where(update_mask, control_error, state["last_error"])
     state["event_scale"] = torch.where(update_mask, next_event_scale, state["event_scale"])
+    state["base_reward"] = base_reward.detach().clone()
+    state["improvement_reward"] = improvement_reward.detach().clone()
     state["reward"] = reward.detach().clone()
     setattr(env, state_name, state)
 
@@ -1200,6 +1231,8 @@ def dribbling_useful_foot_touch(
     setattr(env, "_dribbling_useful_touch_current_error", control_error)
     setattr(env, "_dribbling_useful_touch_improvement", improvement)
     setattr(env, "_dribbling_useful_touch_cg_aligned", cg_aligned)
+    setattr(env, "_dribbling_useful_touch_base_reward", base_reward)
+    setattr(env, "_dribbling_useful_touch_improvement_reward", improvement_reward)
     setattr(env, "_dribbling_useful_touch_reward", reward)
     return reward
 

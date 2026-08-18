@@ -957,13 +957,11 @@ class MotionCommand(CommandTerm):
         self._locomotion_segment_idx[env_id] = seg_idx
 
     def _restart_locomotion_segment_plans(self, env_ids: torch.Tensor | Sequence[int]) -> None:
-        """Restart manual command plans after an environment reset.
+        """Restart manual command plans after an explicit sequence-end reset.
 
-        A reset intentionally clears ``_locomotion_cmd_initialized`` so its
-        first command is immediate.  Manual multi-segment playback must then
-        write segment zero straight away; otherwise the global segment clock
-        resumes in the middle of its old plan and the next transition is
-        mistaken for a new episode's initial command.
+        Ordinary failures preserve the active segment and its remaining time.
+        Only a completed plan configured with ``reset_on_end`` reaches this
+        path and writes segment zero as the new command.
         """
         env_ids_t = self._to_env_id_tensor(env_ids)
         for env_id in env_ids_t.tolist():
@@ -1511,25 +1509,51 @@ class MotionCommand(CommandTerm):
         )
         self.style_phase_wrap_count[ids] += 1
 
-    def _spawn_ball_at_motion_start(self, env_ids: torch.Tensor) -> None:
-        """Place the ball a fixed distance ahead of the clip's frame-0 anchor (+X)."""
+    def _spawn_ball_at_motion_start(
+        self,
+        env_ids: torch.Tensor,
+        anchor_pos_override: torch.Tensor | None = None,
+    ) -> None:
+        """Place the ball ahead of the reset pelvis in the configured control frame."""
         lateral_jitter = float(self._target_lateral_spawn_jitter)
         distance = float(getattr(self.cfg, "soccer_ball_start_ahead_distance", 0.45))
         lateral_offset = float(getattr(self.cfg, "soccer_ball_start_ahead_lateral", 0.0))
         base_height = float(self._target_height)
+        align_locomotion_heading = bool(
+            getattr(self.cfg, "soccer_ball_spawn_align_locomotion_heading", False)
+        )
 
-        for env_id in env_ids:
-            motion_idx = int(self.motion_idx[env_id].item())
-            first_anchor = self.motion.get_first_frame_anchor_pos(motion_idx, self.motion_anchor_body_index)
-            ball_pos = spawn_ball_ahead_env_local(
-                first_anchor,
-                distance + float(self.curve_radius_offset[env_id]),
-                lateral_offset,
-                base_height,
-            )
+        for local_idx, env_id in enumerate(env_ids):
+            if anchor_pos_override is None:
+                motion_idx = int(self.motion_idx[env_id].item())
+                first_anchor = self.motion.get_first_frame_anchor_pos(
+                    motion_idx, self.motion_anchor_body_index
+                )
+            else:
+                first_anchor = anchor_pos_override[local_idx]
+            sampled_lateral_offset = lateral_offset
             if lateral_jitter > 0.0:
                 y_off = sample_uniform(-lateral_jitter, lateral_jitter, (1,), device=self.device).squeeze(0)
-                ball_pos[1] = ball_pos[1] + y_off
+                sampled_lateral_offset += float(y_off)
+            sampled_distance = distance + float(self.curve_radius_offset[env_id])
+            if align_locomotion_heading:
+                heading = self.locomotion_cmd_heading[env_id]
+                forward = torch.stack((torch.cos(heading), torch.sin(heading)))
+                lateral = torch.stack((-torch.sin(heading), torch.cos(heading)))
+                ball_pos = self.soccer_ball_pos.new_empty(3)
+                ball_pos[:2] = (
+                    first_anchor[:2]
+                    + sampled_distance * forward
+                    + sampled_lateral_offset * lateral
+                )
+                ball_pos[2] = base_height
+            else:
+                ball_pos = spawn_ball_ahead_env_local(
+                    first_anchor,
+                    sampled_distance,
+                    sampled_lateral_offset,
+                    base_height,
+                )
             self.soccer_ball_pos[env_id] = ball_pos
 
     def _spawn_ball_at_paid_original_location(self, env_ids: torch.Tensor) -> None:
@@ -1576,7 +1600,11 @@ class MotionCommand(CommandTerm):
             ball_pos[2] = base_height
             self.soccer_ball_pos[env_id] = ball_pos
 
-    def _compute_soccer_ball_positions(self, env_ids: Sequence[int] | torch.Tensor):
+    def _compute_soccer_ball_positions(
+        self,
+        env_ids: Sequence[int] | torch.Tensor,
+        anchor_pos_override: torch.Tensor | None = None,
+    ):
         if isinstance(env_ids, torch.Tensor):
             ids = env_ids.to(self.device, dtype=torch.long)
         else:
@@ -1587,7 +1615,7 @@ class MotionCommand(CommandTerm):
 
         spawn_mode = str(getattr(self.cfg, "soccer_ball_spawn_mode", "clip_displacement")).lower().strip()
         if spawn_mode in {"start", "start_ahead", "motion_start"}:
-            self._spawn_ball_at_motion_start(ids)
+            self._spawn_ball_at_motion_start(ids, anchor_pos_override=anchor_pos_override)
             return
         if spawn_mode in {"paid_original", "original"}:
             self._spawn_ball_at_paid_original_location(ids)
@@ -1695,6 +1723,47 @@ class MotionCommand(CommandTerm):
         ball_state = torch.cat([ball_pos, ball_quat, ball_lin_vel, ball_ang_vel], dim=-1)
         self.soccer_ball.write_root_state_to_sim(ball_state, env_ids=ids)
 
+    def reset_scene_for_locomotion_command(
+        self,
+        env_ids: Sequence[int] | torch.Tensor | None = None,
+    ) -> None:
+        """Align the initial robot and ball scene with the installed manual command.
+
+        Playback installs a manual command after the environment's initial reset.
+        Synchronizing both root yaw and ball placement prevents that initial scene
+        from retaining the previous resampled command frame.
+        """
+        ids = (
+            torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+            if env_ids is None
+            else self._to_env_id_tensor(env_ids)
+        )
+        if ids.numel() == 0:
+            return
+        env_origins = getattr(self._env.scene, "env_origins", None)
+        if env_origins is None:
+            return
+
+        root_pos = self.robot.data.root_pos_w[ids].clone()
+        root_ori = self.robot.data.root_quat_w[ids].clone()
+        root_ori = align_body_quat_yaw_to_task_forward(root_ori)
+        heading = self.locomotion_cmd_heading[ids]
+        zeros = torch.zeros_like(heading)
+        heading_quat = quat_from_euler_xyz(zeros, zeros, heading)
+        root_ori = quat_mul(heading_quat, root_ori)
+        root_lin_vel = torch.zeros_like(self.robot.data.root_lin_vel_w[ids])
+        root_ang_vel = torch.zeros_like(self.robot.data.root_ang_vel_w[ids])
+        self.robot.write_root_state_to_sim(
+            torch.cat((root_pos, root_ori, root_lin_vel, root_ang_vel), dim=-1),
+            env_ids=ids,
+        )
+
+        pelvis_pos_local = root_pos - env_origins[ids]
+        self._sample_soccer_offset(ids)
+        self._compute_soccer_ball_positions(ids, anchor_pos_override=pelvis_pos_local)
+        self._update_soccer_ball(ids)
+        self._update_target_points(ids)
+
     def _resample_command(self, env_ids: Sequence[int]):
         if len(env_ids) == 0:
             return
@@ -1703,20 +1772,12 @@ class MotionCommand(CommandTerm):
         if env_ids.numel() == 0:
             return
 
-        # Legacy manual diagnostics deliberately keep one global timeline
-        # across ordinary failure resets.  There are two explicit exceptions:
-        # stateful start/dribble/stop control restarts every reset, while a
-        # manual sequence with ``reset_on_end`` restarts only after its final
-        # segment deliberately requested this reset.
+        # Ordinary failures keep the active manual segment and remaining hold
+        # time.  Only ``reset_on_end`` deliberately restarts a completed plan.
         manual_restart_env_ids = env_ids.new_empty((0,), dtype=torch.long)
         if self._locomotion_command_mode == "manual":
-            restart_every_manual_reset = bool(
-                getattr(self.cfg, "locomotion_task_state_restart_manual_sequence_on_reset", False)
-            )
             sequence_finished = self._locomotion_sequence_finished[env_ids].clone()
-            if restart_every_manual_reset:
-                manual_restart_env_ids = env_ids
-            elif self._locomotion_segment_reset_on_end:
+            if self._locomotion_segment_reset_on_end:
                 manual_restart_env_ids = env_ids[sequence_finished]
 
         if self._locomotion_command_mode != "manual":
@@ -1740,9 +1801,14 @@ class MotionCommand(CommandTerm):
             self._sequential_sampling(env_ids)
         else:
             raise ValueError(f"Unsupported sampling_strategy: {self.cfg.sampling_strategy}")
-        self._compute_soccer_ball_positions(env_ids)
-        self._update_soccer_ball(env_ids)
-        self._update_target_points(env_ids)
+
+        # Resolve the new command before placing the ball.  Otherwise a reset
+        # can spawn the ball for the previous turn and only then switch the
+        # policy to segment zero / a newly sampled heading.
+        if self._locomotion_command_mode == "resampled":
+            self._sample_locomotion_commands(env_ids, reset_task_sequence=True)
+        elif manual_restart_env_ids.numel() > 0:
+            self._restart_locomotion_segment_plans(manual_restart_env_ids)
         
         # Sample blind-zone min/max thresholds and reset blind-zone state.
         blind_min_low, blind_min_high = self.cfg.blind_distance_min_range
@@ -1763,7 +1829,13 @@ class MotionCommand(CommandTerm):
         root_pos[env_ids] += rand_samples[:, 0:3]
         orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
         root_ori[env_ids] = quat_mul(orientations_delta, root_ori[env_ids])
-        if bool(getattr(self.cfg, "reset_face_task_forward", False)):
+        if bool(getattr(self.cfg, "reset_face_locomotion_heading", False)):
+            task_facing_root_ori = align_body_quat_yaw_to_task_forward(root_ori[env_ids])
+            heading = self.locomotion_cmd_heading[env_ids]
+            zeros = torch.zeros_like(heading)
+            heading_quat = quat_from_euler_xyz(zeros, zeros, heading)
+            root_ori[env_ids] = quat_mul(heading_quat, task_facing_root_ori)
+        elif bool(getattr(self.cfg, "reset_face_task_forward", False)):
             root_ori[env_ids] = align_body_quat_yaw_to_task_forward(root_ori[env_ids])
 
         range_list = [self.cfg.velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
@@ -1785,6 +1857,21 @@ class MotionCommand(CommandTerm):
         joint_pos[env_ids] = torch.clip(
             joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
         )
+
+        # Spawn from the actual randomized reset pelvis rather than the
+        # unperturbed reference anchor.  The Control task can additionally
+        # rotate this offset into the active locomotion heading.
+        env_origins = getattr(self._env.scene, "env_origins", None)
+        reset_anchor_local = None
+        if env_origins is not None:
+            reset_anchor_local = root_pos[env_ids] - env_origins[env_ids]
+        self._compute_soccer_ball_positions(
+            env_ids,
+            anchor_pos_override=reset_anchor_local,
+        )
+        self._update_soccer_ball(env_ids)
+        self._update_target_points(env_ids)
+
         self.robot.write_joint_state_to_sim(joint_pos[env_ids], joint_vel[env_ids], env_ids=env_ids)
         self.robot.write_root_state_to_sim(
             torch.cat([root_pos[env_ids], root_ori[env_ids], root_lin_vel[env_ids], root_ang_vel[env_ids]], dim=-1),
@@ -1801,10 +1888,6 @@ class MotionCommand(CommandTerm):
         resample_flags[env_ids] = True
         setattr(self._env, flag_name, resample_flags)
         self._steps_since_resample[env_ids] = 0
-        if self._locomotion_command_mode == "resampled":
-            self._sample_locomotion_commands(env_ids, reset_task_sequence=True)
-        elif manual_restart_env_ids.numel() > 0:
-            self._restart_locomotion_segment_plans(manual_restart_env_ids)
 
     # Called every step in the IsaacLab main loop.
     def _update_command(self):
@@ -1939,7 +2022,6 @@ class MotionCommandCfg(CommandTermCfg):
     locomotion_task_state_enabled: bool = False
     locomotion_task_state_sequence: tuple[str | int, ...] = ("dribble",)
     locomotion_task_state_stationary_speed: float = 0.05
-    locomotion_task_state_restart_manual_sequence_on_reset: bool = False
     locomotion_task_idle_duration_range: tuple[float, float] = (1.0, 2.0)
     locomotion_task_dribble_duration_range: tuple[float, float] = (1.5, 3.0)
     locomotion_task_stop_duration_range: tuple[float, float] = (1.0, 2.0)
@@ -1978,9 +2060,13 @@ class MotionCommandCfg(CommandTermCfg):
     soccer_ball_spawn_mode: str = "clip_displacement"
     soccer_ball_start_ahead_distance: float = 0.45
     soccer_ball_start_ahead_lateral: float = 0.0
+    soccer_ball_spawn_align_locomotion_heading: bool = False
 
     # Reset pose: face task +X and drop reference velocities (reduces frame-0 ee_body_pos fails).
     reset_face_task_forward: bool = False
+    # Control-only reset: preserve roll/pitch but align root yaw with the
+    # currently effective locomotion heading.  Takes precedence over +X.
+    reset_face_locomotion_heading: bool = False
     reset_zero_velocity: bool = False
 
     pose_range: dict[str, tuple[float, float]] = {}
