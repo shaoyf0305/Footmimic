@@ -109,6 +109,25 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
         )
         num_ankle_links = len(legal_ankles)
 
+        # One physical position--velocity state drives normal control and
+        # recovery.  Keep these parameters identical for every closed-loop
+        # reward so the cached recovery gate is evaluated exactly once per
+        # control step.
+        closed_loop_params = {
+            "desired_forward_offset": 0.45,
+            "prediction_horizon": 0.20,
+            "position_forward_std": 0.22,
+            "position_lateral_std": 0.18,
+            "recovery_forward_half_width": 0.16,
+            "recovery_lateral_half_width": 0.12,
+            "recovery_transition_width": 0.16,
+            "recovery_gate_filter_steps": 4,
+            "position_correction_gain": 1.5,
+            "max_position_correction_speed": 0.45,
+            "max_recovery_target_speed": 2.20,
+            "velocity_ema_window_steps": 10,
+        }
+
         # Stage-2 keeps position style only; its orientation contribution was 0.17%.
         self.rewards.motion_body_ori = None
         self.rewards.motion_body_pos = RewTerm(
@@ -135,9 +154,9 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             params={"threshold": 0.24, "std": 0.5, "foot_cfg": foot_cfg},
         )
         self.rewards.motion_anchor_lin_vel = RewTerm(
-            func=mdp.motion_anchor_lin_vel_tracking_exp,
+            func=mdp.dribbling_closed_loop_pelvis_velocity_tracking_exp,
             weight=5.0,
-            params={"command_name": "motion", "std": 0.8},
+            params={"command_name": "motion", "std": 0.8, **closed_loop_params},
         )
         self.rewards.motion_anchor_ang_vel = RewTerm(
             func=mdp.motion_anchor_ang_vel_tracking_exp,
@@ -154,25 +173,12 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             weight=1.0,
             params={"command_name": "motion", "std": 0.45, "min_command_speed": 0.25},
         )
-        self.rewards.dribbling_face_ball = RewTerm(
-            func=mdp.dribbling_command_face_ball,
-            weight=1.0,
-            params={"command_name": "motion", "min_distance": 0.05},
-        )
         self.rewards.dribbling_dynamic_proximity = RewTerm(
             func=mdp.dribbling_command_dynamic_proximity,
             weight=3.0,
             params={
                 "command_name": "motion",
-                "near_dist": 0.28,
-                "far_dist": 0.72,
-                "penalty_std": 0.15,
-                "pelvis_speed_min": 0.35,
-                "ball_sensor_name": "soccer_ball_contact",
-                "contact_force_threshold": 1.0,
-                "no_contact_zone_damping": 0.12,
-                "zone_lateral_abs_max": 0.14,
-                "possession_window_steps": 30,
+                **closed_loop_params,
             },
         )
         self.rewards.dribbling_ball_too_close_penalty = RewTerm(
@@ -191,17 +197,15 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
         )
         self.rewards.dribbling_ball_velocity_tracking = RewTerm(
             func=mdp.dribbling_command_ball_velocity_tracking_reward,
-            weight=2.5,
+            weight=7.5,
             params={
                 "command_name": "motion",
                 "absolute_tolerance": 0.10,
                 "relative_tolerance": 0.05,
                 "speed_error_std": 0.30,
                 "lateral_speed_std": 0.35,
-                "velocity_ema_window_steps": 10,
-                "ball_sensor_name": "soccer_ball_contact",
-                "contact_force_threshold": 1.0,
-                "possession_window_steps": 30,
+                "minimum_controllability_gate": 0.10,
+                **closed_loop_params,
             },
         )
         self.rewards.dribbling_ball_speed_excess = RewTerm(
@@ -213,19 +217,6 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "min_speed_cap": 0.35,
                 "huber_scale": 0.45,
                 "max_penalty": 6.0,
-            },
-        )
-        self.rewards.dribbling_ball_coast_penalty = RewTerm(
-            func=mdp.dribbling_ball_coast_without_contact_penalty,
-            weight=-2.2,
-            params={
-                "command_name": "motion",
-                "ball_sensor_name": "soccer_ball_contact",
-                "contact_force_threshold": 1.0,
-                "speed_threshold": 0.55,
-                "speed_scale": 0.40,
-                "max_close_xy_dist": 0.50,
-                "recent_contact_grace_steps": 30,
             },
         )
         self.rewards.dribbling_sustained_contact_penalty = RewTerm(
@@ -248,74 +239,20 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "vz_threshold": 0.32,
             },
         )
-        self.rewards.dribbling_ball_forward_progress = RewTerm(
-            func=mdp.dribbling_command_ball_progress_reward,
-            weight=5.0,
-            params={
-                "command_name": "motion",
-                "min_forward_speed": 0.42,
-                "command_speed_ratio": 0.50,
-                "speed_scale": 0.22,
-                "lateral_ratio_max": 0.70,
-                "pelvis_speed_min": 0.25,
-                "ball_sensor_name": "soccer_ball_contact",
-                "contact_force_threshold": 1.0,
-                "require_recent_contact": True,
-                "recent_contact_window": 30,
-            },
-        )
-        self.rewards.dribbling_orbiting_penalty = RewTerm(
-            func=mdp.dribbling_orbiting_penalty,
-            weight=-6.0,
-            params={
-                "command_name": "motion",
-                "ball_sensor_name": "soccer_ball_contact",
-                "contact_force_threshold": 1.0,
-                "orbit_radius_max": 0.9,
-                "tangential_deadzone": 0.08,
-                "tangential_scale": 0.35,
-                "possession_window_steps": 30,
-            },
-        )
-        self.rewards.dribbling_gait_foot_tracking = RewTerm(
-            func=mdp.dribbling_gait_foot_tracking_exp,
-            weight=1.4,
-            params={
-                "command_name": "motion",
-                "std": 0.28,
-                "foot_body_names": both_feet,
-                "ball_sensor_name": "soccer_ball_contact",
-                "contact_force_threshold": 1.0,
-                "possession_window_steps": 30,
-            },
-        )
-        self.rewards.dribbling_chase_ball = RewTerm(
-            func=mdp.dribbling_command_chase_ball_reward,
-            weight=2.0,
-            params={
-                "command_name": "motion",
-                "ball_sensor_name": "soccer_ball_contact",
-                "contact_force_threshold": 1.0,
-                "min_ball_ahead": 0.28,
-                "max_chase_xy_dist": 1.05,
-                "pelvis_forward_speed_min": 0.25,
-                "forward_speed_scale": 0.50,
-            },
-        )
         self.rewards.dribbling_rapid_retouch_penalty = RewTerm(
             func=mdp.dribbling_rapid_retouch_penalty,
             weight=-6.0,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
-                "force_threshold": 22.0,
-                "min_steps_between_touches": 26,
+                "force_threshold": 14.0,
+                "min_steps_between_touches": 14,
                 "all_body_cfg": contact_body_cfg,
                 "num_ankle_links": num_ankle_links,
             },
         )
-        self.rewards.dribbling_legal_foot_touch = RewTerm(
-            func=mdp.dribbling_legal_foot_touch,
+        self.rewards.dribbling_useful_foot_touch = RewTerm(
+            func=mdp.dribbling_useful_foot_touch,
             weight=5.5,
             params={
                 "command_name": "motion",
@@ -323,7 +260,11 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
                 "force_threshold": 14.0,
                 "all_body_cfg": contact_body_cfg,
                 "num_ankle_links": num_ankle_links,
-                "min_pelvis_heading": 0.0,
+                "evaluation_delay_steps": 5,
+                "improvement_scale": 0.50,
+                "contact_window_tolerance_steps": 2,
+                "off_window_reward_scale": 0.35,
+                **closed_loop_params,
             },
         )
         self.rewards.dribbling_micro_contact_filter = RewTerm(
@@ -352,17 +293,11 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
         self.rewards.dribbling_cg_foot_ball_distance = RewTerm(
             func=mdp.dribbling_cg_foot_ball_distance_exp,
             weight=3.5,
-            params={"command_name": "motion", "std": 0.22, "use_xy_only": True},
-        )
-        self.rewards.dribbling_cg_contact_consistency = RewTerm(
-            func=mdp.dribbling_cg_contact_consistency,
-            weight=1.0,
             params={
                 "command_name": "motion",
-                "ball_sensor_name": "soccer_ball_contact",
-                "contact_force_threshold": 1.0,
-                "contact_window_tolerance_steps": 2,
-                "premature_contact_penalty": 1.0,
+                "std": 0.22,
+                "use_xy_only": True,
+                "max_reference_distance": 0.55,
             },
         )
 

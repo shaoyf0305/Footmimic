@@ -805,6 +805,10 @@ def _create_diagnostic(
         "ball_pelvis_xy_distance": [],
         "ball_command_forward_offset": [],
         "ball_command_lateral_offset": [],
+        "ball_predicted_forward_offset": [],
+        "ball_predicted_lateral_offset": [],
+        "ball_position_error_norm": [],
+        "ball_control_position_reward": [],
         "ball_position_z": [],
         "ball_vertical_speed": [],
         "ball_contact": [],
@@ -820,17 +824,18 @@ def _create_diagnostic(
         "ball_contact_duty_penalty": [],
         "ball_too_close_penalty": [],
         "ball_too_close_distance_xy": [],
-        "possession_active": [],
-        "possession_steps_since_contact": [],
         "cg_label_available": [],
         "cg_expected_contact": [],
         "cg_expected_foot": [],
         "cg_contact_window_active": [],
-        "cg_contact_window_hit": [],
-        "cg_contact_event_score": [],
-        "cg_premature_contact": [],
-        "cg_missing_contact": [],
-        "cg_wrong_foot_contact": [],
+        "useful_touch_new_event": [],
+        "useful_touch_evaluated": [],
+        "useful_touch_pending": [],
+        "useful_touch_pre_error": [],
+        "useful_touch_current_error": [],
+        "useful_touch_improvement": [],
+        "useful_touch_cg_aligned": [],
+        "useful_touch_reward": [],
         "ball_xy_speed": [],
         "ball_command_forward_speed": [],
         "ball_speed_target": [],
@@ -843,8 +848,17 @@ def _create_diagnostic(
         "ball_velocity_ema_window_steps": [],
         "ball_speed_cap": [],
         "ball_velocity_tracking_reward": [],
+        "ball_velocity_controllability_gate": [],
         "ball_speed_excess_penalty": [],
+        "ball_closing_speed": [],
         "pelvis_xy_speed": [],
+        "recovery_gate_raw": [],
+        "recovery_gate": [],
+        "pelvis_command_target_velocity_xy": [],
+        "pelvis_position_correction_velocity_xy": [],
+        "pelvis_recovery_target_velocity_xy": [],
+        "pelvis_blended_target_velocity_xy": [],
+        "closed_loop_pelvis_velocity_reward": [],
         "command_target_speed": [],
         "command_target_heading": [],
         "foot_reference_position_error": [],
@@ -918,6 +932,20 @@ def _append_diagnostic(
 
     def _cpu(value: torch.Tensor) -> np.ndarray:
         return value[0].detach().cpu().numpy().copy()
+
+    def _append_scalar_attr(key: str, attr: str) -> None:
+        value = getattr(base_env, attr, None)
+        diagnostic[key].append(np.nan if value is None else float(value[0].item()))
+
+    def _append_bool_attr(key: str, attr: str) -> None:
+        value = getattr(base_env, attr, None)
+        diagnostic[key].append(False if value is None else bool(value[0].item()))
+
+    def _append_xy_attr(key: str, attr: str) -> None:
+        value = getattr(base_env, attr, None)
+        diagnostic[key].append(
+            np.full(2, np.nan, dtype=np.float32) if value is None else _cpu(value)
+        )
 
     diagnostic["step"].append(int(step))
     diagnostic["motion_idx"].append(int(command.motion_idx[0].item()))
@@ -1028,6 +1056,16 @@ def _append_diagnostic(
     lateral_offset = torch.dot(ball_delta_xy, command_lateral_dir)
     diagnostic["ball_command_forward_offset"].append(float(forward_offset.item()))
     diagnostic["ball_command_lateral_offset"].append(float(lateral_offset.item()))
+    _append_scalar_attr(
+        "ball_predicted_forward_offset", "_dribbling_predicted_ball_forward_offset"
+    )
+    _append_scalar_attr(
+        "ball_predicted_lateral_offset", "_dribbling_predicted_ball_lateral_offset"
+    )
+    _append_scalar_attr("ball_position_error_norm", "_dribbling_position_error_norm")
+    _append_scalar_attr(
+        "ball_control_position_reward", "_dribbling_control_position_reward"
+    )
     diagnostic["ball_position_z"].append(float(soccer_ball.data.root_pos_w[0, 2].item()))
     diagnostic["ball_vertical_speed"].append(float(soccer_ball.data.root_lin_vel_w[0, 2].item()))
     ball_forward_speed = torch.dot(ball_vel_xy, command_dir)
@@ -1062,18 +1100,20 @@ def _append_diagnostic(
         body_force_env0.detach().cpu().numpy().copy()
     )
     diagnostic["ball_contact_body_index"].append(actual_body_index)
-    ankle_names = {"left_ankle_roll_link", "right_ankle_roll_link"}
+    legal_ball_contact_names = {"right_ankle_roll_link"}
     actual_body_name = body_names[actual_body_index] if actual_body_index >= 0 else ""
     diagnostic["ball_undesired_body_contact"].append(
-        bool(link_contact and actual_body_name and actual_body_name not in ankle_names)
+        bool(
+            link_contact
+            and actual_body_name
+            and actual_body_name not in legal_ball_contact_names
+        )
     )
 
     duty_ema = getattr(base_env, "_dribbling_contact_duty_ema", None)
     duty_penalty = getattr(base_env, "_dribbling_contact_duty_penalty", None)
     too_close_penalty = getattr(base_env, "_dribbling_ball_too_close_penalty", None)
     too_close_distance = getattr(base_env, "_dribbling_ball_too_close_distance_xy", None)
-    possession_active = getattr(base_env, "_dribbling_possession_active", None)
-    possession_steps = getattr(base_env, "_dribbling_possession_steps_since_contact", None)
     speed_cap = getattr(base_env, "_dribbling_ball_speed_cap", None)
     filtered_ball_velocity = getattr(base_env, "_dribbling_filtered_ball_velocity_xy", None)
     velocity_tracking_reward = getattr(base_env, "_dribbling_ball_velocity_tracking_reward", None)
@@ -1089,12 +1129,6 @@ def _append_diagnostic(
     )
     diagnostic["ball_too_close_distance_xy"].append(
         np.nan if too_close_distance is None else float(too_close_distance[0].item())
-    )
-    diagnostic["possession_active"].append(
-        False if possession_active is None else bool(possession_active[0].item())
-    )
-    diagnostic["possession_steps_since_contact"].append(
-        -1 if possession_steps is None else int(possession_steps[0].item())
     )
     diagnostic["ball_speed_cap"].append(
         np.nan if speed_cap is None else float(speed_cap[0].item())
@@ -1126,8 +1160,35 @@ def _append_diagnostic(
     diagnostic["ball_velocity_tracking_reward"].append(
         np.nan if velocity_tracking_reward is None else float(velocity_tracking_reward[0].item())
     )
+    _append_scalar_attr(
+        "ball_velocity_controllability_gate",
+        "_dribbling_ball_velocity_controllability_gate",
+    )
     diagnostic["ball_speed_excess_penalty"].append(
         np.nan if speed_excess_penalty is None else float(speed_excess_penalty[0].item())
+    )
+    _append_scalar_attr("ball_closing_speed", "_dribbling_ball_closing_speed")
+    _append_scalar_attr("recovery_gate_raw", "_dribbling_recovery_gate_raw")
+    _append_scalar_attr("recovery_gate", "_dribbling_recovery_gate")
+    _append_xy_attr(
+        "pelvis_command_target_velocity_xy",
+        "_dribbling_command_target_velocity_xy",
+    )
+    _append_xy_attr(
+        "pelvis_position_correction_velocity_xy",
+        "_dribbling_position_correction_velocity_xy",
+    )
+    _append_xy_attr(
+        "pelvis_recovery_target_velocity_xy",
+        "_dribbling_recovery_target_velocity_xy",
+    )
+    _append_xy_attr(
+        "pelvis_blended_target_velocity_xy",
+        "_dribbling_blended_pelvis_target_velocity_xy",
+    )
+    _append_scalar_attr(
+        "closed_loop_pelvis_velocity_reward",
+        "_dribbling_closed_loop_pelvis_velocity_reward",
     )
 
     cg_labeled = bool(
@@ -1136,54 +1197,28 @@ def _append_diagnostic(
     )
     cg_expected_contact = bool(command.dribble_cg_contact_ref[0].item()) if cg_labeled else False
     cg_expected_foot = int(command.dribble_cg_foot_ref[0].item()) if cg_labeled else -1
-    expected_body_name = (
-        "left_ankle_roll_link" if cg_expected_foot == 0
-        else "right_ankle_roll_link" if cg_expected_foot == 1
-        else ""
-    )
     diagnostic["cg_label_available"].append(cg_labeled)
     diagnostic["cg_expected_contact"].append(cg_expected_contact)
     diagnostic["cg_expected_foot"].append(cg_expected_foot)
     cg_window_tensor = getattr(base_env, "_dribbling_cg_contact_window_active", None)
-    cg_window_hit_tensor = getattr(base_env, "_dribbling_cg_contact_window_hit", None)
-    cg_premature_tensor = getattr(base_env, "_dribbling_cg_premature_contact", None)
-    cg_event_score_tensor = getattr(base_env, "_dribbling_cg_contact_event_score", None)
     cg_window_active = (
         cg_expected_contact
         if cg_window_tensor is None
         else bool(cg_window_tensor[0].item())
     )
-    cg_window_hit = (
-        cg_window_active and robot_contact
-        if cg_window_hit_tensor is None
-        else bool(cg_window_hit_tensor[0].item())
-    )
-    cg_premature = (
-        cg_labeled and link_contact and not cg_window_active
-        if cg_premature_tensor is None
-        else bool(cg_premature_tensor[0].item())
-    )
-    cg_event_score = (
-        float(cg_window_hit) - float(cg_premature)
-        if cg_event_score_tensor is None
-        else float(cg_event_score_tensor[0].item())
-    )
     diagnostic["cg_contact_window_active"].append(cg_window_active)
-    diagnostic["cg_contact_window_hit"].append(cg_window_hit)
-    diagnostic["cg_contact_event_score"].append(cg_event_score)
-    diagnostic["cg_premature_contact"].append(cg_premature)
-    diagnostic["cg_missing_contact"].append(cg_labeled and cg_window_active and not cg_window_hit)
-    diagnostic["cg_wrong_foot_contact"].append(
-        bool(
-            cg_labeled
-            and cg_window_active
-            and link_contact
-            and filtered_available
-            and actual_body_index >= 0
-            and expected_body_name
-            and actual_body_name != expected_body_name
-        )
+    _append_bool_attr("useful_touch_new_event", "_dribbling_useful_touch_new_event")
+    _append_bool_attr("useful_touch_evaluated", "_dribbling_useful_touch_evaluated")
+    _append_bool_attr("useful_touch_pending", "_dribbling_useful_touch_pending")
+    _append_scalar_attr("useful_touch_pre_error", "_dribbling_useful_touch_pre_error")
+    _append_scalar_attr(
+        "useful_touch_current_error", "_dribbling_useful_touch_current_error"
     )
+    _append_scalar_attr(
+        "useful_touch_improvement", "_dribbling_useful_touch_improvement"
+    )
+    _append_bool_attr("useful_touch_cg_aligned", "_dribbling_useful_touch_cg_aligned")
+    _append_scalar_attr("useful_touch_reward", "_dribbling_useful_touch_reward")
     foot_ref_ids = [command.cfg.body_names.index(name) for name in _FOOT_DIAGNOSTIC_BODY_NAMES]
     foot_error = torch.norm(
         command.robot_body_pos_w[0, foot_ref_ids] - command.body_pos_relative_w[0, foot_ref_ids], dim=-1
@@ -1452,39 +1487,40 @@ def _save_diagnostic(diagnostic: dict) -> None:
     foot_error = float(np.mean(arrays["foot_reference_position_error"]))
     heading_error = float(np.mean(np.abs(arrays["heading_error"])))
     too_close_rate = float(np.mean(arrays["ball_too_close_penalty"] > 0.0))
-    possession_rate = float(np.mean(arrays["possession_active"]))
     finite_contact_duty = arrays["ball_contact_duty_ema"][
         np.isfinite(arrays["ball_contact_duty_ema"])
     ]
     contact_duty = (
         float(np.mean(finite_contact_duty)) if finite_contact_duty.size else np.nan
     )
-    labeled_mask = arrays["cg_label_available"].astype(bool)
-    window_mask = labeled_mask & arrays["cg_contact_window_active"].astype(bool)
-    outside_window_mask = labeled_mask & ~window_mask
-    window_end_mask = window_mask.copy()
-    if window_end_mask.size > 1:
-        window_end_mask[:-1] &= (
-            ~window_mask[1:]
-            | arrays["done"][:-1].astype(bool)
-            | (arrays["motion_idx"][:-1] != arrays["motion_idx"][1:])
-        )
-    # Do not count a trace that stops halfway through a contact window as a
-    # failed event.  The last sample is complete only when the episode ended.
-    window_end_mask[-1] &= arrays["done"][-1].astype(bool)
-    observed_window_contact_mask = window_mask & arrays["ball_link_contact"].astype(bool)
-    premature_rate = (
-        float(np.mean(arrays["cg_premature_contact"][outside_window_mask]))
-        if np.any(outside_window_mask) else np.nan
+    finite_recovery_gate = arrays["recovery_gate"][np.isfinite(arrays["recovery_gate"])]
+    recovery_gate_mean = (
+        float(np.mean(finite_recovery_gate)) if finite_recovery_gate.size else np.nan
     )
-    window_hit_rate = (
-        float(np.mean(arrays["cg_contact_window_hit"][window_end_mask]))
-        if np.any(window_end_mask) else np.nan
+    recovery_active_rate = (
+        float(np.mean(finite_recovery_gate > 0.5)) if finite_recovery_gate.size else np.nan
     )
-    missing_rate = 1.0 - window_hit_rate if np.isfinite(window_hit_rate) else np.nan
-    wrong_foot_rate = (
-        float(np.mean(arrays["cg_wrong_foot_contact"][observed_window_contact_mask]))
-        if np.any(observed_window_contact_mask) else np.nan
+    finite_controllability = arrays["ball_velocity_controllability_gate"][
+        np.isfinite(arrays["ball_velocity_controllability_gate"])
+    ]
+    controllability_mean = (
+        float(np.mean(finite_controllability)) if finite_controllability.size else np.nan
+    )
+    useful_touch_events = int(np.count_nonzero(arrays["useful_touch_new_event"]))
+    useful_touch_eval_mask = arrays["useful_touch_evaluated"].astype(bool)
+    useful_touch_evaluations = int(np.count_nonzero(useful_touch_eval_mask))
+    useful_touch_success_rate = (
+        float(np.mean(arrays["useful_touch_reward"][useful_touch_eval_mask] > 0.0))
+        if useful_touch_evaluations else np.nan
+    )
+    useful_touch_improvement = (
+        float(np.mean(arrays["useful_touch_improvement"][useful_touch_eval_mask]))
+        if useful_touch_evaluations else np.nan
+    )
+    useful_event_mask = arrays["useful_touch_new_event"].astype(bool)
+    useful_touch_cg_alignment = (
+        float(np.mean(arrays["useful_touch_cg_aligned"][useful_event_mask]))
+        if useful_touch_events else np.nan
     )
     task_state_names = np.asarray(["idle", "dribble", "stop"])
     task_state_counts = np.bincount(arrays["task_state"].astype(np.int64), minlength=3)[:3]
@@ -1582,11 +1618,14 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"contact_rate={contact_rate:.3f}  raw_link_contact_rate={link_contact_rate:.3f}  "
         f"net_contact_rate={net_contact_rate:.3f}  "
         f"ball_pelvis_xy={ball_distance:.3f} m  "
-        f"too_close_rate={too_close_rate:.3f}  possession_rate={possession_rate:.3f}  "
+        f"too_close_rate={too_close_rate:.3f}  "
         f"contact_duty={contact_duty:.3f}  "
-        f"cg_window_hit={window_hit_rate:.3f}  cg_premature={premature_rate:.3f}  "
-        f"cg_missing_window={missing_rate:.3f}  "
-        f"cg_wrong_foot={wrong_foot_rate:.3f}  "
+        f"recovery_gate={recovery_gate_mean:.3f}  recovery_active={recovery_active_rate:.3f}  "
+        f"controllability={controllability_mean:.3f}  "
+        f"useful_touches={useful_touch_events}/{useful_touch_evaluations}  "
+        f"useful_success={useful_touch_success_rate:.3f}  "
+        f"useful_improvement={useful_touch_improvement:.3f}  "
+        f"touch_cg_alignment={useful_touch_cg_alignment:.3f}  "
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
         f"ball_speed_mae={ball_speed_error:.3f} m/s  "
         f"filtered_ball_speed_mae={filtered_ball_speed_error:.3f} m/s  "
@@ -1906,21 +1945,24 @@ def _get_play_overlay(env) -> str:
         ]
         if hasattr(cmd, "motion_has_dribble_cg_label") and bool(cmd.motion_has_dribble_cg_label[i].item()):
             cg_window_tensor = getattr(base_env, "_dribbling_cg_contact_window_active", None)
-            cg_window_hit_tensor = getattr(base_env, "_dribbling_cg_contact_window_hit", None)
             cg_window = (
                 bool(cmd.dribble_cg_contact_ref[i].item())
                 if cg_window_tensor is None
                 else bool(cg_window_tensor[i].item())
             )
-            cg_window_hit = (
-                cg_window and sim_touch
-                if cg_window_hit_tensor is None
-                else bool(cg_window_hit_tensor[i].item())
-            )
             ankle_parts.append(f"cg_window={'YES' if cg_window else 'NO'}")
-            if cg_window:
-                ankle_parts.append(f"hit={'YES' if cg_window_hit else 'WAIT'}")
+        useful_touch_tensor = getattr(base_env, "_dribbling_useful_touch_reward", None)
+        if useful_touch_tensor is not None:
+            ankle_parts.append(f"useful={float(useful_touch_tensor[i].item()):.2f}")
         lines.append(f"Ankle-Ball: {'  |  '.join(ankle_parts)}")
+
+        recovery_gate_tensor = getattr(base_env, "_dribbling_recovery_gate", None)
+        closing_speed_tensor = getattr(base_env, "_dribbling_ball_closing_speed", None)
+        if recovery_gate_tensor is not None and closing_speed_tensor is not None:
+            lines.append(
+                f"Ball recovery: gate={float(recovery_gate_tensor[i].item()):.2f}"
+                f"  closing={float(closing_speed_tensor[i].item()):+.2f} m/s"
+            )
 
         if hasattr(base_env, "_dribbling_no_contact_count"):
             no_contact_count = float(base_env._dribbling_no_contact_count[i].item())

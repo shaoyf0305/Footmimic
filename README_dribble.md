@@ -69,30 +69,28 @@ run's `diagnostics/` directory. New archives include:
 - `step_reward`
 - actions, joint tracking, command, ball, contact, manifold, torque, and termination telemetry
 
-The cleaned Control environment records 28 active reward terms. The
-`dribbling_ball_velocity_tracking` term rewards command-relative speed and
-direction tracking during right-foot possession using a reset-safe 10-step
-(0.2 s) ball-velocity EMA. It shares the original `+7.5` positive speed budget
-with forward progress (`+2.5` tracking and `+5.0` progress) so speed regulation
-cannot hide degraded motion quality behind extra task reward. The existing
-ball-speed penalty remains an instantaneous command-relative Huber safety
-envelope that retains a gradient at high speed. Three low-use guardrails are
-intentionally retained for early training: illegal-body ball contact, vertical
-ball bounce, and excessive ankle-contact force. The angular
-velocity reward now tracks a bounded yaw-rate target generated from heading
-error instead of rewarding zero yaw rate during a commanded turn.
+The cleaned Control environment records 21 active reward terms. Normal control
+and ball recovery share one predicted position--velocity state. Inside the
+controllable region the pelvis follows the locomotion command; outside it, a
+smooth recovery gate blends toward the filtered ball velocity plus a bounded
+position correction. The `+7.5` positive ball-speed budget is now one direct,
+two-sided velocity-vector tracking term rather than separate progress and
+tracking objectives. Its score is softly reduced during recovery, while the
+instantaneous command-relative Huber excess penalty remains the high-speed
+safety envelope.
 
 The current Control task accepts only right-ankle ball contact as legal. Both
 feet remain in gait tracking, but a left-foot ball touch is an undesired
 contact. No mirrored or additional kick data is required.
 
 Current contact truth uses filtered per-link robot contact with a two-control-step
-sensor hold. A real right-ankle touch also starts a 30-control-step possession
-window shared by progress, proximity, coast, orbit, and gait reward gates. This
-restores task coverage between discrete touches without treating ball-ground
-friction as robot contact. Diagnostics record both contact channels, possession,
-and the ball's net XY contact force; net force remains telemetry only. CG contact
-is scored per annotated contact window instead of rewarding easy no-contact matches.
+sensor hold. There is no reward possession timer. A gentle right-ankle touch is
+rewarded only if the combined predicted-position and ball-velocity error is
+lower five control steps later; the CG contact window is a soft timing
+multiplier on that useful-touch score. Diagnostics record the recovery gate,
+predicted ball position, closing speed, blended pelvis target, useful-touch
+improvement, both contact channels, and the ball's net XY contact force. Net
+force remains telemetry only.
 
 After an episode termination, playback clears the recurrent policy hidden state
 while leaving the active manual speed/heading segment unchanged. Thus a physical
@@ -101,10 +99,10 @@ timing retains the continuous-Control behavior used by the v5 baseline.
 
 Use `--diagnostic_stride N` to record every Nth control step.
 
-The current MDP inventory and action-quality correction are documented in
-[MDP_SUMMARY_08.md](MDP_SUMMARY_08.md). `MDP_SUMMARY_07.md` retains the first
-instantaneous speed-feedback implementation, and `MDP_SUMMARY_06.md` retains
-the preceding possession/recovery implementation.
+The complete current Stage-1/Stage-2 reward inventory and action-quality
+correction are maintained in [MDP_SUMMARY.md](MDP_SUMMARY.md). Future MDP
+changes update that living summary directly; the numbered interim summaries
+have been removed.
 
 ## MuJoCo sim2sim
 
