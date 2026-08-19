@@ -7,6 +7,11 @@ from isaaclab_rl.rsl_rl import (
     RslRlPpoAlgorithmCfg,
 )
 
+from soccer.utils.bounded_actor_critic import register_bounded_actor_critic
+
+
+register_bounded_actor_critic()
+
 
 @configclass
 class G1DribblingRecurrentPPORunnerCfg(RslRlOnPolicyRunnerCfg):
@@ -17,6 +22,7 @@ class G1DribblingRecurrentPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     empirical_normalization = True
 
     policy = RslRlPpoActorCriticRecurrentCfg(
+        class_name="BoundedUpperBodyActorCriticRecurrent",
         init_noise_std=1.0,
         actor_hidden_dims=[128, 64, 32],
         critic_hidden_dims=[128, 64, 32],

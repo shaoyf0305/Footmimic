@@ -167,6 +167,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.load(
             resume_path,
             migrate_legacy_upper_body_residual=args_cli.migrate_legacy_upper_body_residual,
+            migrate_bounded_upper_body_policy=args_cli.migrate_bounded_upper_body_policy,
         )
 
     # dump the configuration into log-directory

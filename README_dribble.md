@@ -97,6 +97,22 @@ with the recovery gate, predicted ball position, closing speed, blended pelvis
 target, both contact channels, and the ball's net XY contact force. Net force
 remains telemetry only.
 
+Per-link force columns are accepted only when the runtime PhysX filter count
+exactly matches the configured body-filter count; the old silent truncation is
+removed. A present-but-mismatched matrix fails fast instead of training with a
+geometry guess; only runtimes without a matrix use the compatibility fallback.
+Diagnostics store both articulation body names and collision-semantic
+labels. In particular, `right_knee_link` owns the complete lower-leg cylinder
+and is reported as `right_shin_collision`. The first control step after reset is
+excluded from contact truth to remove the stale one-frame initialization impulse.
+The contact-hold cache is validated against its actual state fields and cleared
+inside the reset guard, so its documented two-step hold now persists within an
+episode without leaking across episodes.
+
+Diagnostics also store `bounded_upper_body_policy_action`. It is true for the
+current Stage 2 controller, whose 14 arm residuals are bounded by the policy
+distribution itself, and false for Stage 1.
+
 After any Control episode termination, playback clears the recurrent policy
 hidden state. An ordinary failure preserves the active manual segment, target
 heading, and remaining duration; only a completed sequence using `reset_on_end`
@@ -113,27 +129,36 @@ ball. Any valid right-ankle contact clears it. IDLE and STOP do not accumulate
 this counter, and `ball_lost` is likewise gated to DRIBBLE.
 
 The 14 arm outputs in Stage 2 are reference-relative residuals while the full
-29-D action interface remains unchanged. Zero arm action means the live motion
-reference exactly. The correction is projected in the motion-bank PCA tangent,
-smoothly bounded to `q_ref ± 0.25 rad`, and filtered as a residual rather than
-an absolute target. The policy still observes the final normalized joint target,
-so the Stage-1/Stage-2 input layout remains consistent. Diagnostics include the
-policy, projected, and executed residuals plus their saturation fraction.
+29-D action interface remains unchanged. These 14 dimensions now use a
+tanh-transformed Gaussian inside the actor policy, including the transformed
+PPO log-probability; lower-body actions remain Gaussian. Zero arm action means
+the live motion reference exactly. The bounded correction is projected in the
+motion-bank PCA tangent, safety-clamped to `q_ref ± 0.25 rad`, and filtered as a
+residual rather than an absolute target. Deterministic playback and ONNX apply
+the same actor transform. The policy still observes the final normalized joint
+target, so the Stage-1/Stage-2 input layout remains consistent. Diagnostics
+include the policy, projected, and executed residuals plus their saturation
+fraction.
 
-Pre-residual checkpoints require an explicit one-time migration during the
-first Stage-2 train or play load:
+Pre-residual checkpoints without an action marker require this one-time flag:
 
 ```text
 --migrate_legacy_upper_body_residual
 ```
 
-This temporary compatibility path preserves the lower-body output, hidden
-layers, critic, and observation normalizer while resetting only the 14 legacy
-arm output rows. Newly saved checkpoints carry the `reference_residual_v1`
-marker. Never pass the migration flag when resuming one of those checkpoints;
-the loader rejects repeated migration. Once the retained baselines have all
-been converted, the clearly marked temporary loader block and CLI flag can be
-removed without changing the runtime residual controller.
+Essay 11 checkpoints carrying `reference_residual_v1` instead require:
+
+```text
+--migrate_bounded_upper_body_policy
+```
+
+Both temporary paths preserve the lower-body output, hidden layers, critic,
+and observation normalizer while resetting only the 14 incompatible arm output
+rows. Newly saved checkpoints carry `bounded_reference_residual_v2`. Never pass
+either migration flag when resuming one of those checkpoints; the loader rejects
+repeated or mismatched migration. Once the retained baselines have all been
+converted, the clearly marked temporary loader block and both CLI flags can be
+removed without changing the runtime bounded residual controller.
 
 Use `--diagnostic_stride N` to record every Nth control step.
 

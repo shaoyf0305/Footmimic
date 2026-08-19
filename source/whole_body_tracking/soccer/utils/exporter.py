@@ -3,7 +3,9 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import math
 import os
+
 import torch
 
 import onnx
@@ -32,6 +34,15 @@ def export_motion_policy_as_onnx(
 class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
     def __init__(self, env: ManagerBasedRLEnv, actor_critic, normalizer=None, verbose=False, motion_name=None):
         super().__init__(actor_critic, normalizer, verbose)
+        bounded_indices = getattr(actor_critic, "bounded_action_indices", None)
+        action_dim = int(self.actor[-1].out_features)
+        bounded_mask = torch.zeros(action_dim, dtype=torch.float32)
+        if isinstance(bounded_indices, torch.Tensor) and bounded_indices.numel() > 0:
+            bounded_mask[bounded_indices.detach().cpu().long()] = 1.0
+        self.register_buffer("bounded_action_mask", bounded_mask)
+        self.bounded_mean_limit = float(
+            getattr(actor_critic, "_bounded_mean_limit", math.atanh(0.95))
+        )
         cmd: MotionCommand = env.command_manager.get_term("motion")
         # import ipdb; ipdb.set_trace()
         if len(cmd.motion.joint_pos.shape) == 2:  # Single motion.
@@ -55,10 +66,21 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
             self.time_step_total = self.joint_pos.shape[0]           
 
 
+    def _policy_actions(self, actor_input: torch.Tensor) -> torch.Tensor:
+        raw_actions = self.actor(actor_input)
+        # Algebraic masking exports cleanly to ONNX and leaves Stage-1 actions
+        # unchanged because its mask is all zeros.
+        bounded_mean = self.bounded_mean_limit * torch.tanh(
+            raw_actions / self.bounded_mean_limit
+        )
+        bounded_actions = torch.tanh(bounded_mean)
+        return raw_actions + self.bounded_action_mask * (bounded_actions - raw_actions)
+
+
     def forward(self, x, time_step):
         time_step_clamped = torch.clamp(time_step.long().squeeze(-1), max=self.time_step_total - 1)
         return (
-            self.actor(self.normalizer(x)),
+            self._policy_actions(self.normalizer(x)),
             self.joint_pos[time_step_clamped],
             self.joint_vel[time_step_clamped],
             self.body_pos_w[time_step_clamped],
@@ -74,7 +96,7 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
         x = x.squeeze(0)
         time_step_clamped = torch.clamp(time_step.long().squeeze(-1), max=self.time_step_total - 1)
         return (
-            self.actor(x),
+            self._policy_actions(x),
             h,
             c,
             self.joint_pos[time_step_clamped],
@@ -172,6 +194,13 @@ def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filen
         "anchor_body_name": env.command_manager.get_term("motion").cfg.anchor_body_name,
         "body_names": env.command_manager.get_term("motion").cfg.body_names,
     }
+    action_term = env.action_manager.get_term("joint_pos")
+    bounded_action_ids = getattr(action_term, "_upper_action_ids", None)
+    if getattr(action_term, "uses_bounded_upper_body_policy_action", False) and isinstance(
+        bounded_action_ids, torch.Tensor
+    ):
+        metadata["bounded_policy_action_indices"] = bounded_action_ids.detach().cpu().tolist()
+        metadata["bounded_policy_action_transform"] = "tanh_normal"
 
     model = onnx.load(onnx_path)
 

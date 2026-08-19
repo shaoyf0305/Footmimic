@@ -146,7 +146,7 @@ from isaaclab.envs import DirectMARLEnv, DirectMARLEnvCfg, DirectRLEnvCfg, Manag
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
-from rsl_rl.runners import OnPolicyRunner
+from soccer.utils.bounded_actor_critic import BoundedOnPolicyRunner as OnPolicyRunner
 
 import soccer.tasks  # noqa: F401
 from soccer.tasks.tracking.mdp.rewards_dribbling import soccer_ball_robot_contact
@@ -697,6 +697,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner,
             resume_path,
             migrate_legacy_upper_body_residual=args_cli.migrate_legacy_upper_body_residual,
+            migrate_bounded_upper_body_policy=args_cli.migrate_bounded_upper_body_policy,
         )
         policy = runner.get_inference_policy(device=base_env.device)
         _log("Policy loaded; starting per-reference rollouts.")
@@ -722,6 +723,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     runner,
                     resume_path,
                     migrate_legacy_upper_body_residual=args_cli.migrate_legacy_upper_body_residual,
+                    migrate_bounded_upper_body_policy=args_cli.migrate_bounded_upper_body_policy,
                 )
                 policy = runner.get_inference_policy(device=base_env.device)
 

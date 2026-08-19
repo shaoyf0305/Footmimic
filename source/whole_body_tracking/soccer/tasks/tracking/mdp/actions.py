@@ -197,6 +197,9 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self._use_reference_relative_upper_body_residual = bool(
             cfg.reference_relative_upper_body_residual
         )
+        self._upper_body_policy_action_is_bounded = bool(
+            cfg.upper_body_policy_action_is_bounded
+        )
         self._filtered_latent = torch.zeros(self.num_envs, rank, device=self.device)
         self._filtered_upper_target = torch.zeros(self.num_envs, upper_dim, device=self.device)
         self._filtered_upper_residual = torch.zeros(self.num_envs, upper_dim, device=self.device)
@@ -331,6 +334,14 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         """Whether the 14 arm actions are residuals around the live motion reference."""
         return self._use_reference_relative_upper_body_residual
 
+    @property
+    def uses_bounded_upper_body_policy_action(self) -> bool:
+        """Whether arm policy values already live in the bounded ``(-1, 1)`` space."""
+        return (
+            self._use_reference_relative_upper_body_residual
+            and self._upper_body_policy_action_is_bounded
+        )
+
     def policy_action_ids_for_robot_joint_ids(self, robot_joint_ids: Sequence[int]) -> list[int]:
         """Return external policy indices for lower-body robot joints.
 
@@ -446,7 +457,15 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             # radians before projecting the correction, not the absolute pose.
             safe_reference_margin = max(float(reference_margin), 1.0e-6)
             policy_residual = self.raw_actions[:, action_ids].clone()
-            policy_residual_saturated = torch.abs(torch.tanh(policy_residual)) >= 0.95
+            if self._upper_body_policy_action_is_bounded:
+                # The actor samples these dimensions from a tanh-Normal and
+                # PPO evaluates the corresponding change-of-variables
+                # likelihood.  Do not hide that bounded action behind another
+                # environment-side tanh before assigning its physical meaning.
+                policy_residual = torch.clamp(policy_residual, min=-1.0, max=1.0)
+                policy_residual_saturated = torch.abs(policy_residual) >= 0.95
+            else:
+                policy_residual_saturated = torch.abs(torch.tanh(policy_residual)) >= 0.95
             reference_deviation = safe_reference_margin * policy_residual
             upper_raw_target = reference_target + reference_deviation
             clipped = None
@@ -479,14 +498,27 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             # correction instead of the absolute target, a changing reference
             # is followed immediately and cannot create a stale-target overshoot.
             safe_reference_margin = max(float(reference_margin), 1.0e-6)
-            bounded_unit_deviation = torch.tanh(
-                projected_residual / safe_reference_margin
-            )
-            reference_bounded_deviation = (
-                safe_reference_margin * bounded_unit_deviation
-            )
+            if self._upper_body_policy_action_is_bounded:
+                # The stochastic action is already bounded.  Keep a final
+                # component-wise safety clamp only for amplification caused by
+                # the PCA projection; avoid compressing every valid residual
+                # through a second tanh.
+                reference_bounded_deviation = torch.clamp(
+                    projected_residual,
+                    min=-safe_reference_margin,
+                    max=safe_reference_margin,
+                )
+                bounded_unit_deviation = reference_bounded_deviation / safe_reference_margin
+                reference_saturated = torch.abs(projected_residual) >= safe_reference_margin
+            else:
+                bounded_unit_deviation = torch.tanh(
+                    projected_residual / safe_reference_margin
+                )
+                reference_bounded_deviation = (
+                    safe_reference_margin * bounded_unit_deviation
+                )
+                reference_saturated = torch.abs(bounded_unit_deviation) >= 0.95
             constrained_target = reference_target + reference_bounded_deviation
-            reference_saturated = torch.abs(bounded_unit_deviation) >= 0.95
 
             alpha = 1.0 - math.exp(
                 -2.0 * math.pi * float(self.cfg.cutoff_frequency_hz) * step_dt
@@ -854,6 +886,10 @@ class UpperBodyManifoldJointPositionActionCfg(JointPositionActionCfg):
     # actions as dimensionless corrections around the live motion reference.
     # This is the active Stage-2 interface; zero action means exact reference.
     reference_relative_upper_body_residual: bool = False
+    # Stage-2 actor uses a tanh-transformed Gaussian on the arm dimensions,
+    # including the corrected PPO log-probability.  When enabled, the action
+    # term receives normalized residuals directly in ``(-1, 1)``.
+    upper_body_policy_action_is_bounded: bool = False
     # Clamp large normalized arm commands before target scaling.  This is
     # intentionally disabled by default to preserve non-control action semantics.
     upper_body_raw_action_limit: float | None = None

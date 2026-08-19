@@ -12,6 +12,7 @@ from rsl_rl.runners.on_policy_runner import OnPolicyRunner as BaseOnPolicyRunner
 
 UPPER_BODY_ACTION_SEMANTICS_KEY = "upper_body_action_semantics"
 UPPER_BODY_REFERENCE_RESIDUAL_V1 = "reference_residual_v1"
+UPPER_BODY_BOUNDED_REFERENCE_RESIDUAL_V2 = "bounded_reference_residual_v2"
 
 
 def _get_alg_policy(runner):
@@ -64,7 +65,7 @@ def checkpoint_infos_with_action_semantics(runner, infos):
         stamped_infos = dict(infos)
     else:
         raise TypeError(f"Checkpoint infos must be a dict or None, got {type(infos)!r}.")
-    stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_REFERENCE_RESIDUAL_V1
+    stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_BOUNDED_REFERENCE_RESIDUAL_V2
     return stamped_infos
 
 
@@ -244,8 +245,8 @@ def _migrate_direct_latent_action_output(
 
 
 # TEMPORARY LEGACY MIGRATION -------------------------------------------------
-# Remove this block, its CLI flag, and the call site once every retained
-# Stage-2 baseline checkpoint has been converted to reference_residual_v1.
+# Remove this block, its CLI flags, and the call sites once every retained
+# Stage-2 baseline checkpoint has been converted to bounded_reference_residual_v2.
 # The runtime residual action term does not depend on this compatibility code.
 def _is_legacy_joint_action_output(
     key: str,
@@ -271,7 +272,7 @@ def _migrate_legacy_upper_body_output_to_residual(
     key: str,
     upper_action_ids: list[int],
 ) -> torch.Tensor:
-    """Reset only the 14 arm rows whose meaning changes from absolute to residual."""
+    """Reset only the 14 arm rows incompatible with the bounded residual policy."""
     migrated = old.clone()
     if key == "std" or key.endswith(".std"):
         migrated[upper_action_ids] = 0.5
@@ -298,6 +299,7 @@ def prepare_loaded_dict_for_obs_expand(
     runner,
     *,
     migrate_legacy_upper_body_residual: bool = False,
+    migrate_bounded_upper_body_policy: bool = False,
 ) -> bool:
     """Adapt legacy observation layouts and joint-action checkpoints in place."""
     policy = _get_alg_policy(runner)
@@ -311,22 +313,39 @@ def prepare_loaded_dict_for_obs_expand(
     residual_layout = _reference_upper_residual_layout(runner)
     checkpoint_semantics = _checkpoint_upper_body_action_semantics(loaded_dict)
     migrate_residual_output = False
+    if migrate_legacy_upper_body_residual and migrate_bounded_upper_body_policy:
+        raise ValueError(
+            "Choose exactly one upper-body migration flag; they represent different source checkpoint semantics."
+        )
     if residual_layout is None:
-        if migrate_legacy_upper_body_residual:
+        if migrate_legacy_upper_body_residual or migrate_bounded_upper_body_policy:
             raise ValueError(
-                "--migrate_legacy_upper_body_residual was requested, but this task does not use "
+                "An upper-body migration was requested, but this task does not use "
                 "reference-relative upper-body residual actions."
             )
-    elif checkpoint_semantics == UPPER_BODY_REFERENCE_RESIDUAL_V1:
-        if migrate_legacy_upper_body_residual:
+    elif checkpoint_semantics == UPPER_BODY_BOUNDED_REFERENCE_RESIDUAL_V2:
+        if migrate_legacy_upper_body_residual or migrate_bounded_upper_body_policy:
             raise ValueError(
-                "This checkpoint already uses reference_residual_v1. Remove "
-                "--migrate_legacy_upper_body_residual; normal resume must never reset the arm head."
+                "This checkpoint already uses bounded_reference_residual_v2. Remove the migration flag; "
+                "normal resume must never reset the arm head."
             )
+    elif checkpoint_semantics == UPPER_BODY_REFERENCE_RESIDUAL_V1:
+        if not migrate_bounded_upper_body_policy:
+            raise RuntimeError(
+                "This Stage-2 checkpoint uses the unbounded reference_residual_v1 policy. Load it once with "
+                "--migrate_bounded_upper_body_policy to retain the lower body while resetting the 14 saturated "
+                "arm output rows. Do not reuse that flag after the converted run saves a checkpoint."
+            )
+        migrate_residual_output = True
     elif checkpoint_semantics is None:
+        if migrate_bounded_upper_body_policy:
+            raise ValueError(
+                "A checkpoint without an action-semantics marker is pre-residual. Use "
+                "--migrate_legacy_upper_body_residual instead of --migrate_bounded_upper_body_policy."
+            )
         if not migrate_legacy_upper_body_residual:
             raise RuntimeError(
-                "This Stage-2 task expects reference_residual_v1 arm actions, but the checkpoint has "
+                "This Stage-2 task expects bounded_reference_residual_v2 arm actions, but the checkpoint has "
                 "no residual-action marker. For a pre-residual checkpoint, load it once with "
                 "--migrate_legacy_upper_body_residual. Do not use that flag for checkpoints saved "
                 "after migration."
@@ -335,7 +354,7 @@ def prepare_loaded_dict_for_obs_expand(
     else:
         raise ValueError(
             f"Unsupported upper-body action semantics {checkpoint_semantics!r}; expected "
-            f"{UPPER_BODY_REFERENCE_RESIDUAL_V1!r}."
+            f"{UPPER_BODY_BOUNDED_REFERENCE_RESIDUAL_V2!r}."
         )
     old_action_dim = int(ckpt_sd["std"].numel()) if isinstance(ckpt_sd.get("std"), torch.Tensor) else None
     new_action_dim = int(current_sd["std"].numel()) if isinstance(current_sd.get("std"), torch.Tensor) else None
@@ -370,7 +389,7 @@ def prepare_loaded_dict_for_obs_expand(
                 upper_action_ids=upper_action_ids,
             )
             migrated_residual_keys.append(key)
-            notes.append(f"{key}: reset 14 legacy absolute arm rows for residual actions")
+            notes.append(f"{key}: reset 14 incompatible arm rows for bounded residual actions")
             changed = True
             continue
 
@@ -427,10 +446,10 @@ def prepare_loaded_dict_for_obs_expand(
                 "Could not identify both the actor output and exploration std tensors required for "
                 "the one-time upper-body residual migration."
             )
-        loaded_dict[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_REFERENCE_RESIDUAL_V1
+        loaded_dict[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_BOUNDED_REFERENCE_RESIDUAL_V2
         infos = loaded_dict.get("infos")
         stamped_infos = dict(infos) if isinstance(infos, dict) else {}
-        stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_REFERENCE_RESIDUAL_V1
+        stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_BOUNDED_REFERENCE_RESIDUAL_V2
         loaded_dict["infos"] = stamped_infos
 
     if not changed:
@@ -443,12 +462,12 @@ def prepare_loaded_dict_for_obs_expand(
     print("[INFO] Warm-start: adapted a legacy checkpoint to the current interface.")
     if migrate_residual_output:
         print(
-            "[INFO] One-time arm migration: kept lower-body/hidden/critic weights, reset only "
-            "the 14 legacy arm output rows, and started a fresh optimizer."
+            "[INFO] One-time bounded-policy migration: kept lower-body/hidden/critic weights, reset only "
+            "the 14 incompatible arm output rows, and started a fresh optimizer."
         )
         print(
             "[INFO] Future resumes from checkpoints saved by this run must NOT use "
-            "--migrate_legacy_upper_body_residual."
+            "either upper-body migration flag."
         )
     for note in notes:
         if "->" in note:
@@ -478,11 +497,15 @@ def load_checkpoint_with_obs_expand(runner, path: str, **load_kwargs) -> Any:
     migrate_legacy_upper_body_residual = bool(
         load_kwargs.pop("migrate_legacy_upper_body_residual", False)
     )
+    migrate_bounded_upper_body_policy = bool(
+        load_kwargs.pop("migrate_bounded_upper_body_policy", False)
+    )
     loaded_dict = torch.load(path, map_location=map_location, weights_only=False)
     expanded = prepare_loaded_dict_for_obs_expand(
         loaded_dict,
         runner,
         migrate_legacy_upper_body_residual=migrate_legacy_upper_body_residual,
+        migrate_bounded_upper_body_policy=migrate_bounded_upper_body_policy,
     )
 
     if not expanded:

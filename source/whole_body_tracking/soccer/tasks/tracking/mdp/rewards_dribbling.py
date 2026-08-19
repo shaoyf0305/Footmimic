@@ -24,6 +24,31 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+_RESET_CONTACT_GUARD_STEPS = 1
+_BALL_CONTACT_COLLISION_LABELS = {
+    # The URDF attaches the complete lower-leg collision cylinder to the knee
+    # link.  Calling this a knee contact is visually misleading.
+    "left_knee_link": "left_shin_collision",
+    "right_knee_link": "right_shin_collision",
+}
+
+
+def soccer_ball_contact_collision_names(body_names: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Return collision-semantic labels for robot body filter names."""
+    return tuple(_BALL_CONTACT_COLLISION_LABELS.get(name, name) for name in body_names)
+
+
+def _zero_reset_contact_samples(env: ManagerBasedRLEnv, values: torch.Tensor) -> torch.Tensor:
+    """Remove the stale PhysX contact sample immediately following reset."""
+    step_buf = getattr(env, "episode_length_buf", None)
+    if not isinstance(step_buf, torch.Tensor) or step_buf.shape[0] != env.num_envs:
+        return values
+    reset_guard = step_buf.to(device=values.device) <= _RESET_CONTACT_GUARD_STEPS
+    while reset_guard.ndim < values.ndim:
+        reset_guard = reset_guard.unsqueeze(-1)
+    return torch.where(reset_guard, torch.zeros_like(values), values)
+
+
 def soccer_ball_contact_net_force_w(
     env: ManagerBasedRLEnv,
     ball_sensor_name: str = "soccer_ball_contact",
@@ -57,9 +82,9 @@ def soccer_ball_contact_net_force_w(
         return zero
 
     if forces.ndim == 3:
-        return forces[:, 0, :]
+        return _zero_reset_contact_samples(env, forces[:, 0, :])
     if forces.shape[-1] >= 3:
-        return forces[:, :3]
+        return _zero_reset_contact_samples(env, forces[:, :3])
     return zero
 
 
@@ -75,9 +100,15 @@ def _soccer_ball_filtered_forces_w(
     ``None`` tensor signals that the runtime only supports the legacy net force.
     """
     contact_sensor: ContactSensor = env.scene.sensors[ball_sensor_name]
+    filter_expr = getattr(contact_sensor.cfg, "filter_prim_paths_expr", ()) or ()
+    names = tuple(str(path).rstrip("/").rsplit("/", 1)[-1] for path in filter_expr)
+    expected_filter_count = len(names)
     matrix = getattr(contact_sensor.data, "force_matrix_w", None)
     if not isinstance(matrix, torch.Tensor) or matrix.numel() == 0:
-        return None, ()
+        setattr(env, "_soccer_ball_contact_filter_count", 0)
+        setattr(env, "_soccer_ball_contact_expected_filter_count", expected_filter_count)
+        setattr(env, "_soccer_ball_contact_filter_mapping_valid", False)
+        return None, names
 
     matrix = torch.nan_to_num(matrix.to(env.device))
     if matrix.ndim == 4:
@@ -86,15 +117,39 @@ def _soccer_ball_filtered_forces_w(
     elif matrix.ndim == 2 and matrix.shape[-1] == 3:
         matrix = matrix.unsqueeze(1)
     if matrix.ndim != 3 or matrix.shape[-1] < 3:
-        return None, ()
+        setattr(env, "_soccer_ball_contact_filter_count", 0)
+        setattr(env, "_soccer_ball_contact_expected_filter_count", expected_filter_count)
+        setattr(env, "_soccer_ball_contact_filter_mapping_valid", False)
+        return None, names
     matrix = matrix[..., :3]
 
-    filter_expr = getattr(contact_sensor.cfg, "filter_prim_paths_expr", ()) or ()
-    names = tuple(str(path).rstrip("/").rsplit("/", 1)[-1] for path in filter_expr)
-    usable = min(matrix.shape[1], len(names))
-    if usable <= 0:
-        return None, ()
-    return matrix[:, :usable], names[:usable]
+    actual_filter_count = int(matrix.shape[1])
+    mapping_valid = actual_filter_count == expected_filter_count and expected_filter_count > 0
+    setattr(env, "_soccer_ball_contact_filter_count", actual_filter_count)
+    setattr(env, "_soccer_ball_contact_expected_filter_count", expected_filter_count)
+    setattr(env, "_soccer_ball_contact_filter_mapping_valid", mapping_valid)
+    if not mapping_valid:
+        raise RuntimeError(
+            "Soccer-ball contact filter mapping is ambiguous: PhysX returned "
+            f"{actual_filter_count} columns for {expected_filter_count} configured body filters. "
+            "Refusing to assign link names or train with a geometry guess. Verify the active "
+            "ContactSensor filter layout. The compatibility fallback is reserved for runtimes "
+            "that do not expose force_matrix_w at all."
+        )
+    return _zero_reset_contact_samples(env, matrix), names
+
+
+def soccer_ball_contact_filter_status(
+    env: ManagerBasedRLEnv,
+    ball_sensor_name: str = "soccer_ball_contact",
+) -> tuple[int, int, bool]:
+    """Return runtime/expected filter counts and whether column labels are safe."""
+    _soccer_ball_filtered_forces_w(env, ball_sensor_name)
+    return (
+        int(getattr(env, "_soccer_ball_contact_filter_count", 0)),
+        int(getattr(env, "_soccer_ball_contact_expected_filter_count", 0)),
+        bool(getattr(env, "_soccer_ball_contact_filter_mapping_valid", False)),
+    )
 
 
 def soccer_ball_body_contact_force_magnitudes(
@@ -240,8 +295,8 @@ def soccer_ball_robot_contact(
     if (
         not isinstance(state, dict)
         or not isinstance(state.get("last_step"), torch.Tensor)
-        or not isinstance(state.get("base_reward"), torch.Tensor)
-        or not isinstance(state.get("improvement_reward"), torch.Tensor)
+        or not isinstance(state.get("steps_since_contact"), torch.Tensor)
+        or not isinstance(state.get("contact"), torch.Tensor)
         or state["last_step"].shape[0] != env.num_envs
     ):
         state = {
@@ -262,10 +317,10 @@ def soccer_ball_robot_contact(
         torch.zeros_like(steps_since),
         torch.clamp(steps_since + 1, max=int(hold_steps) + 1),
     )
-    # Never carry a contact hold across an environment reset.  Contact at the
-    # reset pose can be detected normally from the following control step.
+    # Never carry a contact hold or a stale PhysX initialization impulse across
+    # an environment reset.  Contact is detected normally after the guard.
     next_steps_since = torch.where(
-        step_buf == 0,
+        step_buf <= _RESET_CONTACT_GUARD_STEPS,
         torch.full_like(next_steps_since, int(hold_steps) + 1),
         next_steps_since,
     )

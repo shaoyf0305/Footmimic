@@ -34,6 +34,16 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
             "after migration. This temporary compatibility flag can be removed with the legacy loader."
         ),
     )
+    arg_group.add_argument(
+        "--migrate_bounded_upper_body_policy",
+        action="store_true",
+        default=False,
+        help=(
+            "One-time migration for a reference_residual_v1 Stage-2 checkpoint: preserve the "
+            "lower body and reset only the 14 saturated arm output rows before switching to the "
+            "bounded tanh-Normal policy. Never use for a checkpoint saved after migration."
+        ),
+    )
     # -- logger arguments
     arg_group.add_argument(
         "--logger", type=str, default=None, choices={"wandb", "tensorboard", "neptune"}, help="Logger module to use."

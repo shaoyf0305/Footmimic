@@ -2,6 +2,21 @@
 
 > **维护约定：本文件是当前 S1/S2 MDP 的唯一持续更新总表。** 后续 input、reward、termination、reset 或 diagnostics 发生变化时，直接修改 `MDP_SUMMARY.md`，不再新建 `MDP_SUMMARY_09.md` 等编号文件；旧的编号版中间总结已删除。
 
+## 0.1 当前更新：contact 语义校验与 bounded policy
+
+`diagnostic_20260819_142724.npz` 暴露出两个不能继续靠后处理掩盖的问题：接触诊断把挂在 `right_knee_link` 下的整段小腿碰撞圆柱显示成“膝盖”，而 S2 actor 的 14 维手臂原始 residual 已有 `89.65%` 落入旧 tanh/clamp 饱和区。
+
+当前修复如下：
+
+- 接触 reward 的合法性不变：只有 `right_ankle_roll_link` 合法，小腿触球仍是 undesired contact；但 diagnostics 同时保存 body 名和碰撞语义名，`right_knee_link` 明确显示为 `right_shin_collision`；
+- 逐-link `force_matrix_w` 只有在 runtime filter 列数与配置 filter 数完全一致时才会被赋予 body 名；不再用 `min(count)` 静默截断后继续解释错位列。matrix 存在但数量不符时直接报错，只有旧 runtime 完全没有 matrix 时才走兼容回退；
+- reset 后第一个 control step 的 PhysX stale contact sample 统一清零，启动时一次性的左右小腿 `851/877 N` 不再进入 reward、termination 或 diagnostics；
+- 修复 contact hold 缓存字段校验错误；两步 hold 现在确实跨控制步保留，并在 reset guard 内清空，不再每次调用时重建；
+- S2 手臂 14 维改为部分 tanh-Normal 策略：下肢仍为普通 Gaussian，手臂采样值严格位于 `(-1,1)`，PPO log-prob 包含 tanh Jacobian 修正；
+- actor 的手臂 pre-squash mean 先限制在 `±atanh(0.95)`，确定性 play 和 ONNX 使用同一变换；环境收到的已经是有界 residual，不再对它重复施加第一层 tanh；
+- PCA 投影后只保留一次 `±0.25 rad` 物理安全 clamp 和 1.8 Hz residual filter，最终仍受 soft joint limits 保护；
+- checkpoint action marker 升级为 `bounded_reference_residual_v2`。Essay 11 的 `reference_residual_v1` checkpoint 必须显式做一次 bounded-policy 迁移并重置已经饱和的 14 行手臂输出头。
+
 ## 0. Essay 10：reset 与 no-contact 修复
 
 `diagnostic_20260818_131135.npz` 中第一轮在 `+0.65 rad` 和 `-0.65 rad` 转向时分别触发 `dribbling_no_contact`。旧 reset 保留失败时的手动 segment，却沿 task `+X` 重生球，导致球在当前 command frame 中瞬间侧偏 `-0.267 m` / `+0.230 m`；完整 sequence 结束后回到 heading 0，第二轮才明显变好。首帧还出现过 `876.8 N` 的左膝--球初始化接触。
@@ -191,7 +206,7 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 | 14 | `dribbling_rapid_retouch_penalty` | -1.0 | -0.020 | event-normalized；两次右脚 `<=14 N` 触球间隔 `<14 steps` 时实际回报 `-1.0/event` |
 | 15 | `dribbling_useful_foot_touch` | +1.0 | +0.020 | event-normalized；新轻触给 25% 基础分，5 steps 后按控制改善给其余 75%，单次最高 `+1.0`；CG 窗口为软系数 |
 | 16 | `dribbling_micro_contact_filter` | -4.0 | -0.080 | 右 ankle force EMA 超过 `22 N` 后连续惩罚，raw 上限 2 |
-| 17 | `dribbling_undesired_contact_penalty` | -12.0 | -0.240 | 右 ankle 以外所有机器人 link 触球均惩罚，包括左脚 |
+| 17 | `dribbling_undesired_contact_penalty` | -12.0 | -0.240 | 右 ankle 以外所有机器人碰撞体触球均惩罚，包括左脚和左右小腿；URDF 的小腿碰撞体挂在 `*_knee_link` 下 |
 | 18 | `dribbling_cg_foot_ball_distance` | +3.5 | +0.070 | 仅在 CG reference foot--ball distance `<=0.55 m` 的接近/触球窗口跟踪，`std=0.22` |
 | 19 | `action_rate_l2` | -0.1 | -0.002 | 对 effective action 做变化率惩罚 |
 | 20 | `joint_limit` | -10.0 | -0.200 | soft joint limit 越界惩罚 |
@@ -209,7 +224,7 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 | `dribbling_gait_foot_tracking` | +1.4 | 删除 | 与常驻 `motion_foot_pos` 重复，而且恰在追球时把策略拉回 demo gait |
 | `dribbling_chase_ball` | +2.0 | 删除并入 pelvis 闭环 | 只奖励绝对 pelvis 前向速度，不能判断是否真正接近运动中的球 |
 | `dribbling_cg_contact_consistency` | +1.0 | 合并进 useful touch | 独立 CG 事件分数不判断触球结果；现在只对物理上有效的触球做 timing 调制 |
-| `upper_body_reference_overflow` | -0.05 | 删除 | 读取旧绝对 target 包络前的 overflow，但策略输入是执行后的 action；现由 reference-relative residual、PCA tangent 投影和 smooth tanh envelope 直接定义执行语义 |
+| `upper_body_reference_overflow` | -0.05 | 删除 | 读取旧绝对 target 包络前的 overflow，但策略输入是执行后的 action；现由 reference-relative residual、PCA tangent 投影、策略侧 tanh-Normal 和投影后的物理安全限幅直接定义执行语义 |
 
 这些项不是权重设为 0，而是已从 Stage 2 配置及对应实现中删除。S2 reward 数量由 28 降为 20。
 
@@ -244,23 +259,34 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 - CLI manual command 安装后会立即同步 robot yaw 和球，因此第一次 rollout 与之后的 reset 使用相同 command frame。
 - command 训练范围保持 speed `0.40--1.50 m/s`、heading `-0.75--0.75 rad`、duration `3--6 s`。
 - 输入与 action 维度不变：Actor 163、Critic 295、Action 29，因此现有 S1/S2 checkpoint 在结构上兼容；本次不需要重训 S1。
+- reset 后首个 control step 的接触传感器值按初始化保护帧处理，不会把 pre-reset/stale PhysX 冲量计入触球 reward、termination 或 diagnostics。
 
 ### 7.1 旧 checkpoint 的一次性迁移
 
-旧 checkpoint 的双臂输出是绝对关节 target，不能直接解释为 residual。首次从旧 S1/S2 checkpoint 初始化新的 S2 run 时，必须显式添加：
+保留 checkpoint 分为三种 action 语义，迁移参数不能混用：
+
+1. 旧 S1/S2 checkpoint 没有 action marker，双臂还是绝对 target。首次初始化 S2 时添加：
 
 ```bash
 --migrate_legacy_upper_body_residual
 ```
 
-迁移只清零 actor 最后输出层的双臂 14 行，将这 14 维 exploration std 设为 `0.5`；下肢输出、RNN/MLP 隐层、critic 和 observation normalizer 全部保留。由于 action 语义变化，旧 optimizer 被丢弃并重新初始化。
+2. Essay 11 的 S2 checkpoint 带 `reference_residual_v1` marker，但其 Gaussian actor 仍可输出无界 residual。首次切换到当前 bounded policy 时添加：
+
+```bash
+--migrate_bounded_upper_body_policy
+```
+
+3. 当前 checkpoint 带 `bounded_reference_residual_v2` marker，正常 resume，两个迁移参数都不能添加。
+
+两条迁移路径都只清零 actor 最后输出层的双臂 14 行，将这 14 维 exploration std 设为 `0.5`；下肢输出、RNN/MLP 隐层、critic 和 observation normalizer 全部保留。由于 action 分布或语义变化，旧 optimizer 被丢弃并重新初始化。
 
 这是带 `TEMPORARY LEGACY MIGRATION` 标记的过渡模块，不会自动触发：
 
-- 旧 checkpoint 没有 `reference_residual_v1` 标记且未提供迁移参数时，loader 直接拒绝加载；
-- 迁移后的新 checkpoint 会在 `infos` 中写入 `upper_body_action_semantics=reference_residual_v1`；
+- 无 marker 或 `reference_residual_v1` checkpoint 未提供各自正确的迁移参数时，loader 直接拒绝加载；
+- 迁移后的新 checkpoint 会在 `infos` 中写入 `upper_body_action_semantics=bounded_reference_residual_v2`；
 - 正确 resume 新 checkpoint 时**不得**再加迁移参数；如果误加，loader 会报错而不是再次清零双臂；
-- 基线确认且所有保留 checkpoint 都已迁移后，可以删除该 CLI 参数和 checkpoint loader 中整段临时迁移代码；runtime residual action 不依赖它。
+- 基线确认且所有保留 checkpoint 都已迁移后，可以删除这两个 CLI 参数和 checkpoint loader 中整段临时迁移代码；runtime bounded policy 与 residual action 不依赖它。
 
 ## 8. Diagnostics
 
@@ -298,6 +324,11 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 - `reference_relative_upper_body_residual`
 - `upper_residual_policy`、`upper_residual_projected`
 - `upper_residual_executed`、`upper_residual_saturation_fraction`
+- `ball_contact_body_names`：Isaac articulation body/link 名
+- `ball_contact_collision_names`：用于视频解释的碰撞语义名；例如 `right_knee_link -> right_shin_collision`
+- `ball_contact_filter_count`、`ball_contact_expected_filter_count`
+- `ball_contact_filter_mapping_valid`：只有为 true 时逐-link force 列才按上述名称解释
+- `bounded_upper_body_policy_action`：当前 action term 是否启用策略侧 tanh-Normal；新 S2 应为 true，S1 为 false
 
 旧 possession timer 和独立 CG contact-consistency telemetry 已删除，避免把不再参与当前 MDP 的状态误认为有效门控。
 
@@ -314,6 +345,6 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 | recovery 中 closing speed | 大部分为正，不再出现 chase reward 满分但距离持续增大 |
 | useful touch 改善成功率 | 随训练上升；轻触基础分与延迟改善分必须分开看 |
 | 手臂、腰部参考误差 | 至少保持 06 水平，并继续向 5.0 靠近 |
-| 上肢 residual 饱和比例 | 从旧绝对 target 的 `92.35%` 降到 `<10%`，并检查 `upper_residual_policy` 不再持续增大 |
+| 上肢 residual 饱和比例 | 从 Essay 11 的 `89.65%` 降到 `<10%`；`upper_residual_policy` 必须始终位于 `[-1,1]`，且 play/ONNX 一致 |
 
-网络结构不变，但旧 checkpoint 的双臂输出语义不同。应保留旧 run 作为只读基线，通过 `--migrate_legacy_upper_body_residual` 只迁移一次并写入新的 experiment/run；之后从新 run 的 checkpoint 正常 resume，绝不能继续携带该迁移参数。
+网络参数结构不变，但旧 checkpoint 的双臂输出分布或语义不同。无 marker 的旧 S1/S2 使用 `--migrate_legacy_upper_body_residual`；Essay 11 `reference_residual_v1` 使用 `--migrate_bounded_upper_body_policy`。两者都只迁移一次并写入新 run，之后从 `bounded_reference_residual_v2` checkpoint 正常 resume，绝不能继续携带迁移参数。

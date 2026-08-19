@@ -229,12 +229,14 @@ import torch
 
 from soccer.tasks.tracking.mdp.rewards_dribbling import (
     soccer_ball_body_contact_force_magnitudes,
+    soccer_ball_contact_collision_names,
+    soccer_ball_contact_filter_status,
     soccer_ball_contact_force_magnitude,
     soccer_ball_max_link_contact_force_magnitude,
     soccer_ball_robot_contact,
 )
 
-from rsl_rl.runners import OnPolicyRunner
+from soccer.utils.bounded_actor_critic import BoundedOnPolicyRunner as OnPolicyRunner
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -708,6 +710,9 @@ def _create_diagnostic(
     reference_relative_upper_residual = bool(
         getattr(action_term, "uses_reference_relative_upper_body_residual", False)
     )
+    bounded_upper_body_policy_action = bool(
+        getattr(action_term, "uses_bounded_upper_body_policy_action", False)
+    )
     if direct_upper_latent:
         trunk_action_ids = action_term.policy_action_ids_for_robot_joint_ids(trunk_joint_ids)
     else:
@@ -725,6 +730,12 @@ def _create_diagnostic(
     _body_force, ball_contact_body_names, ball_contact_filter_available = (
         soccer_ball_body_contact_force_magnitudes(base_env, _BALL_SENSOR_NAME)
     )
+    ball_contact_collision_labels = soccer_ball_contact_collision_names(ball_contact_body_names)
+    (
+        ball_contact_filter_count,
+        ball_contact_expected_filter_count,
+        ball_contact_filter_mapping_valid,
+    ) = soccer_ball_contact_filter_status(base_env, _BALL_SENSOR_NAME)
     constraint_groups = np.asarray([constraint["group"] for constraint in constraints])
     constraint_margins = np.asarray([constraint["margin"] for constraint in constraints], dtype=np.float32)
     constraint_joint_names = (
@@ -739,6 +750,7 @@ def _create_diagnostic(
         "action_ids": torch.as_tensor(arm_action_ids, dtype=torch.long, device=base_env.device),
         "direct_upper_body_latent": direct_upper_latent,
         "reference_relative_upper_body_residual": reference_relative_upper_residual,
+        "bounded_upper_body_policy_action": bounded_upper_body_policy_action,
         "trunk_joint_ids": torch.as_tensor(trunk_joint_ids, dtype=torch.long, device=base_env.device),
         "trunk_joint_names": np.asarray(_TRUNK_DIAGNOSTIC_JOINT_NAMES),
         "trunk_action_ids": torch.as_tensor(trunk_action_ids, dtype=torch.long, device=base_env.device),
@@ -753,7 +765,11 @@ def _create_diagnostic(
         "reward_step_dt": reward_step_dt,
         "task_state_names": np.asarray(["idle", "dribble", "stop"]),
         "ball_contact_body_names": np.asarray(ball_contact_body_names),
+        "ball_contact_collision_names": np.asarray(ball_contact_collision_labels),
         "ball_contact_filter_available": bool(ball_contact_filter_available),
+        "ball_contact_filter_count": int(ball_contact_filter_count),
+        "ball_contact_expected_filter_count": int(ball_contact_expected_filter_count),
+        "ball_contact_filter_mapping_valid": bool(ball_contact_filter_mapping_valid),
         "constraint_group": "none" if not constraints else "+".join(constraint_groups.tolist()),
         "constraint_margin": float(constraint_margins[0]) if len(constraints) == 1 else np.nan,
         "constraint_joint_names": constraint_joint_names,
@@ -1464,12 +1480,15 @@ def _save_diagnostic(diagnostic: dict) -> None:
     metadata_keys = {
         "path", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names",
         "reward_term_weights", "reward_term_step_weights", "reward_step_dt", "task_state_names",
-        "ball_contact_body_names", "ball_contact_filter_available",
+        "ball_contact_body_names", "ball_contact_collision_names", "ball_contact_filter_available",
+        "ball_contact_filter_count", "ball_contact_expected_filter_count",
+        "ball_contact_filter_mapping_valid",
         "trunk_joint_ids", "trunk_joint_names", "trunk_action_ids", "trunk_body_ids",
         "trunk_reference_body_ids", "trunk_body_names",
         "constraint_group", "constraint_margin", "constraint_joint_names", "constraint_groups",
         "constraint_margins", "waist_roll_stiffness_scale", "waist_roll_damping_scale",
         "direct_upper_body_latent", "reference_relative_upper_body_residual",
+        "bounded_upper_body_policy_action",
     }
     arrays = {
         key: np.asarray(value)
@@ -1485,8 +1504,16 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["reward_step_dt"] = np.asarray(diagnostic["reward_step_dt"])
     arrays["task_state_names"] = diagnostic["task_state_names"]
     arrays["ball_contact_body_names"] = diagnostic["ball_contact_body_names"]
+    arrays["ball_contact_collision_names"] = diagnostic["ball_contact_collision_names"]
     arrays["ball_contact_filter_available"] = np.asarray(
         diagnostic["ball_contact_filter_available"]
+    )
+    arrays["ball_contact_filter_count"] = np.asarray(diagnostic["ball_contact_filter_count"])
+    arrays["ball_contact_expected_filter_count"] = np.asarray(
+        diagnostic["ball_contact_expected_filter_count"]
+    )
+    arrays["ball_contact_filter_mapping_valid"] = np.asarray(
+        diagnostic["ball_contact_filter_mapping_valid"]
     )
     arrays["constraint_group"] = np.asarray(diagnostic["constraint_group"])
     arrays["constraint_margin"] = np.asarray(diagnostic["constraint_margin"])
@@ -1498,6 +1525,9 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["direct_upper_body_latent"] = np.asarray(diagnostic["direct_upper_body_latent"])
     arrays["reference_relative_upper_body_residual"] = np.asarray(
         diagnostic["reference_relative_upper_body_residual"]
+    )
+    arrays["bounded_upper_body_policy_action"] = np.asarray(
+        diagnostic["bounded_upper_body_policy_action"]
     )
     np.savez_compressed(diagnostic["path"], **arrays)
     contact_rate = float(np.mean(arrays["ball_contact"]))
@@ -2236,6 +2266,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         ppo_runner,
         resume_path,
         migrate_legacy_upper_body_residual=args_cli.migrate_legacy_upper_body_residual,
+        migrate_bounded_upper_body_policy=args_cli.migrate_bounded_upper_body_policy,
     )
 
     # obtain the trained policy for inference

@@ -362,6 +362,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             cutoff_frequency_hz=1.8,
             reference_target_margin=0.25,
             reference_relative_upper_body_residual=True,
+            upper_body_policy_action_is_bounded=True,
         )
         self.actions.joint_pos.scale = old_action_cfg.scale
         self.actions.joint_pos.offset = old_action_cfg.offset

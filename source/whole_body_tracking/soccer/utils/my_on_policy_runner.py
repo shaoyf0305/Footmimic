@@ -1,11 +1,10 @@
 import os
 
 from rsl_rl.env import VecEnv
-from rsl_rl.runners.on_policy_runner import OnPolicyRunner
-
 from isaaclab_rl.rsl_rl import export_policy_as_onnx
 
 import wandb
+from soccer.utils.bounded_actor_critic import BoundedOnPolicyRunner
 from soccer.utils.checkpoint_loading import (
     checkpoint_infos_with_action_semantics,
     load_checkpoint_with_obs_expand,
@@ -13,7 +12,7 @@ from soccer.utils.checkpoint_loading import (
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
 
-class MyOnPolicyRunner(OnPolicyRunner):
+class MyOnPolicyRunner(BoundedOnPolicyRunner):
     def save(self, path: str, infos=None):
         """Save the model and training information."""
         infos = checkpoint_infos_with_action_semantics(self, infos)
@@ -26,7 +25,7 @@ class MyOnPolicyRunner(OnPolicyRunner):
             wandb.save(policy_path + filename, base_path=os.path.dirname(policy_path))
 
 
-class MotionOnPolicyRunner(OnPolicyRunner):
+class MotionOnPolicyRunner(BoundedOnPolicyRunner):
     def __init__(
         self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu", registry_name: str = None
     ):

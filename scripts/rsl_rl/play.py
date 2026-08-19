@@ -43,7 +43,7 @@ import os
 import pathlib
 import torch
 
-from rsl_rl.runners import OnPolicyRunner
+from soccer.utils.bounded_actor_critic import BoundedOnPolicyRunner as OnPolicyRunner
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -145,6 +145,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         ppo_runner,
         resume_path,
         migrate_legacy_upper_body_residual=args_cli.migrate_legacy_upper_body_residual,
+        migrate_bounded_upper_body_policy=args_cli.migrate_bounded_upper_body_policy,
     )
 
     # obtain the trained policy for inference
