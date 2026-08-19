@@ -10,6 +10,10 @@ import torch
 from rsl_rl.runners.on_policy_runner import OnPolicyRunner as BaseOnPolicyRunner
 
 
+UPPER_BODY_ACTION_SEMANTICS_KEY = "upper_body_action_semantics"
+UPPER_BODY_REFERENCE_RESIDUAL_V1 = "reference_residual_v1"
+
+
 def _get_alg_policy(runner):
     """Resolve policy module across rsl_rl versions (``alg.policy`` or legacy ``alg.actor_critic``)."""
     alg = runner.alg
@@ -20,6 +24,48 @@ def _get_alg_policy(runner):
     raise AttributeError(
         f"Unsupported algorithm type {type(alg)!r}: expected ``policy`` or ``actor_critic`` attribute."
     )
+
+
+def _reference_upper_residual_layout(runner) -> tuple[list[int], int] | None:
+    """Return arm action rows when the environment uses the 29-D residual interface."""
+    env = getattr(runner, "env", None)
+    base_env = getattr(env, "unwrapped", env)
+    try:
+        action_term = base_env.action_manager.get_term("joint_pos")
+    except (AttributeError, KeyError):
+        return None
+    if not getattr(action_term, "uses_reference_relative_upper_body_residual", False):
+        return None
+    upper_ids = getattr(action_term, "_upper_action_ids", None)
+    if not isinstance(upper_ids, torch.Tensor):
+        return None
+    return [int(index) for index in upper_ids.detach().cpu().tolist()], int(action_term.action_dim)
+
+
+def _checkpoint_upper_body_action_semantics(loaded_dict: dict[str, Any]) -> str | None:
+    semantics = loaded_dict.get(UPPER_BODY_ACTION_SEMANTICS_KEY)
+    if isinstance(semantics, str):
+        return semantics
+    infos = loaded_dict.get("infos")
+    if isinstance(infos, dict):
+        semantics = infos.get(UPPER_BODY_ACTION_SEMANTICS_KEY)
+        if isinstance(semantics, str):
+            return semantics
+    return None
+
+
+def checkpoint_infos_with_action_semantics(runner, infos):
+    """Stamp newly saved residual-action checkpoints for safe future resumes."""
+    if _reference_upper_residual_layout(runner) is None:
+        return infos
+    if infos is None:
+        stamped_infos: dict[str, Any] = {}
+    elif isinstance(infos, dict):
+        stamped_infos = dict(infos)
+    else:
+        raise TypeError(f"Checkpoint infos must be a dict or None, got {type(infos)!r}.")
+    stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_REFERENCE_RESIDUAL_V1
+    return stamped_infos
 
 
 # Current observations retain polar ball position, polar locomotion command,
@@ -197,6 +243,46 @@ def _migrate_direct_latent_action_output(
     return migrated
 
 
+# TEMPORARY LEGACY MIGRATION -------------------------------------------------
+# Remove this block, its CLI flag, and the call site once every retained
+# Stage-2 baseline checkpoint has been converted to reference_residual_v1.
+# The runtime residual action term does not depend on this compatibility code.
+def _is_legacy_joint_action_output(
+    key: str,
+    old: torch.Tensor,
+    cur: torch.Tensor,
+    *,
+    action_dim: int,
+) -> bool:
+    """Identify actor-head rows without touching hidden layers or the critic."""
+    if old.shape != cur.shape or old.ndim not in (1, 2) or old.shape[0] != action_dim:
+        return False
+    if key == "std" or key.endswith(".std"):
+        return old.ndim == 1
+    return key.startswith("actor.") and (
+        (old.ndim == 1 and key.endswith(".bias"))
+        or (old.ndim == 2 and key.endswith(".weight"))
+    )
+
+
+def _migrate_legacy_upper_body_output_to_residual(
+    old: torch.Tensor,
+    *,
+    key: str,
+    upper_action_ids: list[int],
+) -> torch.Tensor:
+    """Reset only the 14 arm rows whose meaning changes from absolute to residual."""
+    migrated = old.clone()
+    if key == "std" or key.endswith(".std"):
+        migrated[upper_action_ids] = 0.5
+    elif old.ndim == 1:
+        migrated[upper_action_ids] = 0.0
+    else:
+        migrated[upper_action_ids, :] = 0.0
+    return migrated
+# END TEMPORARY LEGACY MIGRATION ---------------------------------------------
+
+
 def _maybe_expand_normalizer_entry(loaded_dict: dict[str, Any], key: str, current_sd: dict[str, torch.Tensor]) -> bool:
     if key not in loaded_dict:
         return False
@@ -207,7 +293,12 @@ def _maybe_expand_normalizer_entry(loaded_dict: dict[str, Any], key: str, curren
     return True
 
 
-def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> bool:
+def prepare_loaded_dict_for_obs_expand(
+    loaded_dict: dict[str, Any],
+    runner,
+    *,
+    migrate_legacy_upper_body_residual: bool = False,
+) -> bool:
     """Adapt legacy observation layouts and joint-action checkpoints in place."""
     policy = _get_alg_policy(runner)
     model_key = "model_state_dict"
@@ -217,12 +308,42 @@ def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> b
     ckpt_sd = loaded_dict[model_key]
     current_sd = policy.state_dict()
     layout = _direct_upper_latent_layout(runner)
+    residual_layout = _reference_upper_residual_layout(runner)
+    checkpoint_semantics = _checkpoint_upper_body_action_semantics(loaded_dict)
+    migrate_residual_output = False
+    if residual_layout is None:
+        if migrate_legacy_upper_body_residual:
+            raise ValueError(
+                "--migrate_legacy_upper_body_residual was requested, but this task does not use "
+                "reference-relative upper-body residual actions."
+            )
+    elif checkpoint_semantics == UPPER_BODY_REFERENCE_RESIDUAL_V1:
+        if migrate_legacy_upper_body_residual:
+            raise ValueError(
+                "This checkpoint already uses reference_residual_v1. Remove "
+                "--migrate_legacy_upper_body_residual; normal resume must never reset the arm head."
+            )
+    elif checkpoint_semantics is None:
+        if not migrate_legacy_upper_body_residual:
+            raise RuntimeError(
+                "This Stage-2 task expects reference_residual_v1 arm actions, but the checkpoint has "
+                "no residual-action marker. For a pre-residual checkpoint, load it once with "
+                "--migrate_legacy_upper_body_residual. Do not use that flag for checkpoints saved "
+                "after migration."
+            )
+        migrate_residual_output = True
+    else:
+        raise ValueError(
+            f"Unsupported upper-body action semantics {checkpoint_semantics!r}; expected "
+            f"{UPPER_BODY_REFERENCE_RESIDUAL_V1!r}."
+        )
     old_action_dim = int(ckpt_sd["std"].numel()) if isinstance(ckpt_sd.get("std"), torch.Tensor) else None
     new_action_dim = int(current_sd["std"].numel()) if isinstance(current_sd.get("std"), torch.Tensor) else None
 
     transformed_sd: dict[str, torch.Tensor] = {}
     notes: list[str] = []
     changed = False
+    migrated_residual_keys: list[str] = []
     for key, cur in current_sd.items():
         if key not in ckpt_sd:
             transformed_sd[key] = cur.clone()
@@ -231,6 +352,28 @@ def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> b
             continue
 
         old = ckpt_sd[key]
+        is_residual_action_output = (
+            migrate_residual_output
+            and residual_layout is not None
+            and _is_legacy_joint_action_output(
+                key,
+                old,
+                cur,
+                action_dim=residual_layout[1],
+            )
+        )
+        if is_residual_action_output:
+            upper_action_ids, _ = residual_layout
+            transformed_sd[key] = _migrate_legacy_upper_body_output_to_residual(
+                old,
+                key=key,
+                upper_action_ids=upper_action_ids,
+            )
+            migrated_residual_keys.append(key)
+            notes.append(f"{key}: reset 14 legacy absolute arm rows for residual actions")
+            changed = True
+            continue
+
         if old.shape == cur.shape:
             transformed_sd[key] = old
             continue
@@ -271,6 +414,25 @@ def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> b
             f"Incompatible checkpoint tensor '{key}': ckpt {tuple(old.shape)} vs env {tuple(cur.shape)}"
         )
 
+    if migrate_residual_output:
+        has_std = any(
+            key == "std" or key.endswith(".std") for key in migrated_residual_keys
+        )
+        has_actor_output = any(
+            key.startswith("actor.") and key.endswith(".weight")
+            for key in migrated_residual_keys
+        )
+        if not has_std or not has_actor_output:
+            raise RuntimeError(
+                "Could not identify both the actor output and exploration std tensors required for "
+                "the one-time upper-body residual migration."
+            )
+        loaded_dict[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_REFERENCE_RESIDUAL_V1
+        infos = loaded_dict.get("infos")
+        stamped_infos = dict(infos) if isinstance(infos, dict) else {}
+        stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_REFERENCE_RESIDUAL_V1
+        loaded_dict["infos"] = stamped_infos
+
     if not changed:
         return False
 
@@ -279,6 +441,15 @@ def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> b
     loaded_dict.pop("rnd_optimizer_state_dict", None)
 
     print("[INFO] Warm-start: adapted a legacy checkpoint to the current interface.")
+    if migrate_residual_output:
+        print(
+            "[INFO] One-time arm migration: kept lower-body/hidden/critic weights, reset only "
+            "the 14 legacy arm output rows, and started a fresh optimizer."
+        )
+        print(
+            "[INFO] Future resumes from checkpoints saved by this run must NOT use "
+            "--migrate_legacy_upper_body_residual."
+        )
     for note in notes:
         if "->" in note:
             print(f"  {note}")
@@ -304,8 +475,15 @@ def prepare_loaded_dict_for_obs_expand(loaded_dict: dict[str, Any], runner) -> b
 def load_checkpoint_with_obs_expand(runner, path: str, **load_kwargs) -> Any:
     """Load a checkpoint and migrate legacy observation/action interfaces."""
     map_location = load_kwargs.pop("map_location", getattr(runner, "device", None))
+    migrate_legacy_upper_body_residual = bool(
+        load_kwargs.pop("migrate_legacy_upper_body_residual", False)
+    )
     loaded_dict = torch.load(path, map_location=map_location, weights_only=False)
-    expanded = prepare_loaded_dict_for_obs_expand(loaded_dict, runner)
+    expanded = prepare_loaded_dict_for_obs_expand(
+        loaded_dict,
+        runner,
+        migrate_legacy_upper_body_residual=migrate_legacy_upper_body_residual,
+    )
 
     if not expanded:
         return BaseOnPolicyRunner.load(runner, path, **load_kwargs)

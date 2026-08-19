@@ -1040,6 +1040,17 @@ def dribbling_ball_xy_speed_excess_penalty(
 # Useful gentle foot touch.
 # ---------------------------------------------------------------------------
 
+def _event_score_to_reward_rate(env: ManagerBasedRLEnv, score: torch.Tensor) -> torch.Tensor:
+    """Convert a dimensionless event score to a reward rate.
+
+    IsaacLab multiplies every reward term by the control-step duration.  Event
+    terms occur on one step only, so returning ``score / step_dt`` makes their
+    integrated contribution independent of control frequency.
+    """
+    step_dt = max(float(getattr(env, "step_dt", 0.02)), 1.0e-6)
+    return score / step_dt
+
+
 def dribbling_useful_foot_touch(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
@@ -1074,9 +1085,10 @@ def dribbling_useful_foot_touch(
     impact-settling delay, the remaining score budget is proportional to the
     decrease in that error.  A neutral light touch is therefore valid and
     rewarded, while a touch that improves control still receives the full
-    score.  The base and improvement components sum to at most one per touch,
-    so this does not expand the term's original maximum reward budget.  CG
-    timing remains a soft style multiplier, not a separate reward.
+    score.  The base and improvement components sum to at most one per touch.
+    The score is converted to a reward rate so its integrated per-event return
+    is not accidentally reduced by ``step_dt``.  CG timing remains a soft
+    style multiplier, not a separate reward.
     """
     if evaluation_delay_steps <= 0 or improvement_scale <= 0.0:
         raise ValueError("touch delay and improvement scale must be positive.")
@@ -1233,8 +1245,10 @@ def dribbling_useful_foot_touch(
     setattr(env, "_dribbling_useful_touch_cg_aligned", cg_aligned)
     setattr(env, "_dribbling_useful_touch_base_reward", base_reward)
     setattr(env, "_dribbling_useful_touch_improvement_reward", improvement_reward)
-    setattr(env, "_dribbling_useful_touch_reward", reward)
-    return reward
+    reward_rate = _event_score_to_reward_rate(env, reward)
+    setattr(env, "_dribbling_useful_touch_event_score", reward)
+    setattr(env, "_dribbling_useful_touch_reward", reward_rate)
+    return reward_rate
 
 
 # ---------------------------------------------------------------------------
@@ -1412,7 +1426,9 @@ def dribbling_rapid_retouch_penalty(
 ) -> torch.Tensor:
     """Penalty for a **new** legal gentle touch sooner than ``min_steps_between_touches``.
 
-    Encourages kick → chase → kick cadence instead of tapping the ball every step.
+    Encourages kick → chase → kick cadence instead of tapping the ball every
+    step.  The one-step event score is converted to a reward rate so the
+    integrated penalty does not depend on the control-step duration.
     """
     if min_steps_between_touches <= 0:
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
@@ -1455,6 +1471,10 @@ def dribbling_rapid_retouch_penalty(
     too_soon = new_touch & (steps_since < int(min_steps_between_touches))
     steps_since = torch.where(new_touch, torch.zeros_like(steps_since), steps_since)
 
+    event_score = too_soon.to(torch.float32)
+    reward_rate = _event_score_to_reward_rate(env, event_score)
     setattr(env, prev_touch_name, touch.detach().clone())
     setattr(env, steps_name, steps_since)
-    return too_soon.to(torch.float32)
+    setattr(env, "_dribbling_rapid_retouch_event", too_soon)
+    setattr(env, "_dribbling_rapid_retouch_reward", reward_rate)
+    return reward_rate

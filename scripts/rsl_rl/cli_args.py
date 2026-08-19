@@ -24,6 +24,16 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     arg_group.add_argument("--resume", type=bool, default=None, help="Whether to resume from a checkpoint.")
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
+    arg_group.add_argument(
+        "--migrate_legacy_upper_body_residual",
+        action="store_true",
+        default=False,
+        help=(
+            "One-time migration for a pre-reference-residual Stage-2 checkpoint: preserve the "
+            "lower body and reset only the 14 arm output rows. Never use for a checkpoint saved "
+            "after migration. This temporary compatibility flag can be removed with the legacy loader."
+        ),
+    )
     # -- logger arguments
     arg_group.add_argument(
         "--logger", type=str, default=None, choices={"wandb", "tensorboard", "neptune"}, help="Logger module to use."

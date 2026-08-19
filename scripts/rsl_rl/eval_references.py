@@ -693,7 +693,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = _make_eval_env()
         base_env = _resolve_base_env(env)
         runner = OnPolicyRunner(env, agent_dict, log_dir=None, device=agent_cfg.device)
-        load_checkpoint_with_obs_expand(runner, resume_path)
+        load_checkpoint_with_obs_expand(
+            runner,
+            resume_path,
+            migrate_legacy_upper_body_residual=args_cli.migrate_legacy_upper_body_residual,
+        )
         policy = runner.get_inference_policy(device=base_env.device)
         _log("Policy loaded; starting per-reference rollouts.")
 
@@ -714,7 +718,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 env = _make_eval_env()
                 base_env = _resolve_base_env(env)
                 runner = OnPolicyRunner(env, agent_dict, log_dir=None, device=agent_cfg.device)
-                load_checkpoint_with_obs_expand(runner, resume_path)
+                load_checkpoint_with_obs_expand(
+                    runner,
+                    resume_path,
+                    migrate_legacy_upper_body_residual=args_cli.migrate_legacy_upper_body_residual,
+                )
                 policy = runner.get_inference_policy(device=base_env.device)
 
             # Fresh RNN hidden state per rollout.

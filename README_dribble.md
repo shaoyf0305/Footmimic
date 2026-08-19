@@ -87,8 +87,11 @@ Current contact truth uses filtered per-link robot contact with a two-control-st
 sensor hold. There is no reward possession timer. A new gentle right-ankle
 touch receives 25% of the useful-touch score immediately; the remaining 75%
 depends on whether combined predicted-position and ball-velocity error is lower
-five control steps later. The two parts still sum to at most the original unit
-raw score, and the CG contact window remains a soft timing multiplier.
+five control steps later. The two parts sum to at most one event score. Useful
+touch and rapid-retouch terms return `score / control_dt`, so their configured
+weights are frequency-independent per-event returns: up to `+1.0` for a fully
+useful touch and `-1.0` for a retouch within 14 steps. The CG contact window
+remains a soft timing multiplier.
 Diagnostics record the base and improvement components separately, together
 with the recovery gate, predicted ball position, closing speed, blended pelvis
 target, both contact channels, and the ball's net XY contact force. Net force
@@ -109,11 +112,28 @@ or `0.25` during a command-transition window while the pelvis closes on the
 ball. Any valid right-ankle contact clears it. IDLE and STOP do not accumulate
 this counter, and `ball_lost` is likewise gated to DRIBBLE.
 
-The upper-body reference envelope uses a smooth tanh bound instead of a hard
-clip. The policy still observes the final post-bound, post-manifold, filtered
-29-D effective action. The old pre-bound `upper_body_reference_overflow` reward
-has been deleted; diagnostics now record raw, bounded, and post-projection
-reference deviations plus the tanh saturation fraction.
+The 14 arm outputs in Stage 2 are reference-relative residuals while the full
+29-D action interface remains unchanged. Zero arm action means the live motion
+reference exactly. The correction is projected in the motion-bank PCA tangent,
+smoothly bounded to `q_ref ± 0.25 rad`, and filtered as a residual rather than
+an absolute target. The policy still observes the final normalized joint target,
+so the Stage-1/Stage-2 input layout remains consistent. Diagnostics include the
+policy, projected, and executed residuals plus their saturation fraction.
+
+Pre-residual checkpoints require an explicit one-time migration during the
+first Stage-2 train or play load:
+
+```text
+--migrate_legacy_upper_body_residual
+```
+
+This temporary compatibility path preserves the lower-body output, hidden
+layers, critic, and observation normalizer while resetting only the 14 legacy
+arm output rows. Newly saved checkpoints carry the `reference_residual_v1`
+marker. Never pass the migration flag when resuming one of those checkpoints;
+the loader rejects repeated migration. Once the retained baselines have all
+been converted, the clearly marked temporary loader block and CLI flag can be
+removed without changing the runtime residual controller.
 
 Use `--diagnostic_stride N` to record every Nth control step.
 

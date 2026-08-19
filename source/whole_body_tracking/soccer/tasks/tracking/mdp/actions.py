@@ -21,11 +21,12 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
 
     Lower-body targets pass through unchanged.  In legacy mode the policy emits
     one target per robot joint and the selected upper-body targets are projected
-    onto a PCA manifold.  Control mode can instead expose the PCA coordinates
-    directly: the policy emits only ``manifold_rank`` upper-body latent actions
-    and the term decodes them around the current motion reference.  This removes
-    the redundant upper-body action null space that otherwise lets raw actions
-    grow without changing the executed pose.
+    onto a PCA manifold.  The active control mode keeps the full 29-D interface
+    but interprets the 14 arm actions as corrections around the live reference;
+    their projection and filtering happen in residual space.  An experimental
+    mode can instead expose the PCA coordinates directly.  Both alternatives
+    remove the absolute-target null space that let raw arm actions grow without
+    changing the executed pose.
     """
 
     cfg: UpperBodyManifoldJointPositionActionCfg
@@ -54,6 +55,14 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             raise ValueError("reference_target_margin must be positive when enabled.")
         if cfg.upper_body_raw_action_limit is not None and cfg.upper_body_raw_action_limit <= 0.0:
             raise ValueError("upper_body_raw_action_limit must be positive when enabled.")
+        if cfg.reference_relative_upper_body_residual and cfg.direct_upper_body_latent_action:
+            raise ValueError(
+                "reference-relative upper-body residual and direct upper-body latent actions are mutually exclusive."
+            )
+        if cfg.reference_relative_upper_body_residual and cfg.reference_target_margin is None:
+            raise ValueError(
+                "reference-relative upper-body residual actions require reference_target_margin."
+            )
         if cfg.trunk_stabilized_joint_names:
             if cfg.trunk_stabilized_reference_margin <= 0.0:
                 raise ValueError("trunk_stabilized_reference_margin must be positive when enabled.")
@@ -185,8 +194,12 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             len(lower_action_ids), self._policy_action_dim, dtype=torch.long, device=self.device
         )
         self._use_direct_upper_body_latent = bool(cfg.direct_upper_body_latent_action)
+        self._use_reference_relative_upper_body_residual = bool(
+            cfg.reference_relative_upper_body_residual
+        )
         self._filtered_latent = torch.zeros(self.num_envs, rank, device=self.device)
         self._filtered_upper_target = torch.zeros(self.num_envs, upper_dim, device=self.device)
+        self._filtered_upper_residual = torch.zeros(self.num_envs, upper_dim, device=self.device)
         self._filter_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._filtered_trunk_pitch_target = torch.zeros(self.num_envs, device=self.device)
         self._trunk_pitch_filter_initialized = torch.zeros(
@@ -223,6 +236,12 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             self.num_envs, device=self.device
         )
         self.manifold_policy_latent = torch.zeros(self.num_envs, rank, device=self.device)
+        self.upper_residual_policy = torch.zeros_like(self._filtered_upper_residual)
+        self.upper_residual_projected = torch.zeros_like(self._filtered_upper_residual)
+        self.upper_residual_executed = torch.zeros_like(self._filtered_upper_residual)
+        self.upper_residual_saturation_fraction = torch.zeros(
+            self.num_envs, device=self.device
+        )
         self.trunk_pitch_raw_target = torch.full((self.num_envs,), torch.nan, device=self.device)
         self.trunk_pitch_reference_target = torch.full((self.num_envs,), torch.nan, device=self.device)
         self.trunk_pitch_soft_target = torch.full((self.num_envs,), torch.nan, device=self.device)
@@ -307,6 +326,11 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         """Whether the external policy emits PCA coordinates instead of arm joints."""
         return self._use_direct_upper_body_latent
 
+    @property
+    def uses_reference_relative_upper_body_residual(self) -> bool:
+        """Whether the 14 arm actions are residuals around the live motion reference."""
+        return self._use_reference_relative_upper_body_residual
+
     def policy_action_ids_for_robot_joint_ids(self, robot_joint_ids: Sequence[int]) -> list[int]:
         """Return external policy indices for lower-body robot joints.
 
@@ -359,6 +383,8 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
 
     def process_actions(self, actions: torch.Tensor) -> None:
         policy_latent = None
+        policy_residual = None
+        policy_residual_saturated = None
         if self._use_direct_upper_body_latent:
             if actions.shape[1] != self._policy_action_dim:
                 raise ValueError(
@@ -372,7 +398,10 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             full_actions[:, self._lower_action_ids] = actions[:, : self._lower_action_ids.numel()]
             actions = full_actions
         # Legacy mode keeps the optional replay-only guard for old policies.
-        elif self.cfg.upper_body_raw_action_limit is not None:
+        elif (
+            not self._use_reference_relative_upper_body_residual
+            and self.cfg.upper_body_raw_action_limit is not None
+        ):
             actions = actions.clone()
             limit = float(self.cfg.upper_body_raw_action_limit)
             actions[:, self._upper_action_ids] = torch.clamp(
@@ -411,64 +440,141 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             upper_raw_target = reference_target + filtered_latent @ self._manifold_basis.transpose(0, 1)
             clipped = torch.abs(torch.tanh(policy_latent)) >= 0.95
             self.manifold_policy_latent[:] = policy_latent
+        elif self._use_reference_relative_upper_body_residual:
+            # In residual mode a zero policy action means exactly the live
+            # motion reference.  Scale the dimensionless policy command into
+            # radians before projecting the correction, not the absolute pose.
+            safe_reference_margin = max(float(reference_margin), 1.0e-6)
+            policy_residual = self.raw_actions[:, action_ids].clone()
+            policy_residual_saturated = torch.abs(torch.tanh(policy_residual)) >= 0.95
+            reference_deviation = safe_reference_margin * policy_residual
+            upper_raw_target = reference_target + reference_deviation
+            clipped = None
         else:
             upper_raw_target = self.processed_actions[:, action_ids].clone()
             clipped = None
 
-        # The reference envelope remains the physical/style safety guard in
-        # both interfaces.  Use a monotonic smooth bound instead of a hard
-        # clamp: every raw target maps to a distinct bounded target, and the
-        # policy observes the final executed action rather than a permanently
-        # clipped pre-bound request.
-        reference_deviation = upper_raw_target - reference_target
-        if reference_margin is None:
-            constrained_target = upper_raw_target
-            reference_bounded_deviation = reference_deviation
-            reference_saturated = torch.zeros_like(reference_deviation, dtype=torch.bool)
-        else:
-            safe_reference_margin = max(float(reference_margin), 1.0e-6)
-            normalized_deviation = reference_deviation / safe_reference_margin
-            bounded_unit_deviation = torch.tanh(normalized_deviation)
-            reference_bounded_deviation = safe_reference_margin * bounded_unit_deviation
-            constrained_target = reference_target + reference_bounded_deviation
-            reference_saturated = torch.abs(bounded_unit_deviation) >= 0.95
-
-        if self._use_direct_upper_body_latent:
-            filtered_target = torch.clamp(constrained_target, min=soft_limits[..., 0], max=soft_limits[..., 1])
-            nullspace_residual = torch.zeros(self.num_envs, device=self.device)
-        else:
-            centered = constrained_target - self._manifold_mean
-            raw_latent = centered @ self._manifold_basis
+        if self._use_reference_relative_upper_body_residual:
+            # Project the correction in the motion-bank tangent basis.  This
+            # preserves the invariant ``zero action -> exact reference`` that
+            # an absolute-pose PCA projection cannot guarantee.
+            raw_latent = reference_deviation @ self._manifold_basis
             bounded_latent = torch.clamp(
                 raw_latent,
                 min=-self._manifold_latent_limit,
                 max=self._manifold_latent_limit,
             )
             parallel = bounded_latent @ self._manifold_basis.transpose(0, 1)
-            orthogonal = centered - (raw_latent @ self._manifold_basis.transpose(0, 1))
+            raw_parallel = raw_latent @ self._manifold_basis.transpose(0, 1)
+            orthogonal = reference_deviation - raw_parallel
             nullspace_residual = torch.mean(torch.abs(orthogonal), dim=1)
             residual_limit = float(self.cfg.orthogonal_residual_limit)
-            bounded_orthogonal = residual_limit * torch.tanh(orthogonal / max(residual_limit, 1.0e-6))
-            projected = self._manifold_mean + parallel + bounded_orthogonal
-            projected = torch.clamp(projected, min=soft_limits[..., 0], max=soft_limits[..., 1])
-            alpha = 1.0 - math.exp(-2.0 * math.pi * float(self.cfg.cutoff_frequency_hz) * step_dt)
+            bounded_orthogonal = residual_limit * torch.tanh(
+                orthogonal / max(residual_limit, 1.0e-6)
+            )
+            projected_residual = parallel + bounded_orthogonal
+
+            # Apply the single physical/style envelope after projection, then
+            # low-pass the bounded residual.  Because the filter acts on the
+            # correction instead of the absolute target, a changing reference
+            # is followed immediately and cannot create a stale-target overshoot.
+            safe_reference_margin = max(float(reference_margin), 1.0e-6)
+            bounded_unit_deviation = torch.tanh(
+                projected_residual / safe_reference_margin
+            )
+            reference_bounded_deviation = (
+                safe_reference_margin * bounded_unit_deviation
+            )
+            constrained_target = reference_target + reference_bounded_deviation
+            reference_saturated = torch.abs(bounded_unit_deviation) >= 0.95
+
+            alpha = 1.0 - math.exp(
+                -2.0 * math.pi * float(self.cfg.cutoff_frequency_hz) * step_dt
+            )
             alpha = min(max(alpha, 0.0), 1.0)
             initialized = self._filter_initialized[:, None]
-            filtered_latent = torch.where(
+            filtered_residual = torch.where(
                 initialized,
-                self._filtered_latent + alpha * (bounded_latent - self._filtered_latent),
-                bounded_latent,
+                self._filtered_upper_residual
+                + alpha
+                * (reference_bounded_deviation - self._filtered_upper_residual),
+                reference_bounded_deviation,
             )
-            previous_target = torch.where(
-                initialized,
-                self._filtered_upper_target,
-                self._asset.data.joint_pos[:, self._upper_robot_ids],
+            filtered_target = torch.clamp(
+                reference_target + filtered_residual,
+                min=soft_limits[..., 0],
+                max=soft_limits[..., 1],
             )
-            filtered_target = previous_target + alpha * (projected - previous_target)
-            filtered_target = torch.clamp(filtered_target, min=soft_limits[..., 0], max=soft_limits[..., 1])
+            filtered_residual = filtered_target - reference_target
+            filtered_latent = filtered_residual @ self._manifold_basis
+            self._filtered_upper_residual[:] = filtered_residual
             self._filtered_latent[:] = filtered_latent
             self._filter_initialized[:] = True
             clipped = torch.abs(raw_latent) > self._manifold_latent_limit
+        else:
+            # Direct-latent and legacy absolute-target modes retain their
+            # original envelope and projection semantics for compatibility.
+            reference_deviation = upper_raw_target - reference_target
+            if reference_margin is None:
+                constrained_target = upper_raw_target
+                reference_bounded_deviation = reference_deviation
+                reference_saturated = torch.zeros_like(reference_deviation, dtype=torch.bool)
+            else:
+                safe_reference_margin = max(float(reference_margin), 1.0e-6)
+                normalized_deviation = reference_deviation / safe_reference_margin
+                bounded_unit_deviation = torch.tanh(normalized_deviation)
+                reference_bounded_deviation = safe_reference_margin * bounded_unit_deviation
+                constrained_target = reference_target + reference_bounded_deviation
+                reference_saturated = torch.abs(bounded_unit_deviation) >= 0.95
+
+            if self._use_direct_upper_body_latent:
+                filtered_target = torch.clamp(
+                    constrained_target,
+                    min=soft_limits[..., 0],
+                    max=soft_limits[..., 1],
+                )
+                nullspace_residual = torch.zeros(self.num_envs, device=self.device)
+            else:
+                centered = constrained_target - self._manifold_mean
+                raw_latent = centered @ self._manifold_basis
+                bounded_latent = torch.clamp(
+                    raw_latent,
+                    min=-self._manifold_latent_limit,
+                    max=self._manifold_latent_limit,
+                )
+                parallel = bounded_latent @ self._manifold_basis.transpose(0, 1)
+                orthogonal = centered - (raw_latent @ self._manifold_basis.transpose(0, 1))
+                nullspace_residual = torch.mean(torch.abs(orthogonal), dim=1)
+                residual_limit = float(self.cfg.orthogonal_residual_limit)
+                bounded_orthogonal = residual_limit * torch.tanh(
+                    orthogonal / max(residual_limit, 1.0e-6)
+                )
+                projected = self._manifold_mean + parallel + bounded_orthogonal
+                projected = torch.clamp(
+                    projected, min=soft_limits[..., 0], max=soft_limits[..., 1]
+                )
+                alpha = 1.0 - math.exp(
+                    -2.0 * math.pi * float(self.cfg.cutoff_frequency_hz) * step_dt
+                )
+                alpha = min(max(alpha, 0.0), 1.0)
+                initialized = self._filter_initialized[:, None]
+                filtered_latent = torch.where(
+                    initialized,
+                    self._filtered_latent + alpha * (bounded_latent - self._filtered_latent),
+                    bounded_latent,
+                )
+                previous_target = torch.where(
+                    initialized,
+                    self._filtered_upper_target,
+                    self._asset.data.joint_pos[:, self._upper_robot_ids],
+                )
+                filtered_target = previous_target + alpha * (projected - previous_target)
+                filtered_target = torch.clamp(
+                    filtered_target, min=soft_limits[..., 0], max=soft_limits[..., 1]
+                )
+                self._filtered_latent[:] = filtered_latent
+                self._filter_initialized[:] = True
+                clipped = torch.abs(raw_latent) > self._manifold_latent_limit
         self._filtered_upper_target[:] = filtered_target
         self._processed_actions[:, action_ids] = filtered_target
 
@@ -681,11 +787,25 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
             torch.abs(filtered_target - reference_target), dim=1
         )
         self.manifold_reference_saturation_fraction[:] = reference_saturated.float().mean(dim=1)
+        if policy_residual is None:
+            self.upper_residual_policy.zero_()
+            self.upper_residual_projected.zero_()
+            self.upper_residual_executed.zero_()
+            self.upper_residual_saturation_fraction.zero_()
+        else:
+            assert policy_residual_saturated is not None
+            self.upper_residual_policy[:] = policy_residual
+            self.upper_residual_projected[:] = reference_bounded_deviation
+            self.upper_residual_executed[:] = filtered_target - reference_target
+            self.upper_residual_saturation_fraction[:] = (
+                policy_residual_saturated.float().mean(dim=1)
+            )
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         super().reset(env_ids)
         self._filtered_latent[env_ids] = 0.0
         self._filtered_upper_target[env_ids] = 0.0
+        self._filtered_upper_residual[env_ids] = 0.0
         self._filter_initialized[env_ids] = False
         self._filtered_trunk_pitch_target[env_ids] = 0.0
         self._trunk_pitch_filter_initialized[env_ids] = False
@@ -706,6 +826,10 @@ class UpperBodyManifoldJointPositionAction(JointPositionAction):
         self.manifold_reference_bounded_deviation[env_ids] = 0.0
         self.manifold_reference_post_projection_deviation[env_ids] = 0.0
         self.manifold_reference_saturation_fraction[env_ids] = 0.0
+        self.upper_residual_policy[env_ids] = 0.0
+        self.upper_residual_projected[env_ids] = 0.0
+        self.upper_residual_executed[env_ids] = 0.0
+        self.upper_residual_saturation_fraction[env_ids] = 0.0
         self.effective_raw_actions[env_ids] = 0.0
         self.prev_effective_raw_actions[env_ids] = 0.0
 
@@ -726,6 +850,10 @@ class UpperBodyManifoldJointPositionActionCfg(JointPositionActionCfg):
     # Control-only interface: policy outputs one PCA coordinate per manifold
     # component instead of one raw action per upper-body joint.
     direct_upper_body_latent_action: bool = False
+    # Preserve the full joint-action layout but interpret the selected arm
+    # actions as dimensionless corrections around the live motion reference.
+    # This is the active Stage-2 interface; zero action means exact reference.
+    reference_relative_upper_body_residual: bool = False
     # Clamp large normalized arm commands before target scaling.  This is
     # intentionally disabled by default to preserve non-control action semantics.
     upper_body_raw_action_limit: float | None = None

@@ -6,13 +6,17 @@ from rsl_rl.runners.on_policy_runner import OnPolicyRunner
 from isaaclab_rl.rsl_rl import export_policy_as_onnx
 
 import wandb
-from soccer.utils.checkpoint_loading import load_checkpoint_with_obs_expand
+from soccer.utils.checkpoint_loading import (
+    checkpoint_infos_with_action_semantics,
+    load_checkpoint_with_obs_expand,
+)
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
 
 class MyOnPolicyRunner(OnPolicyRunner):
     def save(self, path: str, infos=None):
         """Save the model and training information."""
+        infos = checkpoint_infos_with_action_semantics(self, infos)
         super().save(path, infos)
         if self.logger_type in ["wandb"]:
             policy_path = path.split("model")[0]
@@ -31,6 +35,7 @@ class MotionOnPolicyRunner(OnPolicyRunner):
 
     def save(self, path: str, infos=None):
         """Save the model and training information."""
+        infos = checkpoint_infos_with_action_semantics(self, infos)
         super().save(path, infos)
         if self.logger_type in ["wandb"]:
             policy_path = path.split("model")[0]

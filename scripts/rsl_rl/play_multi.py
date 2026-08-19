@@ -705,6 +705,9 @@ def _create_diagnostic(
     action_term, action_joint_ids = _get_joint_position_action_term(base_env)
     arm_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, joint_ids)
     direct_upper_latent = bool(getattr(action_term, "uses_direct_upper_body_latent", False))
+    reference_relative_upper_residual = bool(
+        getattr(action_term, "uses_reference_relative_upper_body_residual", False)
+    )
     if direct_upper_latent:
         trunk_action_ids = action_term.policy_action_ids_for_robot_joint_ids(trunk_joint_ids)
     else:
@@ -735,6 +738,7 @@ def _create_diagnostic(
         "joint_names": np.asarray(_ARM_DIAGNOSTIC_JOINT_NAMES),
         "action_ids": torch.as_tensor(arm_action_ids, dtype=torch.long, device=base_env.device),
         "direct_upper_body_latent": direct_upper_latent,
+        "reference_relative_upper_body_residual": reference_relative_upper_residual,
         "trunk_joint_ids": torch.as_tensor(trunk_joint_ids, dtype=torch.long, device=base_env.device),
         "trunk_joint_names": np.asarray(_TRUNK_DIAGNOSTIC_JOINT_NAMES),
         "trunk_action_ids": torch.as_tensor(trunk_action_ids, dtype=torch.long, device=base_env.device),
@@ -837,7 +841,10 @@ def _create_diagnostic(
         "useful_touch_cg_aligned": [],
         "useful_touch_base_reward": [],
         "useful_touch_improvement_reward": [],
+        "useful_touch_event_score": [],
         "useful_touch_reward": [],
+        "rapid_retouch_event": [],
+        "rapid_retouch_reward": [],
         "ball_xy_speed": [],
         "ball_command_forward_speed": [],
         "ball_speed_target": [],
@@ -898,6 +905,10 @@ def _create_diagnostic(
         "manifold_reference_bounded_deviation": [],
         "manifold_reference_post_projection_deviation": [],
         "manifold_reference_saturation_fraction": [],
+        "upper_residual_policy": [],
+        "upper_residual_projected": [],
+        "upper_residual_executed": [],
+        "upper_residual_saturation_fraction": [],
         "trunk_pitch_raw_target": [],
         "trunk_pitch_reference_target": [],
         "trunk_pitch_soft_target": [],
@@ -1230,7 +1241,12 @@ def _append_diagnostic(
         "useful_touch_improvement_reward",
         "_dribbling_useful_touch_improvement_reward",
     )
+    _append_scalar_attr(
+        "useful_touch_event_score", "_dribbling_useful_touch_event_score"
+    )
     _append_scalar_attr("useful_touch_reward", "_dribbling_useful_touch_reward")
+    _append_bool_attr("rapid_retouch_event", "_dribbling_rapid_retouch_event")
+    _append_scalar_attr("rapid_retouch_reward", "_dribbling_rapid_retouch_reward")
     foot_ref_ids = [command.cfg.body_names.index(name) for name in _FOOT_DIAGNOSTIC_BODY_NAMES]
     foot_error = torch.norm(
         command.robot_body_pos_w[0, foot_ref_ids] - command.body_pos_relative_w[0, foot_ref_ids], dim=-1
@@ -1342,6 +1358,18 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
     diagnostic["manifold_reference_saturation_fraction"].append(
         float(_env0("manifold_reference_saturation_fraction", ()).item())
     )
+    diagnostic["upper_residual_policy"].append(
+        _env0("upper_residual_policy", (upper_dim,))
+    )
+    diagnostic["upper_residual_projected"].append(
+        _env0("upper_residual_projected", (upper_dim,))
+    )
+    diagnostic["upper_residual_executed"].append(
+        _env0("upper_residual_executed", (upper_dim,))
+    )
+    diagnostic["upper_residual_saturation_fraction"].append(
+        float(_env0("upper_residual_saturation_fraction", ()).item())
+    )
     diagnostic["trunk_pitch_raw_target"].append(
         float(_env0("trunk_pitch_raw_target", ()).item())
     )
@@ -1441,7 +1469,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         "trunk_reference_body_ids", "trunk_body_names",
         "constraint_group", "constraint_margin", "constraint_joint_names", "constraint_groups",
         "constraint_margins", "waist_roll_stiffness_scale", "waist_roll_damping_scale",
-        "direct_upper_body_latent",
+        "direct_upper_body_latent", "reference_relative_upper_body_residual",
     }
     arrays = {
         key: np.asarray(value)
@@ -1468,6 +1496,9 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["waist_roll_stiffness_scale"] = np.asarray(diagnostic["waist_roll_stiffness_scale"])
     arrays["waist_roll_damping_scale"] = np.asarray(diagnostic["waist_roll_damping_scale"])
     arrays["direct_upper_body_latent"] = np.asarray(diagnostic["direct_upper_body_latent"])
+    arrays["reference_relative_upper_body_residual"] = np.asarray(
+        diagnostic["reference_relative_upper_body_residual"]
+    )
     np.savez_compressed(diagnostic["path"], **arrays)
     contact_rate = float(np.mean(arrays["ball_contact"]))
     net_contact_rate = float(np.mean(arrays["ball_net_contact"]))
@@ -1548,6 +1579,8 @@ def _save_diagnostic(diagnostic: dict) -> None:
     useful_touch_improvement_score_sum = float(
         np.nansum(arrays["useful_touch_improvement_reward"])
     )
+    useful_touch_event_score_sum = float(np.nansum(arrays["useful_touch_event_score"]))
+    rapid_retouch_events = int(np.count_nonzero(arrays["rapid_retouch_event"]))
     useful_event_mask = arrays["useful_touch_new_event"].astype(bool)
     useful_touch_cg_alignment = (
         float(np.mean(arrays["useful_touch_cg_aligned"][useful_event_mask]))
@@ -1650,6 +1683,16 @@ def _save_diagnostic(diagnostic: dict) -> None:
     reference_saturation = float(
         np.nanmean(arrays["manifold_reference_saturation_fraction"])
     )
+    upper_residual_policy_abs = float(np.nanmean(np.abs(arrays["upper_residual_policy"])))
+    upper_residual_projected_abs = float(
+        np.nanmean(np.abs(arrays["upper_residual_projected"]))
+    )
+    upper_residual_executed_abs = float(
+        np.nanmean(np.abs(arrays["upper_residual_executed"]))
+    )
+    upper_residual_saturation = float(
+        np.nanmean(arrays["upper_residual_saturation_fraction"])
+    )
     term_reasons = arrays["termination_reason"][arrays["termination_reason"] != ""]
     unique_reasons, reason_counts = np.unique(term_reasons, return_counts=True)
     reason_summary = ", ".join(f"{name}={count}" for name, count in zip(unique_reasons, reason_counts)) or "none"
@@ -1666,8 +1709,10 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"useful_touches={useful_touch_events}/{useful_touch_evaluations}  "
         f"useful_success={useful_touch_success_rate:.3f}  "
         f"useful_improvement={useful_touch_improvement:.3f}  "
-        f"touch_base_raw_sum={useful_touch_base_score_sum:.3f}  "
-        f"touch_improve_raw_sum={useful_touch_improvement_score_sum:.3f}  "
+        f"touch_base_score_sum={useful_touch_base_score_sum:.3f}  "
+        f"touch_improve_score_sum={useful_touch_improvement_score_sum:.3f}  "
+        f"touch_event_score_sum={useful_touch_event_score_sum:.3f}  "
+        f"rapid_retouches={rapid_retouch_events}  "
         f"touch_cg_alignment={useful_touch_cg_alignment:.3f}  "
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
         f"ball_speed_mae={ball_speed_error:.3f} m/s  "
@@ -1689,6 +1734,10 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"reference_bounded_dev={reference_bounded_deviation:.3f} rad  "
         f"reference_post_dev={reference_post_projection_deviation:.3f} rad  "
         f"reference_saturation={reference_saturation:.3f}  "
+        f"upper_residual_policy_abs={upper_residual_policy_abs:.3f}  "
+        f"upper_residual_projected_abs={upper_residual_projected_abs:.3f} rad  "
+        f"upper_residual_executed_abs={upper_residual_executed_abs:.3f} rad  "
+        f"upper_residual_saturation={upper_residual_saturation:.3f}  "
         f"waist_target_err={trunk_target_error:.3f} rad  "
         f"waist_target_ref_offset={trunk_target_reference_offset:.3f} rad  "
         f"waist_pitch_filter_delta={trunk_pitch_filter_delta:.3f} rad  "
@@ -1998,9 +2047,9 @@ def _get_play_overlay(env) -> str:
                 else bool(cg_window_tensor[i].item())
             )
             ankle_parts.append(f"cg_window={'YES' if cg_window else 'NO'}")
-        useful_touch_tensor = getattr(base_env, "_dribbling_useful_touch_reward", None)
+        useful_touch_tensor = getattr(base_env, "_dribbling_useful_touch_event_score", None)
         if useful_touch_tensor is not None:
-            ankle_parts.append(f"useful={float(useful_touch_tensor[i].item()):.2f}")
+            ankle_parts.append(f"useful_score={float(useful_touch_tensor[i].item()):.2f}")
         lines.append(f"Ankle-Ball: {'  |  '.join(ankle_parts)}")
 
         recovery_gate_tensor = getattr(base_env, "_dribbling_recovery_gate", None)
@@ -2183,7 +2232,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    load_checkpoint_with_obs_expand(ppo_runner, resume_path)
+    load_checkpoint_with_obs_expand(
+        ppo_runner,
+        resume_path,
+        migrate_legacy_upper_body_residual=args_cli.migrate_legacy_upper_body_residual,
+    )
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)

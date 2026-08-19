@@ -247,7 +247,8 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
         )
         self.rewards.dribbling_rapid_retouch_penalty = RewTerm(
             func=mdp.dribbling_rapid_retouch_penalty,
-            weight=-6.0,
+            # Event-normalized: one too-fast retouch contributes -1.0 return.
+            weight=-1.0,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
@@ -259,7 +260,8 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
         )
         self.rewards.dribbling_useful_foot_touch = RewTerm(
             func=mdp.dribbling_useful_foot_touch,
-            weight=5.5,
+            # Event-normalized: one fully useful touch contributes +1.0 return.
+            weight=1.0,
             params={
                 "command_name": "motion",
                 "ball_sensor_name": "soccer_ball_contact",
@@ -359,6 +361,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             orthogonal_residual_limit=0.10,
             cutoff_frequency_hz=1.8,
             reference_target_margin=0.25,
+            reference_relative_upper_body_residual=True,
         )
         self.actions.joint_pos.scale = old_action_cfg.scale
         self.actions.joint_pos.offset = old_action_cfg.offset

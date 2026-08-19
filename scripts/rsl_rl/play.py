@@ -59,6 +59,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Import extensions to set up environment tasks
 import soccer.tasks  # noqa: F401
+from soccer.utils.checkpoint_loading import load_checkpoint_with_obs_expand
 from soccer.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
 
@@ -140,7 +141,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
+    load_checkpoint_with_obs_expand(
+        ppo_runner,
+        resume_path,
+        migrate_legacy_upper_body_residual=args_cli.migrate_legacy_upper_body_residual,
+    )
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
