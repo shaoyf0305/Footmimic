@@ -58,6 +58,7 @@ python scripts/rsl_rl/train_multi.py --task "${STAGE2_TASK}" \
     --experiment_name "${EXPERIMENT_NAME}" \
     --num_envs "${NUM_ENVS}" \
     --resume True \
+    --migrate_legacy_upper_body_residual \
     --headless
 
 echo

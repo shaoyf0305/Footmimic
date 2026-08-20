@@ -1,10 +1,10 @@
-"""RSL-RL policy support for bounded Stage-2 upper-body residual actions.
+"""RSL-RL policy support for Stage-2 upper-body reference residuals.
 
-The lower-body action dimensions retain the standard Gaussian policy.  Only
-the Stage-2 arm residual dimensions use a tanh-transformed Gaussian, including
-the change-of-variables correction in ``log_prob``.  This keeps PPO's sampled
-actions and likelihood in the same action space instead of relying on an
-environment-side clamp that the policy cannot observe probabilistically.
+PPO stores the Gaussian pre-squash variable for every action dimension. The
+Stage-2 action term applies the sole arm ``tanh`` before assigning the residual
+its physical meaning. For a fixed bijection the tanh Jacobian cancels in PPO's
+new/old probability ratio, avoiding the numerically fragile inverse-tanh path
+for saturated float32 actions.
 """
 
 from __future__ import annotations
@@ -16,77 +16,13 @@ from rsl_rl.modules import ActorCriticRecurrent
 from rsl_rl.runners.on_policy_runner import OnPolicyRunner
 
 
-class _PartiallySquashedNormal:
-    """Independent Normal with tanh transforms on selected dimensions.
-
-    ``mean`` and ``stddev`` intentionally expose the pre-transform Normal
-    parameters.  RSL-RL stores these values for its analytic adaptive-KL
-    schedule.  Samples and log probabilities, however, live in the actual
-    mixed action space consumed by the environment.
-    """
-
-    def __init__(
-        self,
-        mean: torch.Tensor,
-        std: torch.Tensor,
-        bounded_action_indices: torch.Tensor,
-        epsilon: float,
-    ) -> None:
-        self._normal = torch.distributions.Normal(mean, std)
-        self._bounded_action_indices = bounded_action_indices
-        self._epsilon = float(epsilon)
-
-    @property
-    def mean(self) -> torch.Tensor:
-        return self._normal.mean
-
-    @property
-    def stddev(self) -> torch.Tensor:
-        return self._normal.stddev
-
-    def sample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
-        pre_squash = self._normal.sample(sample_shape)
-        if self._bounded_action_indices.numel() == 0:
-            return pre_squash
-        actions = pre_squash.clone()
-        actions[..., self._bounded_action_indices] = torch.tanh(
-            pre_squash[..., self._bounded_action_indices]
-        )
-        return actions
-
-    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
-        if self._bounded_action_indices.numel() == 0:
-            return self._normal.log_prob(actions)
-
-        pre_squash = actions.clone()
-        bounded_actions = torch.clamp(
-            actions[..., self._bounded_action_indices],
-            min=-1.0 + self._epsilon,
-            max=1.0 - self._epsilon,
-        )
-        pre_squash[..., self._bounded_action_indices] = torch.atanh(bounded_actions)
-        log_prob = self._normal.log_prob(pre_squash)
-        # dy/dx = 1 - tanh(x)^2.  Subtract log|dy/dx| to express
-        # the likelihood in the bounded action space used by PPO storage.
-        log_prob[..., self._bounded_action_indices] -= torch.log(
-            torch.clamp(1.0 - bounded_actions.square(), min=self._epsilon)
-        )
-        return log_prob
-
-    def entropy(self) -> torch.Tensor:
-        # A tanh-Normal has no simple analytic entropy.  RSL-RL's existing
-        # Gaussian entropy is retained as the exploration surrogate, while the
-        # PPO probability ratio above uses the exact transformed log-probability.
-        return self._normal.entropy()
-
-
 class BoundedUpperBodyActorCriticRecurrent(ActorCriticRecurrent):
-    """Recurrent actor-critic with bounded arm residual action dimensions.
+    """Recurrent actor-critic with stable pre-squash Gaussian PPO actions.
 
     The module layout and state-dict keys are identical to
-    ``ActorCriticRecurrent``. A single tanh-Normal transform guarantees that
-    the environment receives arm residual values in ``(-1, 1)``. There is no
-    separate mean squash or environment-side residual squash.
+    ``ActorCriticRecurrent``. The environment applies exactly one tanh to the
+    selected arm dimensions; PPO never reconstructs a saturated pre-image with
+    ``atanh``.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -96,7 +32,8 @@ class BoundedUpperBodyActorCriticRecurrent(ActorCriticRecurrent):
             torch.empty(0, dtype=torch.long),
             persistent=False,
         )
-        self._squash_epsilon = 1.0e-6
+        self._minimum_scalar_std = 0.05
+        self._std_floor_warning_emitted = False
         # Inference-only diagnostics.  These tensors are deliberately not
         # buffers and therefore never enter a checkpoint state dict.
         self.last_inference_actor_raw_mean: torch.Tensor | None = None
@@ -124,40 +61,63 @@ class BoundedUpperBodyActorCriticRecurrent(ActorCriticRecurrent):
             device=std_parameter.device,
         )
 
-    def _squash_deterministic_actions(self, pre_squash_mean: torch.Tensor) -> torch.Tensor:
-        if self._bounded_action_indices.numel() == 0:
-            return pre_squash_mean
-        actions = pre_squash_mean.clone()
-        actions[..., self._bounded_action_indices] = torch.tanh(
-            pre_squash_mean[..., self._bounded_action_indices]
-        )
-        return actions
-
     def update_distribution(self, observations: torch.Tensor) -> None:
         mean = self.actor(observations)
+        if not torch.isfinite(mean).all():
+            invalid_ids = torch.nonzero(
+                ~torch.isfinite(mean).all(dim=0), as_tuple=False
+            ).flatten()
+            raise RuntimeError(
+                "Actor pre-squash mean contains NaN/Inf at action indices "
+                f"{invalid_ids.detach().cpu().tolist()}."
+            )
         if self.noise_std_type == "scalar":
+            if not torch.isfinite(self.std).all():
+                invalid_ids = torch.nonzero(~torch.isfinite(self.std), as_tuple=False).flatten()
+                raise RuntimeError(
+                    "Actor exploration std contains NaN/Inf at action indices "
+                    f"{invalid_ids.detach().cpu().tolist()}."
+                )
+            minimum_before_projection = float(self.std.detach().min().item())
+            if minimum_before_projection < self._minimum_scalar_std:
+                # RSL-RL's scalar-noise parameterization optimizes std itself,
+                # so Adam can move it below zero. Project the parameter back to
+                # the valid domain before constructing Normal. This preserves
+                # the checkpoint parameterization and gives it a normal
+                # gradient on the next update, unlike clamping only a temporary
+                # tensor in the computation graph.
+                with torch.no_grad():
+                    self.std.clamp_(min=self._minimum_scalar_std)
+                if not self._std_floor_warning_emitted:
+                    print(
+                        "[WARN] Projected actor scalar std to the safety floor "
+                        f"{self._minimum_scalar_std:.3f}; minimum before projection was "
+                        f"{minimum_before_projection:.6f}."
+                    )
+                    self._std_floor_warning_emitted = True
             std = self.std.expand_as(mean)
         elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std).expand_as(mean)
+            std = torch.exp(self.log_std).clamp_min(self._minimum_scalar_std).expand_as(mean)
         else:
             raise ValueError(
                 f"Unknown standard deviation type: {self.noise_std_type}. "
                 "Expected 'scalar' or 'log'."
             )
-        self.distribution = _PartiallySquashedNormal(
-            mean,
-            std,
-            self._bounded_action_indices,
-            self._squash_epsilon,
-        )
+        self.distribution = torch.distributions.Normal(mean, std)
 
     def act_inference(self, observations: torch.Tensor) -> torch.Tensor:
         input_a = self.memory_a(observations)
         raw_mean = self.actor(input_a.squeeze(0))
-        actions = self._squash_deterministic_actions(raw_mean)
+        diagnostic_action = raw_mean.clone()
+        if self._bounded_action_indices.numel() > 0:
+            diagnostic_action[..., self._bounded_action_indices] = torch.tanh(
+                raw_mean[..., self._bounded_action_indices]
+            )
         self.last_inference_actor_raw_mean = raw_mean.detach()
-        self.last_inference_actor_action = actions.detach()
-        return actions
+        self.last_inference_actor_action = diagnostic_action.detach()
+        # The environment owns the sole arm tanh. Lower and upper dimensions
+        # therefore share one numerically stable Gaussian PPO action space.
+        return raw_mean
 
 
 def register_bounded_actor_critic() -> None:
@@ -203,8 +163,8 @@ class BoundedOnPolicyRunner(OnPolicyRunner):
         policy.set_bounded_action_indices(bounded_indices)
         if bounded_indices:
             print(
-                "[INFO] Stage-2 bounded policy: single tanh-Normal arm transform with corrected "
-                f"log-probability on indices {bounded_indices}."
+                "[INFO] Stage-2 arm policy: Gaussian pre-squash PPO actions with a single "
+                f"environment tanh on indices {bounded_indices}."
             )
 
 

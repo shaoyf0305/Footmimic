@@ -23,10 +23,10 @@ class ReferenceResidualJointPositionAction(JointPositionAction):
     selected arm actions are dimensionless residuals: zero follows the live
     reference exactly and ``+/-1`` requests the configured per-joint margin.
 
-    This term deliberately does not project, re-squash, or temporally filter
-    the residual. The policy's tanh-Normal is the only nonlinear policy-space
-    bound. Simulator soft joint limits remain as the final physical safety
-    guard before the target is sent to the existing position controller.
+    This term deliberately does not project or temporally filter the residual.
+    It applies the sole tanh to PPO's Gaussian pre-squash arm variable.
+    Simulator soft joint limits remain as the final physical safety guard
+    before the target is sent to the existing position controller.
     """
 
     cfg: ReferenceResidualJointPositionActionCfg
@@ -80,6 +80,7 @@ class ReferenceResidualJointPositionAction(JointPositionAction):
         self.upper_reference_target = torch.zeros(upper_shape, device=self.device)
         self.upper_raw_target = torch.zeros(upper_shape, device=self.device)
         self.upper_executed_target = torch.zeros(upper_shape, device=self.device)
+        self.upper_residual_pre_squash = torch.zeros(upper_shape, device=self.device)
         self.upper_residual_policy = torch.zeros(upper_shape, device=self.device)
         self.upper_residual_commanded = torch.zeros(upper_shape, device=self.device)
         self.upper_residual_executed = torch.zeros(upper_shape, device=self.device)
@@ -143,12 +144,11 @@ class ReferenceResidualJointPositionAction(JointPositionAction):
         ).joint_pos[:, self._upper_robot_ids]
         soft_limits = self._asset.data.soft_joint_pos_limits[:, self._upper_robot_ids]
 
-        # tanh-Normal already supplies values in (-1, 1). The clamp is only a
-        # defensive numerical/API guard for manually supplied actions; it does
-        # not reshape normal policy output.
-        policy_residual = torch.clamp(
-            self.raw_actions[:, action_ids], min=-1.0, max=1.0
-        )
+        # PPO stores and evaluates the Gaussian pre-squash variable. Applying
+        # tanh exactly once here avoids inverse-tanh reconstruction of float32
+        # actions at +/-1 while preserving the same bounded physical residual.
+        pre_squash_residual = self.raw_actions[:, action_ids]
+        policy_residual = torch.tanh(pre_squash_residual)
         commanded_residual = policy_residual * self._upper_residual_margins
         raw_target = reference_target + commanded_residual
         executed_target = torch.clamp(
@@ -179,6 +179,7 @@ class ReferenceResidualJointPositionAction(JointPositionAction):
         self.upper_reference_target[:] = reference_target
         self.upper_raw_target[:] = raw_target
         self.upper_executed_target[:] = executed_target
+        self.upper_residual_pre_squash[:] = pre_squash_residual
         self.upper_residual_policy[:] = policy_residual
         self.upper_residual_commanded[:] = commanded_residual
         self.upper_residual_executed[:] = executed_residual
@@ -194,6 +195,7 @@ class ReferenceResidualJointPositionAction(JointPositionAction):
         self.upper_reference_target[env_ids] = 0.0
         self.upper_raw_target[env_ids] = 0.0
         self.upper_executed_target[env_ids] = 0.0
+        self.upper_residual_pre_squash[env_ids] = 0.0
         self.upper_residual_policy[env_ids] = 0.0
         self.upper_residual_commanded[env_ids] = 0.0
         self.upper_residual_executed[env_ids] = 0.0

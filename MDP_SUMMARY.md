@@ -8,14 +8,15 @@
 
 当前 S2 上肢完整路径为：
 
-1. actor 为 29 维输出 Normal 参数；仅 14 个手臂维度使用一次 `a_arm=tanh(z_arm)`，PPO log-prob 包含同一次变换的 Jacobian；下肢仍是普通 Gaussian；
-2. 删除 actor mean 上原先的第二个 tanh 预限幅，确定性 play 直接使用 `tanh(raw_mean)`；因此策略幅值层只有一个 tanh-Normal；
+1. actor 为 29 维输出 Normal 参数，PPO 对全部维度存储并计算 Gaussian pre-squash 变量 `z`；不再把 float32 下接近 `±1` 的 action 用 `atanh` 反演，因此 likelihood 没有饱和反演误差；
+2. 仅在 S2 action term 执行14个手臂维度时做一次 `a_arm=tanh(z_arm)`；下肢仍直接使用 Gaussian action。确定性 play 也先输出 raw mean，再由同一个 action term 做这一次 tanh；
 3. 直接定义 `delta_cmd = 0.25*a_arm`，14 个手臂关节暂时统一使用 `0.25 rad` margin；`a_arm=0` 精确跟随 live reference；
 4. 删除 motion-bank PCA tangent、latent clip、orthogonal residual 的 tanh、投影后 `±0.25 rad` 二次包络，以及 1.8 Hz residual 低通；关节之间不再被隐式耦合，reference 也不再经过滞后目标；
 5. 执行目标只有 `q_raw=q_ref+delta_cmd`，然后用 simulator soft joint limits 得到 `q_exec`，最后交给原有 PD actuator。soft limit 与 PD 是物理执行层，不是第二套策略分布约束；
 6. S1/S2 的 `actions` observation 仍保存最终执行的 normalized absolute joint target，29 维输入接口不变；但 S2 `action_rate_l2` 对手臂改为计算实际 residual 的相邻帧变化，对下肢仍计算 effective action，避免把 motion reference 自己的运动误判为策略抖动。
+7. RSL-RL 的 `scalar` exploration std 是直接可学习参数，本身不保证为正；构造 Normal 前统一投影到 `0.05` 下限，NaN/Inf 则立即报出 action indices。这样不增加 action 变换，只保证概率分布参数合法。
 
-因此，“只保留一个 tanh-Normal”准确指的是**策略空间的非线性幅值约束只有一次**；代码仍有 soft joint-limit hard clamp 与 PD，但两者分别处理可行域和执行动力学，不与 tanh-Normal争夺同一种职责。Essay 13 的 `bounded_reference_residual_v2` checkpoint 与当前网络结构兼容，正常 resume 时不加任何 migration flag；它是当前候选最合理的 warm start，但由于 action 映射已变化，新 rollout 必须单独命名和验收。
+因此，“只保留一个 tanh”准确指的是**从 PPO action 到物理 residual 只有 action term 中的一次非线性幅值约束**；代码仍有 soft joint-limit hard clamp 与 PD，但两者分别处理可行域和执行动力学。Essay 13 的 `bounded_reference_residual_v2` 以及未稳定的 `direct_reference_residual_v3` checkpoint 切换到当前实现时都不加 migration flag；loader 保留下肢、shared/RNN、critic 与 normalizer，重置14行已饱和的手臂输出及其 std，丢弃旧 optimizer，并写成 `pre_squash_reference_residual_v4`。之后 v4 checkpoint 才正常恢复完整 optimizer。
 
 ## 0.3 Essay 13：上一版冻结的 full-method baseline
 
@@ -277,7 +278,7 @@ E13 的 runtime 分组均值为：reference（`body_pos + foot_pos + pelvis_quat
 | `dribbling_gait_foot_tracking` | +1.4 | 删除 | 与常驻 `motion_foot_pos` 重复，而且恰在追球时把策略拉回 demo gait |
 | `dribbling_chase_ball` | +2.0 | 删除并入 pelvis 闭环 | 只奖励绝对 pelvis 前向速度，不能判断是否真正接近运动中的球 |
 | `dribbling_cg_contact_consistency` | +1.0 | 合并进 useful touch | 独立 CG 事件分数不判断触球结果；现在只对物理上有效的触球做 timing 调制 |
-| `upper_body_reference_overflow` | -0.05 | 删除 | 读取旧绝对 target 包络前的 overflow，但策略输入是执行后的 action；当前由一次策略侧 tanh-Normal 与逐关节 reference residual margin 直接定义执行语义，joint limit 另作物理安全保护 |
+| `upper_body_reference_overflow` | -0.05 | 删除 | 读取旧绝对 target 包络前的 overflow，但策略输入是执行后的 action；当前由 action term 中的一次 tanh 与统一 reference residual margin 直接定义执行语义，joint limit 另作物理安全保护 |
 
 这些项不是权重设为 0，而是已从 Stage 2 配置及对应实现中删除。S2 reward 数量由 28 降为 20。
 
@@ -327,20 +328,24 @@ E13 的 runtime 分组均值为：reference（`body_pos + foot_pos + pelvis_quat
 --migrate_legacy_upper_body_residual
 ```
 
+标准 `shell/progressive_dribbling_train.sh` 已在 S1→S2 边界自动添加该参数；用户不需要手工追加。它只作用于这一次加载，S2 后续 resume 不得继续携带。
+
 2. Essay 11 的 S2 checkpoint 带 `reference_residual_v1` marker，但其 Gaussian actor 仍可输出无界 residual。首次切换到当前 bounded policy 时添加：
 
 ```bash
 --migrate_bounded_upper_body_policy
 ```
 
-3. 当前 checkpoint 带 `bounded_reference_residual_v2` marker，正常 resume，两个迁移参数都不能添加。
+3. Essay 12/13 checkpoint 带 `bounded_reference_residual_v2` marker，之前失败尝试可能带 `direct_reference_residual_v3`。切换到当前稳定 action 时不加 migration 参数；loader 保留下肢、shared/RNN、critic 与 normalizer，重置14行饱和手臂输出及其 std、丢弃旧 optimizer，并升级 marker 为 `pre_squash_reference_residual_v4`。
+
+4. 当前稳定版本保存的 checkpoint 带 `pre_squash_reference_residual_v4` marker，正常 resume 并恢复 optimizer；两个 migration 参数都不能添加。
 
 两条迁移路径都只清零 actor 最后输出层的双臂 14 行，将这 14 维 exploration std 设为 `0.5`；下肢输出、RNN/MLP 隐层、critic 和 observation normalizer 全部保留。由于 action 分布或语义变化，旧 optimizer 被丢弃并重新初始化。
 
 这是带 `TEMPORARY LEGACY MIGRATION` 标记的过渡模块，不会自动触发：
 
 - 无 marker 或 `reference_residual_v1` checkpoint 未提供各自正确的迁移参数时，loader 直接拒绝加载；
-- 迁移后的新 checkpoint 会在 `infos` 中写入 `upper_body_action_semantics=bounded_reference_residual_v2`；
+- 当前新 checkpoint 会在 `infos` 中写入 `upper_body_action_semantics=pre_squash_reference_residual_v4`；
 - 正确 resume 新 checkpoint 时**不得**再加迁移参数；如果误加，loader 会报错而不是再次清零双臂；
 - 基线确认且所有保留 checkpoint 都已迁移后，可以删除这两个 CLI 参数和 checkpoint loader 中整段临时迁移代码；runtime bounded policy 与 residual action 不依赖它。
 
@@ -375,7 +380,7 @@ E13 的 runtime 分组均值为：reference（`body_pos + foot_pos + pelvis_quat
 - `useful_touch_reward`、`rapid_retouch_event`、`rapid_retouch_reward`
 - `reference_relative_upper_body_residual`
 - `upper_reference_target`、`upper_raw_target`、`upper_executed_target`
-- `upper_residual_policy`、`upper_residual_commanded`、`upper_residual_executed`
+- `upper_residual_pre_squash`、`upper_residual_policy`、`upper_residual_commanded`、`upper_residual_executed`
 - `upper_residual_actor_boundary_fraction`：`|a_arm|>=0.95` 的比例
 - `upper_residual_joint_limit_fraction`：最终 soft joint limit 实际截断比例
 - `upper_actor_raw_mean`、`upper_actor_squashed_action`
@@ -385,7 +390,7 @@ E13 的 runtime 分组均值为：reference（`body_pos + foot_pos + pelvis_quat
 - `ball_contact_collision_names`：用于视频解释的碰撞语义名；例如 `right_knee_link -> right_shin_collision`
 - `ball_contact_filter_count`、`ball_contact_expected_filter_count`
 - `ball_contact_filter_mapping_valid`：只有为 true 时逐-link force 列才按上述名称解释
-- `bounded_upper_body_policy_action`：当前 action term 是否启用策略侧 tanh-Normal；新 S2 应为 true，S1 为 false
+- `bounded_upper_body_policy_action`：当前 action term 是否把 Gaussian pre-squash 手臂变量通过一次 tanh 映射为有界 residual；S2 为 true，S1 为 false
 
 旧 possession timer、独立 CG contact-consistency 与全部 manifold/PCA telemetry 已删除，避免把不再参与当前 MDP 的状态误认为有效门控。
 
@@ -421,4 +426,4 @@ E13 的 runtime 分组均值为：reference（`body_pos + foot_pos + pelvis_quat
 - 所有 variant 从 diagnostic 的 `reward_term_weights`、`reward_term_step_weights` 和 `reward_terms` 读取实际 runtime 权重与贡献；不根据配置文件手工推测。
 - Ablation 期间不修 no-contact grace、不改 reward 权重，也不清理一次性 checkpoint 迁移模块。任何这些改变都需要新 commit、新 full baseline，并让所有 variant 重新使用同一实现。
 
-网络参数结构不变，但旧 checkpoint 的双臂输出分布或语义不同。无 marker 的旧 S1/S2 使用 `--migrate_legacy_upper_body_residual`；Essay 11 `reference_residual_v1` 使用 `--migrate_bounded_upper_body_policy`。两者都只迁移一次并写入新 run，之后从 `bounded_reference_residual_v2` checkpoint 正常 resume，绝不能继续携带迁移参数。
+网络参数结构不变，但旧 checkpoint 的双臂输出分布或语义不同。无 marker 的旧 S1/S2 使用 `--migrate_legacy_upper_body_residual`；Essay 11 `reference_residual_v1` 使用 `--migrate_bounded_upper_body_policy`。Essay 12/13 v2 与失败尝试 v3 不加 flag，自动保留 shared/lower/critic/normalizer、重置手臂头并换用新 optimizer。之后从 `pre_squash_reference_residual_v4` checkpoint 正常 resume，绝不能继续携带迁移参数。

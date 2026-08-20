@@ -906,6 +906,7 @@ def _create_diagnostic(
         "upper_reference_target": [],
         "upper_raw_target": [],
         "upper_executed_target": [],
+        "upper_residual_pre_squash": [],
         "upper_residual_policy": [],
         "upper_residual_commanded": [],
         "upper_residual_executed": [],
@@ -1341,6 +1342,9 @@ def _append_upper_body_action_diagnostic(diagnostic: dict, env) -> None:
     diagnostic["upper_executed_target"].append(
         _env0("upper_executed_target", (upper_dim,))
     )
+    diagnostic["upper_residual_pre_squash"].append(
+        _env0("upper_residual_pre_squash", (upper_dim,))
+    )
     diagnostic["upper_residual_policy"].append(
         _env0("upper_residual_policy", (upper_dim,))
     )
@@ -1634,6 +1638,9 @@ def _save_diagnostic(diagnostic: dict) -> None:
         float(np.percentile(finite_limit_margin, 5)) if finite_limit_margin.size else np.nan
     )
     terminations = int(np.sum(arrays["done"]))
+    upper_residual_pre_squash_abs = float(
+        np.nanmean(np.abs(arrays["upper_residual_pre_squash"]))
+    )
     upper_residual_policy_abs = float(np.nanmean(np.abs(arrays["upper_residual_policy"])))
     upper_residual_commanded_abs = float(
         np.nanmean(np.abs(arrays["upper_residual_commanded"]))
@@ -1704,6 +1711,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"waist_action_step={trunk_action_step:.3f}  torso_rel_tilt={torso_rel_tilt:.3f} rad  "
         f"torso_rel_tilt_err={torso_rel_tilt_error:.3f} rad  "
         f"torso_rel_ang_vel={torso_rel_ang_vel:.3f} rad/s  "
+        f"upper_residual_pre_squash_abs={upper_residual_pre_squash_abs:.3f}  "
         f"upper_residual_policy_abs={upper_residual_policy_abs:.3f}  "
         f"upper_residual_commanded_abs={upper_residual_commanded_abs:.3f} rad  "
         f"upper_residual_executed_abs={upper_residual_executed_abs:.3f} rad  "

@@ -34,7 +34,10 @@ CONTROL_MOTION_PATH=motions/master-v2 \
 
 Stage 1 keeps the existing broad mimic/style bank. Stage 2 sees only the single
 right-foot `master-v2` clip; the script does not mirror it or mix in another
-kick dataset.
+kick dataset. The script applies `--migrate_legacy_upper_body_residual` exactly
+once at the Stage-1-to-Stage-2 boundary, preserving the lower body and shared
+network while initializing the 14 arm rows for the direct residual interface.
+Checkpoints saved by Stage 2 are v4 and must not use that flag when resumed.
 
 Stage 1 and Stage 2 use the same ordered network inputs: 163 actor dimensions
 and 295 critic dimensions. Ball position, locomotion speed/heading, and the
@@ -126,8 +129,8 @@ inside the reset guard, so its documented two-step hold now persists within an
 episode without leaking across episodes.
 
 Diagnostics also store `bounded_upper_body_policy_action`. It is true for the
-current Stage 2 controller, whose 14 arm residuals are bounded by one
-tanh-Normal policy transform, and false for Stage 1. They additionally store
+current Stage 2 controller, whose 14 Gaussian pre-squash arm variables are
+bounded by one environment-side tanh, and false for Stage 1. They additionally store
 the actor raw mean and squashed action; policy, commanded, and executed arm
 residuals; and separate actor-boundary and soft-joint-limit fractions. The old
 PCA/manifold telemetry has been removed with the inactive execution path.
@@ -155,10 +158,12 @@ identical across Essay 13 ablations and report median, P90, and reset-inclusive
 maximum interval. Changing to an `ever_contact` latch creates a new baseline.
 
 The 14 arm outputs in Stage 2 are reference-relative residuals while the full
-29-D action interface remains unchanged. These dimensions use exactly one
-tanh-Normal transform inside the actor, including the corrected PPO
-log-probability; lower-body actions remain Gaussian. Zero arm action means the
-live motion reference exactly. The correction is applied directly as
+29-D action interface remains unchanged. PPO stores ordinary Gaussian
+pre-squash variables for every dimension; the Stage-2 action term applies
+exactly one tanh to the 14 arm variables. This avoids inverse-tanh likelihood
+reconstruction at float32 saturation; the fixed transform's Jacobian cancels
+in PPO's new/old ratio. Lower-body actions remain Gaussian. Zero arm action
+means the live motion reference exactly. The correction is applied directly as
 `q_ref + 0.25 * action`: all 14 arm joints currently use the same `0.25 rad`
 margin. PCA tangent projection, orthogonal
 residual squashing, the second `±0.25 rad` envelope, and the 1.8 Hz residual
@@ -166,6 +171,10 @@ filter have been removed. Simulator soft joint limits and the existing PD
 actuator remain physical execution safeguards. The policy still observes the
 final normalized absolute joint target, while `action_rate_l2` measures arm
 residual changes so reference motion is not counted as policy jitter.
+RSL-RL's directly optimized scalar exploration standard deviation is projected
+to a `0.05` floor before constructing the Normal distribution; this is a
+distribution-validity guard, not another action-space squash. NaN/Inf still
+fails immediately with the affected action indices.
 
 Pre-residual checkpoints without an action marker require this one-time flag:
 
@@ -179,13 +188,15 @@ Essay 11 checkpoints carrying `reference_residual_v1` instead require:
 --migrate_bounded_upper_body_policy
 ```
 
-Both temporary paths preserve the lower-body output, hidden layers, critic,
-and observation normalizer while resetting only the 14 incompatible arm output
-rows. Newly saved checkpoints carry `bounded_reference_residual_v2`. Never pass
-either migration flag when resuming one of those checkpoints; the loader rejects
-repeated or mismatched migration. Once the retained baselines have all been
-converted, the clearly marked temporary loader block and both CLI flags can be
-removed without changing the runtime bounded residual controller.
+Both explicit legacy paths preserve the lower-body output, hidden layers,
+critic, and observation normalizer while resetting only the 14 incompatible
+arm output rows. Essay 12/13 checkpoints carrying
+`bounded_reference_residual_v2`, as well as checkpoints from the unstable
+`direct_reference_residual_v3` attempt, need no flag. The loader preserves the
+lower-body/shared/RNN/critic/normalizer weights, resets only the 14 saturated
+arm output rows and their std, and drops the old optimizer once. Newly saved
+checkpoints carry `pre_squash_reference_residual_v4` and resume normally with
+their optimizer. Never pass either migration flag for v2, v3, or v4.
 
 Use `--diagnostic_stride N` to record every Nth control step.
 
