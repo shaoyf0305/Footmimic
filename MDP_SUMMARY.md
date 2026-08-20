@@ -2,9 +2,24 @@
 
 > **维护约定：本文件是当前 S1/S2 MDP 的唯一持续更新总表。** 后续 input、reward、termination、reset 或 diagnostics 发生变化时，直接修改 `MDP_SUMMARY.md`，不再新建 `MDP_SUMMARY_09.md` 等编号文件；旧的编号版中间总结已删除。
 
-## 0.3 Essay 13：冻结的 full-method baseline
+## 0.4 当前候选：上肢 action 简化
 
-当前论文主方法冻结在 commit `a589bd71168bd876fe4db93a3d887039c94005a8`（`essay 13`）。`e13.npz` 是当前同一套 1800-step、两轮手动 command sequence 的代表性诊断；它用于记录当前实测分布，不改变下文 MDP 定义。
+当前工作树已经从 Essay 13 分叉，目的是消除 S2 手臂 action 上重复且会相互干扰的三层处理。网络维度仍为 Actor 163 / Critic 295 / Action 29，reward、termination、reset、command 采样和 S1 均未修改；但 action 执行语义改变，因此必须重新训练/续训并生成新的诊断后，才能冻结为下一版 full-method baseline，不能把新结果继续记作 Essay 13。
+
+当前 S2 上肢完整路径为：
+
+1. actor 为 29 维输出 Normal 参数；仅 14 个手臂维度使用一次 `a_arm=tanh(z_arm)`，PPO log-prob 包含同一次变换的 Jacobian；下肢仍是普通 Gaussian；
+2. 删除 actor mean 上原先的第二个 tanh 预限幅，确定性 play 直接使用 `tanh(raw_mean)`；因此策略幅值层只有一个 tanh-Normal；
+3. 直接定义 `delta_cmd = 0.25*a_arm`，14 个手臂关节暂时统一使用 `0.25 rad` margin；`a_arm=0` 精确跟随 live reference；
+4. 删除 motion-bank PCA tangent、latent clip、orthogonal residual 的 tanh、投影后 `±0.25 rad` 二次包络，以及 1.8 Hz residual 低通；关节之间不再被隐式耦合，reference 也不再经过滞后目标；
+5. 执行目标只有 `q_raw=q_ref+delta_cmd`，然后用 simulator soft joint limits 得到 `q_exec`，最后交给原有 PD actuator。soft limit 与 PD 是物理执行层，不是第二套策略分布约束；
+6. S1/S2 的 `actions` observation 仍保存最终执行的 normalized absolute joint target，29 维输入接口不变；但 S2 `action_rate_l2` 对手臂改为计算实际 residual 的相邻帧变化，对下肢仍计算 effective action，避免把 motion reference 自己的运动误判为策略抖动。
+
+因此，“只保留一个 tanh-Normal”准确指的是**策略空间的非线性幅值约束只有一次**；代码仍有 soft joint-limit hard clamp 与 PD，但两者分别处理可行域和执行动力学，不与 tanh-Normal争夺同一种职责。Essay 13 的 `bounded_reference_residual_v2` checkpoint 与当前网络结构兼容，正常 resume 时不加任何 migration flag；它是当前候选最合理的 warm start，但由于 action 映射已变化，新 rollout 必须单独命名和验收。
+
+## 0.3 Essay 13：上一版冻结的 full-method baseline
+
+上一版论文主方法冻结在 commit `a589bd71168bd876fe4db93a3d887039c94005a8`（`essay 13`）。`e13.npz` 是该实现同一套 1800-step、两轮手动 command sequence 的代表性诊断，继续作为当前简化候选的直接对照。
 
 | 指标 | E12 | E13 | 当前判断 |
 |---|---:|---:|---|
@@ -19,7 +34,7 @@
 | 最大逐-link 接触力 | 638.8 N | **39.7 N** | E12 的小腿异常冲击消失 |
 | 实际失败 termination | 0 | **0** | 两轮均完成 |
 
-E13 已满足冻结并开始 ablation 的条件：速度、位置、heading、接触安全和 reset 前后平均表现同时稳定，reference 总贡献没有因任务提升而明显下降。此后 ablation 期间不再调整 input、reward、termination、reset、action manifold 或 command 采样范围；若以后修改其中任一项，必须建立新的 full-method baseline，不能继续沿用 Essay 13 的名称或结果。
+E13 当时已满足冻结并开始 ablation 的条件：速度、位置、heading、接触安全和 reset 前后平均表现同时稳定，reference 总贡献没有因任务提升而明显下降。当前上肢 action 简化正是一次显式的后续 MDP 修正，因此已触发“建立新 full-method baseline”的要求，不能继续沿用 Essay 13 的名称或结果。
 
 当前已知但不阻塞冻结的边界情况：
 
@@ -169,7 +184,7 @@ S1 与 S2 的 Actor、Critic 输入顺序和维度完全一致；本次 reward �
 | 4 | `base_ang_vel` | 3 | 机器人 base angular velocity |
 | 5 | `joint_pos` | 29 | 相对默认位姿的关节位置 |
 | 6 | `joint_vel` | 29 | 关节速度 |
-| 7 | `actions` | 29 | 上一帧真正执行的 normalized joint action；S2 上身是 smooth reference bound、manifold projection、低通滤波之后的结果 |
+| 7 | `actions` | 29 | 上一帧真正执行的 normalized joint target；S2 手臂是 `q_ref + direct residual` 经 soft joint limit 后的最终绝对 target |
 | 8 | `anchor_ball_polar` | 3 | pelvis 到球的 `[distance, cos(heading), sin(heading)]` |
 | 9 | `motion_locomotion_polar_cmd` | 3 | `[speed, cos(command_heading), sin(command_heading)]` |
 | 10 | `anchor_ball_velocity_polar_cmd` | 3 | `[ball_xy_speed, cos(delta_heading), sin(delta_heading)]`；静止球为 `[0,0,0]` |
@@ -244,7 +259,7 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 | 16 | `dribbling_micro_contact_filter` | -4.0 | -0.080 | 0.000000 | 右 ankle force EMA 超过 `22 N` 后连续惩罚，raw 上限 2 |
 | 17 | `dribbling_undesired_contact_penalty` | -12.0 | -0.240 | -0.000133 | 右 ankle 以外所有机器人碰撞体触球均惩罚，包括左脚和左右小腿；URDF 的小腿碰撞体挂在 `*_knee_link` 下 |
 | 18 | `dribbling_cg_foot_ball_distance` | +3.5 | +0.070 | +0.062237 | 仅在 CG reference foot--ball distance `<=0.55 m` 的接近/触球窗口跟踪，`std=0.22` |
-| 19 | `action_rate_l2` | -0.1 | -0.002 | -0.011339 | 对 effective action 做变化率惩罚 |
+| 19 | `action_rate_l2` | -0.1 | -0.002 | -0.011339 | 当前代码：下肢对 effective action、手臂对实际 reference residual 做变化率惩罚；E13 数值来自旧 absolute-effective 定义，仅作历史对照 |
 | 20 | `joint_limit` | -10.0 | -0.200 | -0.004023 | soft joint limit 越界惩罚 |
 
 球速正预算仍为 `+7.5`，没有比 5.0/06 扩张。区别是 Essay 08 的 `progress +5.0` 和 `velocity +2.5` 已合并为一个 `velocity +7.5`：它同时惩罚过慢、过快和侧向速度，不再存在只要求“至少够快”的单边目标。
@@ -262,7 +277,7 @@ E13 的 runtime 分组均值为：reference（`body_pos + foot_pos + pelvis_quat
 | `dribbling_gait_foot_tracking` | +1.4 | 删除 | 与常驻 `motion_foot_pos` 重复，而且恰在追球时把策略拉回 demo gait |
 | `dribbling_chase_ball` | +2.0 | 删除并入 pelvis 闭环 | 只奖励绝对 pelvis 前向速度，不能判断是否真正接近运动中的球 |
 | `dribbling_cg_contact_consistency` | +1.0 | 合并进 useful touch | 独立 CG 事件分数不判断触球结果；现在只对物理上有效的触球做 timing 调制 |
-| `upper_body_reference_overflow` | -0.05 | 删除 | 读取旧绝对 target 包络前的 overflow，但策略输入是执行后的 action；现由 reference-relative residual、PCA tangent 投影、策略侧 tanh-Normal 和投影后的物理安全限幅直接定义执行语义 |
+| `upper_body_reference_overflow` | -0.05 | 删除 | 读取旧绝对 target 包络前的 overflow，但策略输入是执行后的 action；当前由一次策略侧 tanh-Normal 与逐关节 reference residual margin 直接定义执行语义，joint limit 另作物理安全保护 |
 
 这些项不是权重设为 0，而是已从 Stage 2 配置及对应实现中删除。S2 reward 数量由 28 降为 20。
 
@@ -358,14 +373,12 @@ E13 的 runtime 分组均值为：reference（`body_pos + foot_pos + pelvis_quat
 - `useful_touch_cg_aligned`、`useful_touch_base_reward`
 - `useful_touch_improvement_reward`、`useful_touch_event_score`
 - `useful_touch_reward`、`rapid_retouch_event`、`rapid_retouch_reward`
-- `manifold_reference_raw_deviation`
-- `manifold_reference_bounded_deviation`
-- `manifold_reference_post_projection_deviation`
-- `manifold_reference_saturation_fraction`
 - `reference_relative_upper_body_residual`
-- `upper_residual_policy`、`upper_residual_projected`
-- `upper_residual_executed`、`upper_residual_saturation_fraction`
-- `upper_actor_raw_mean`、`upper_actor_bounded_mean`、`upper_actor_squashed_action`
+- `upper_reference_target`、`upper_raw_target`、`upper_executed_target`
+- `upper_residual_policy`、`upper_residual_commanded`、`upper_residual_executed`
+- `upper_residual_actor_boundary_fraction`：`|a_arm|>=0.95` 的比例
+- `upper_residual_joint_limit_fraction`：最终 soft joint limit 实际截断比例
+- `upper_actor_raw_mean`、`upper_actor_squashed_action`
 - `ball_filtered_underspeed_error`、`ball_filtered_overspeed_error`
 - `ball_velocity_underspeed_tolerance`、`ball_velocity_overspeed_tolerance`
 - `ball_contact_body_names`：Isaac articulation body/link 名
@@ -374,9 +387,9 @@ E13 的 runtime 分组均值为：reference（`body_pos + foot_pos + pelvis_quat
 - `ball_contact_filter_mapping_valid`：只有为 true 时逐-link force 列才按上述名称解释
 - `bounded_upper_body_policy_action`：当前 action term 是否启用策略侧 tanh-Normal；新 S2 应为 true，S1 为 false
 
-旧 possession timer 和独立 CG contact-consistency telemetry 已删除，避免把不再参与当前 MDP 的状态误认为有效门控。
+旧 possession timer、独立 CG contact-consistency 与全部 manifold/PCA telemetry 已删除，避免把不再参与当前 MDP 的状态误认为有效门控。
 
-## 9. Essay 13 验收结果与 ablation 协议
+## 9. Essay 13 历史验收结果与新 baseline 约束
 
 ### 9.1 冻结时的验收结果
 
@@ -396,11 +409,11 @@ E13 的 runtime 分组均值为：reference（`body_pos + foot_pos + pelvis_quat
 | projected residual 达到 `0.25 rad` | `<1%` | **0.028%** | 通过 |
 | squashed action `>=0.90/0.94` | 直接报告 boundary pressure | **9.50%/3.76%** | 可接受，继续作为论文指标 |
 
-这些结果说明 Essay 13 已完成“可冻结的论文主方法原型”，但单个 checkpoint、单个 seed 和一条 1800-step diagnostic 不能单独构成论文统计证据。论文级结论由后续多 seed、统一评测和 ablation 建立，而不是继续针对 E13 单条轨迹调 reward。
+这些结果说明 Essay 13 已完成“可冻结的论文主方法原型”，但单个 checkpoint、单个 seed 和一条 1800-step diagnostic 不能单独构成论文统计证据。当前上肢 action 简化必须先用同一评测协议与 E13 对照；达到不降低带球成功率、球速、heading、接触安全且显著降低 shoulder-pitch 幅值/速度后，才能把简化版本冻结为新的 full method，再开展其 ablation。
 
 ### 9.2 Ablation 公平性约束
 
-- Full method 固定为 `essay 13` commit `a589bd71168bd876fe4db93a3d887039c94005a8` 及其对应 checkpoint/config；保存 `e13.npz` 作为代表性诊断，不把它当作多 seed 统计结果。
+- `essay 13` commit `a589bd71168bd876fe4db93a3d887039c94005a8` 及 `e13.npz` 固定为上一版对照；当前简化代码在通过同协议验收前只是候选，不能混用两个实现的结果。
 - 所有 variant 使用相同 S1 初始化、S2 motion clip、训练步数、seed 集合、command curriculum、reset/termination 和 evaluation command；每次只移除或替换被考察模块。
 - 至少报告 3 个独立训练 seed 的均值和标准差；算力允许时优先 5 个 seed。不能挑选单个最好 checkpoint 代替跨 seed 结果。
 - 统一评测至少覆盖 speed `0.5/1.0/1.5 m/s` 与 heading `0/+0.65/-0.65 rad`，并分开报告直行、转向、reset 后第一轮和连续第二轮。

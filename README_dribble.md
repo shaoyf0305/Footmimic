@@ -9,19 +9,18 @@ This repository supports one two-stage pipeline.
 
 No aliases or historical environment variants are registered.
 
-## Frozen Essay 13 baseline
+## Essay 13 baseline and current upper-body candidate
 
-The current full-method baseline is commit
+The last frozen full-method baseline is commit
 `a589bd71168bd876fe4db93a3d887039c94005a8` (`essay 13`). Its representative
 1800-step `e13.npz` rollout has zero failure terminations, `0.219 m/s` filtered
 ball-speed MAE, `0.301` predicted-position error, `0.0565 rad` heading MAE, and
 one undesired-contact frame. Median right-foot contact interval is `0.86 s`,
 and the maximum per-link contact force is `39.7 N`.
 
-This version is frozen as the paper's full-method baseline. Ablations must not
-silently change observations, reward weights or formulas, termination/reset,
-the bounded residual action, or command sampling. A later MDP correction
-requires a new full baseline and cannot reuse Essay 13 results.
+The current working tree intentionally diverges from that baseline only in the
+Stage-2 upper-body action path. It is a new candidate and must be evaluated
+against E13 before being frozen; its results cannot reuse the Essay 13 label.
 
 ## Train
 
@@ -81,7 +80,7 @@ run's `diagnostics/` directory. New archives include:
 - `reward_step_dt`
 - `reward_terms`
 - `step_reward`
-- actions, joint tracking, command, ball, contact, manifold, torque, and termination telemetry
+- actions, joint tracking, command, ball, contact, torque, and termination telemetry
 
 The cleaned Control environment records 20 active reward terms. Normal control
 and ball recovery share one predicted position--velocity state. Inside the
@@ -127,12 +126,11 @@ inside the reset guard, so its documented two-step hold now persists within an
 episode without leaking across episodes.
 
 Diagnostics also store `bounded_upper_body_policy_action`. It is true for the
-current Stage 2 controller, whose 14 arm residuals are bounded by the policy
-distribution itself, and false for Stage 1.
-They additionally store the upper-body actor raw mean, bounded pre-squash mean,
-and squashed action, plus the velocity reward's separate under-speed and
-over-speed excess. These fields distinguish internal actor boundary pressure
-from the physical post-projection safety clamp.
+current Stage 2 controller, whose 14 arm residuals are bounded by one
+tanh-Normal policy transform, and false for Stage 1. They additionally store
+the actor raw mean and squashed action; policy, commanded, and executed arm
+residuals; and separate actor-boundary and soft-joint-limit fractions. The old
+PCA/manifold telemetry has been removed with the inactive execution path.
 
 After any Control episode termination, playback clears the recurrent policy
 hidden state. An ordinary failure preserves the active manual segment, target
@@ -157,16 +155,17 @@ identical across Essay 13 ablations and report median, P90, and reset-inclusive
 maximum interval. Changing to an `ever_contact` latch creates a new baseline.
 
 The 14 arm outputs in Stage 2 are reference-relative residuals while the full
-29-D action interface remains unchanged. These 14 dimensions now use a
-tanh-transformed Gaussian inside the actor policy, including the transformed
-PPO log-probability; lower-body actions remain Gaussian. Zero arm action means
-the live motion reference exactly. The bounded correction is projected in the
-motion-bank PCA tangent, safety-clamped to `q_ref ± 0.25 rad`, and filtered as a
-residual rather than an absolute target. Deterministic playback and ONNX apply
-the same actor transform. The policy still observes the final normalized joint
-target, so the Stage-1/Stage-2 input layout remains consistent. Diagnostics
-include the policy, projected, and executed residuals plus their saturation
-fraction.
+29-D action interface remains unchanged. These dimensions use exactly one
+tanh-Normal transform inside the actor, including the corrected PPO
+log-probability; lower-body actions remain Gaussian. Zero arm action means the
+live motion reference exactly. The correction is applied directly as
+`q_ref + 0.25 * action`: all 14 arm joints currently use the same `0.25 rad`
+margin. PCA tangent projection, orthogonal
+residual squashing, the second `±0.25 rad` envelope, and the 1.8 Hz residual
+filter have been removed. Simulator soft joint limits and the existing PD
+actuator remain physical execution safeguards. The policy still observes the
+final normalized absolute joint target, while `action_rate_l2` measures arm
+residual changes so reference motion is not counted as policy jitter.
 
 Pre-residual checkpoints without an action marker require this one-time flag:
 

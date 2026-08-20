@@ -9,7 +9,6 @@ environment-side clamp that the policy cannot observe probabilistically.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 
 import torch
@@ -85,9 +84,9 @@ class BoundedUpperBodyActorCriticRecurrent(ActorCriticRecurrent):
     """Recurrent actor-critic with bounded arm residual action dimensions.
 
     The module layout and state-dict keys are identical to
-    ``ActorCriticRecurrent``.  A bounded pre-squash mean prevents a migrated arm
-    head from recreating the old tens-of-radians Gaussian mean, while the tanh
-    distribution guarantees that the environment receives values in ``(-1, 1)``.
+    ``ActorCriticRecurrent``. A single tanh-Normal transform guarantees that
+    the environment receives arm residual values in ``(-1, 1)``. There is no
+    separate mean squash or environment-side residual squash.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -97,12 +96,10 @@ class BoundedUpperBodyActorCriticRecurrent(ActorCriticRecurrent):
             torch.empty(0, dtype=torch.long),
             persistent=False,
         )
-        self._bounded_mean_limit = float(math.atanh(0.95))
         self._squash_epsilon = 1.0e-6
         # Inference-only diagnostics.  These tensors are deliberately not
         # buffers and therefore never enter a checkpoint state dict.
         self.last_inference_actor_raw_mean: torch.Tensor | None = None
-        self.last_inference_actor_bounded_mean: torch.Tensor | None = None
         self.last_inference_actor_action: torch.Tensor | None = None
 
     @property
@@ -127,16 +124,6 @@ class BoundedUpperBodyActorCriticRecurrent(ActorCriticRecurrent):
             device=std_parameter.device,
         )
 
-    def _distribution_mean(self, raw_mean: torch.Tensor) -> torch.Tensor:
-        if self._bounded_action_indices.numel() == 0:
-            return raw_mean
-        mean = raw_mean.clone()
-        selected = raw_mean[..., self._bounded_action_indices]
-        mean[..., self._bounded_action_indices] = self._bounded_mean_limit * torch.tanh(
-            selected / self._bounded_mean_limit
-        )
-        return mean
-
     def _squash_deterministic_actions(self, pre_squash_mean: torch.Tensor) -> torch.Tensor:
         if self._bounded_action_indices.numel() == 0:
             return pre_squash_mean
@@ -147,8 +134,7 @@ class BoundedUpperBodyActorCriticRecurrent(ActorCriticRecurrent):
         return actions
 
     def update_distribution(self, observations: torch.Tensor) -> None:
-        raw_mean = self.actor(observations)
-        mean = self._distribution_mean(raw_mean)
+        mean = self.actor(observations)
         if self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
         elif self.noise_std_type == "log":
@@ -168,10 +154,8 @@ class BoundedUpperBodyActorCriticRecurrent(ActorCriticRecurrent):
     def act_inference(self, observations: torch.Tensor) -> torch.Tensor:
         input_a = self.memory_a(observations)
         raw_mean = self.actor(input_a.squeeze(0))
-        bounded_mean = self._distribution_mean(raw_mean)
-        actions = self._squash_deterministic_actions(bounded_mean)
+        actions = self._squash_deterministic_actions(raw_mean)
         self.last_inference_actor_raw_mean = raw_mean.detach()
-        self.last_inference_actor_bounded_mean = bounded_mean.detach()
         self.last_inference_actor_action = actions.detach()
         return actions
 
@@ -219,7 +203,7 @@ class BoundedOnPolicyRunner(OnPolicyRunner):
         policy.set_bounded_action_indices(bounded_indices)
         if bounded_indices:
             print(
-                "[INFO] Stage-2 bounded policy: tanh-Normal arm actions with corrected "
+                "[INFO] Stage-2 bounded policy: single tanh-Normal arm transform with corrected "
                 f"log-probability on indices {bounded_indices}."
             )
 

@@ -352,22 +352,16 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             params={"command_name": "motion"},
         )
 
-        # Preserve the 29-D policy interface while constraining upper-body targets.
+        # Preserve the 29-D policy interface. Arm actions are direct bounded
+        # corrections around the live reference with one shared physical scale.
         old_action_cfg = self.actions.joint_pos
-        self.actions.joint_pos = mdp.UpperBodyManifoldJointPositionActionCfg(
+        self.actions.joint_pos = mdp.ReferenceResidualJointPositionActionCfg(
             asset_name=old_action_cfg.asset_name,
             joint_names=old_action_cfg.joint_names,
             use_default_offset=old_action_cfg.use_default_offset,
             upper_body_joint_names=_CONTROL_UPPER_BODY_JOINT_NAMES,
             command_name="motion",
-            manifold_rank=6,
-            latent_std_limit=3.0,
-            min_latent_limit=0.03,
-            orthogonal_residual_limit=0.10,
-            cutoff_frequency_hz=1.8,
             reference_target_margin=0.25,
-            reference_relative_upper_body_residual=True,
-            upper_body_policy_action_is_bounded=True,
         )
         self.actions.joint_pos.scale = old_action_cfg.scale
         self.actions.joint_pos.offset = old_action_cfg.offset

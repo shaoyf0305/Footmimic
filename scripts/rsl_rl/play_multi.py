@@ -550,11 +550,6 @@ def _create_joint_reference_constraint(env, margin: float, group: str, joint_nam
     command = base_env.command_manager.get_term("motion")
     robot = base_env.scene[command.cfg.asset_name]
     action_term, action_joint_ids = _get_joint_position_action_term(base_env)
-    if getattr(action_term, "uses_direct_upper_body_latent", False):
-        raise ValueError(
-            "Play-only joint reference clamps are incompatible with the direct upper-body latent interface. "
-            "Use the environment's reference envelope and turn-aware trunk limits instead."
-        )
     robot_joint_ids, found_names = robot.find_joints(joint_names, preserve_order=True)
     if len(robot_joint_ids) != len(joint_names):
         raise RuntimeError(f"Could not resolve all {group} constraint joints; found {found_names}.")
@@ -706,17 +701,13 @@ def _create_diagnostic(
         ) from exc
     action_term, action_joint_ids = _get_joint_position_action_term(base_env)
     arm_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, joint_ids)
-    direct_upper_latent = bool(getattr(action_term, "uses_direct_upper_body_latent", False))
     reference_relative_upper_residual = bool(
         getattr(action_term, "uses_reference_relative_upper_body_residual", False)
     )
     bounded_upper_body_policy_action = bool(
         getattr(action_term, "uses_bounded_upper_body_policy_action", False)
     )
-    if direct_upper_latent:
-        trunk_action_ids = action_term.policy_action_ids_for_robot_joint_ids(trunk_joint_ids)
-    else:
-        trunk_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, trunk_joint_ids)
+    trunk_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, trunk_joint_ids)
 
     output_dir = os.path.join(log_dir, "diagnostics")
     os.makedirs(output_dir, exist_ok=True)
@@ -748,7 +739,6 @@ def _create_diagnostic(
         "joint_ids": torch.as_tensor(joint_ids, dtype=torch.long, device=base_env.device),
         "joint_names": np.asarray(_ARM_DIAGNOSTIC_JOINT_NAMES),
         "action_ids": torch.as_tensor(arm_action_ids, dtype=torch.long, device=base_env.device),
-        "direct_upper_body_latent": direct_upper_latent,
         "reference_relative_upper_body_residual": reference_relative_upper_residual,
         "bounded_upper_body_policy_action": bounded_upper_body_policy_action,
         "trunk_joint_ids": torch.as_tensor(trunk_joint_ids, dtype=torch.long, device=base_env.device),
@@ -793,9 +783,7 @@ def _create_diagnostic(
         "policy_action": [],
         "applied_action": [],
         "upper_actor_raw_mean": [],
-        "upper_actor_bounded_mean": [],
         "upper_actor_squashed_action": [],
-        "upper_policy_latent": [],
         "trunk_reference_joint_pos": [],
         "trunk_reference_joint_vel": [],
         "trunk_actual_joint_pos": [],
@@ -915,32 +903,14 @@ def _create_diagnostic(
         "stop_lateral_offset": [],
         "stop_position_score": [],
         "stop_speed_score": [],
-        "manifold_raw_upper_target": [],
-        "manifold_reference_upper_target": [],
-        "manifold_constrained_upper_target": [],
-        "manifold_projected_upper_target": [],
-        "manifold_latent": [],
-        "manifold_projection_error": [],
-        "manifold_projection_error_after_reference_constraint": [],
-        "manifold_nullspace_residual": [],
-        "manifold_latent_clip_fraction": [],
-        "manifold_reference_raw_deviation": [],
-        "manifold_reference_bounded_deviation": [],
-        "manifold_reference_post_projection_deviation": [],
-        "manifold_reference_saturation_fraction": [],
+        "upper_reference_target": [],
+        "upper_raw_target": [],
+        "upper_executed_target": [],
         "upper_residual_policy": [],
-        "upper_residual_projected": [],
+        "upper_residual_commanded": [],
         "upper_residual_executed": [],
-        "upper_residual_saturation_fraction": [],
-        "trunk_pitch_raw_target": [],
-        "trunk_pitch_reference_target": [],
-        "trunk_pitch_soft_target": [],
-        "trunk_pitch_filtered_target": [],
-        "trunk_pitch_reference_overflow": [],
-        "trunk_pitch_turn_relaxation": [],
-        "trunk_pitch_active_lower_deviation": [],
-        "trunk_pitch_active_upper_deviation": [],
-        "trunk_pitch_active_cutoff_frequency_hz": [],
+        "upper_residual_actor_boundary_fraction": [],
+        "upper_residual_joint_limit_fraction": [],
         "step_reward": [],
         "reward_terms": [],
         "done": [],
@@ -1020,22 +990,10 @@ def _append_diagnostic(
     diagnostic["actual_joint_pos"].append(_cpu(robot.data.joint_pos[:, ids]))
     diagnostic["actual_joint_vel"].append(_cpu(robot.data.joint_vel[:, ids]))
     action_term = base_env.action_manager.get_term("joint_pos")
-    if diagnostic["direct_upper_body_latent"]:
-        # A direct-latent policy has no per-arm input actions.  Store the
-        # decoded pre-envelope target alongside the physically effective arm
-        # action so the diagnostic remains comparable with legacy traces.
-        diagnostic["policy_action"].append(_cpu(action_term.manifold_raw_upper_target))
-        diagnostic["applied_action"].append(_cpu(action_term.effective_raw_actions[:, action_ids]))
-        diagnostic["upper_policy_latent"].append(_cpu(action_term.manifold_policy_latent))
-    else:
-        diagnostic["policy_action"].append(_cpu(policy_actions[:, action_ids]))
-        diagnostic["applied_action"].append(_cpu(applied_actions[:, action_ids]))
-        diagnostic["upper_policy_latent"].append(np.empty(0, dtype=np.float32))
+    diagnostic["policy_action"].append(_cpu(policy_actions[:, action_ids]))
+    diagnostic["applied_action"].append(_cpu(applied_actions[:, action_ids]))
     diagnostic["upper_actor_raw_mean"].append(
         _policy_arm_telemetry("last_inference_actor_raw_mean")
-    )
-    diagnostic["upper_actor_bounded_mean"].append(
-        _policy_arm_telemetry("last_inference_actor_bounded_mean")
     )
     diagnostic["upper_actor_squashed_action"].append(
         _policy_arm_telemetry("last_inference_actor_action")
@@ -1364,8 +1322,8 @@ def _append_diagnostic(
     return True
 
 
-def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
-    """Record post-step arm projection and trunk target/actuator telemetry."""
+def _append_upper_body_action_diagnostic(diagnostic: dict, env) -> None:
+    """Record the direct arm residual path and trunk actuator telemetry."""
     base_env = _resolve_base_env(env)
     action_term = base_env.action_manager.get_term("joint_pos")
 
@@ -1376,81 +1334,27 @@ def _append_upper_body_manifold_diagnostic(diagnostic: dict, env) -> None:
         return value[0].detach().cpu().numpy().copy()
 
     upper_dim = len(_ARM_DIAGNOSTIC_JOINT_NAMES)
-    diagnostic["manifold_raw_upper_target"].append(
-        _env0("manifold_raw_upper_target", (upper_dim,))
+    diagnostic["upper_reference_target"].append(
+        _env0("upper_reference_target", (upper_dim,))
     )
-    diagnostic["manifold_reference_upper_target"].append(
-        _env0("manifold_reference_upper_target", (upper_dim,))
-    )
-    diagnostic["manifold_constrained_upper_target"].append(
-        _env0("manifold_constrained_upper_target", (upper_dim,))
-    )
-    diagnostic["manifold_projected_upper_target"].append(
-        _env0("manifold_projected_upper_target", (upper_dim,))
-    )
-    diagnostic["manifold_latent"].append(_env0("manifold_latent", (0,)))
-    diagnostic["manifold_projection_error"].append(
-        float(_env0("manifold_projection_error", ()).item())
-    )
-    diagnostic["manifold_projection_error_after_reference_constraint"].append(
-        float(_env0("manifold_projection_error_after_reference_constraint", ()).item())
-    )
-    diagnostic["manifold_nullspace_residual"].append(
-        float(_env0("manifold_nullspace_residual", ()).item())
-    )
-    diagnostic["manifold_latent_clip_fraction"].append(
-        float(_env0("manifold_latent_clip_fraction", ()).item())
-    )
-    diagnostic["manifold_reference_raw_deviation"].append(
-        float(_env0("manifold_reference_raw_deviation", ()).item())
-    )
-    diagnostic["manifold_reference_bounded_deviation"].append(
-        float(_env0("manifold_reference_bounded_deviation", ()).item())
-    )
-    diagnostic["manifold_reference_post_projection_deviation"].append(
-        float(_env0("manifold_reference_post_projection_deviation", ()).item())
-    )
-    diagnostic["manifold_reference_saturation_fraction"].append(
-        float(_env0("manifold_reference_saturation_fraction", ()).item())
+    diagnostic["upper_raw_target"].append(_env0("upper_raw_target", (upper_dim,)))
+    diagnostic["upper_executed_target"].append(
+        _env0("upper_executed_target", (upper_dim,))
     )
     diagnostic["upper_residual_policy"].append(
         _env0("upper_residual_policy", (upper_dim,))
     )
-    diagnostic["upper_residual_projected"].append(
-        _env0("upper_residual_projected", (upper_dim,))
+    diagnostic["upper_residual_commanded"].append(
+        _env0("upper_residual_commanded", (upper_dim,))
     )
     diagnostic["upper_residual_executed"].append(
         _env0("upper_residual_executed", (upper_dim,))
     )
-    diagnostic["upper_residual_saturation_fraction"].append(
-        float(_env0("upper_residual_saturation_fraction", ()).item())
+    diagnostic["upper_residual_actor_boundary_fraction"].append(
+        float(_env0("upper_residual_actor_boundary_fraction", ()).item())
     )
-    diagnostic["trunk_pitch_raw_target"].append(
-        float(_env0("trunk_pitch_raw_target", ()).item())
-    )
-    diagnostic["trunk_pitch_reference_target"].append(
-        float(_env0("trunk_pitch_reference_target", ()).item())
-    )
-    diagnostic["trunk_pitch_soft_target"].append(
-        float(_env0("trunk_pitch_soft_target", ()).item())
-    )
-    diagnostic["trunk_pitch_filtered_target"].append(
-        float(_env0("trunk_pitch_filtered_target", ()).item())
-    )
-    diagnostic["trunk_pitch_reference_overflow"].append(
-        float(_env0("trunk_pitch_reference_overflow", ()).item())
-    )
-    diagnostic["trunk_pitch_turn_relaxation"].append(
-        float(_env0("trunk_pitch_turn_relaxation", ()).item())
-    )
-    diagnostic["trunk_pitch_active_lower_deviation"].append(
-        float(_env0("trunk_pitch_active_lower_deviation", ()).item())
-    )
-    diagnostic["trunk_pitch_active_upper_deviation"].append(
-        float(_env0("trunk_pitch_active_upper_deviation", ()).item())
-    )
-    diagnostic["trunk_pitch_active_cutoff_frequency_hz"].append(
-        float(_env0("trunk_pitch_active_cutoff_frequency_hz", ()).item())
+    diagnostic["upper_residual_joint_limit_fraction"].append(
+        float(_env0("upper_residual_joint_limit_fraction", ()).item())
     )
 
     command = base_env.command_manager.get_term("motion")
@@ -1526,7 +1430,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         "trunk_reference_body_ids", "trunk_body_names",
         "constraint_group", "constraint_margin", "constraint_joint_names", "constraint_groups",
         "constraint_margins", "waist_roll_stiffness_scale", "waist_roll_damping_scale",
-        "direct_upper_body_latent", "reference_relative_upper_body_residual",
+        "reference_relative_upper_body_residual",
         "bounded_upper_body_policy_action",
     }
     arrays = {
@@ -1561,7 +1465,6 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["constraint_margins"] = diagnostic["constraint_margins"]
     arrays["waist_roll_stiffness_scale"] = np.asarray(diagnostic["waist_roll_stiffness_scale"])
     arrays["waist_roll_damping_scale"] = np.asarray(diagnostic["waist_roll_damping_scale"])
-    arrays["direct_upper_body_latent"] = np.asarray(diagnostic["direct_upper_body_latent"])
     arrays["reference_relative_upper_body_residual"] = np.asarray(
         diagnostic["reference_relative_upper_body_residual"]
     )
@@ -1711,23 +1614,6 @@ def _save_diagnostic(diagnostic: dict) -> None:
     )
     trunk_target_error = float(np.nanmean(np.abs(arrays["trunk_post_step_target_error"])))
     trunk_target_reference_offset = float(np.nanmean(np.abs(arrays["trunk_target_minus_reference"])))
-    trunk_pitch_filter_values = np.abs(
-        arrays["trunk_pitch_filtered_target"] - arrays["trunk_pitch_raw_target"]
-    )
-    finite_trunk_pitch_filter_values = trunk_pitch_filter_values[
-        np.isfinite(trunk_pitch_filter_values)
-    ]
-    trunk_pitch_filter_delta = (
-        float(np.mean(finite_trunk_pitch_filter_values))
-        if finite_trunk_pitch_filter_values.size
-        else np.nan
-    )
-    finite_trunk_pitch_overflow = arrays["trunk_pitch_reference_overflow"][
-        np.isfinite(arrays["trunk_pitch_reference_overflow"])
-    ]
-    trunk_pitch_overflow = (
-        float(np.mean(finite_trunk_pitch_overflow)) if finite_trunk_pitch_overflow.size else np.nan
-    )
     trunk_effort_utilization = arrays["trunk_effort_utilization"]
     finite_effort_utilization = trunk_effort_utilization[np.isfinite(trunk_effort_utilization)]
     effort_utilization_p95 = (
@@ -1748,37 +1634,18 @@ def _save_diagnostic(diagnostic: dict) -> None:
         float(np.percentile(finite_limit_margin, 5)) if finite_limit_margin.size else np.nan
     )
     terminations = int(np.sum(arrays["done"]))
-    finite_projection = arrays["manifold_projection_error"][
-        np.isfinite(arrays["manifold_projection_error"])
-    ]
-    finite_nullspace = arrays["manifold_nullspace_residual"][
-        np.isfinite(arrays["manifold_nullspace_residual"])
-    ]
-    finite_clip = arrays["manifold_latent_clip_fraction"][
-        np.isfinite(arrays["manifold_latent_clip_fraction"])
-    ]
-    projection_error = float(np.mean(finite_projection)) if finite_projection.size else np.nan
-    nullspace_residual = float(np.mean(finite_nullspace)) if finite_nullspace.size else np.nan
-    latent_clip = float(np.mean(finite_clip)) if finite_clip.size else np.nan
-    reference_raw_deviation = float(np.nanmean(arrays["manifold_reference_raw_deviation"]))
-    reference_bounded_deviation = float(
-        np.nanmean(arrays["manifold_reference_bounded_deviation"])
-    )
-    reference_post_projection_deviation = float(
-        np.nanmean(arrays["manifold_reference_post_projection_deviation"])
-    )
-    reference_saturation = float(
-        np.nanmean(arrays["manifold_reference_saturation_fraction"])
-    )
     upper_residual_policy_abs = float(np.nanmean(np.abs(arrays["upper_residual_policy"])))
-    upper_residual_projected_abs = float(
-        np.nanmean(np.abs(arrays["upper_residual_projected"]))
+    upper_residual_commanded_abs = float(
+        np.nanmean(np.abs(arrays["upper_residual_commanded"]))
     )
     upper_residual_executed_abs = float(
         np.nanmean(np.abs(arrays["upper_residual_executed"]))
     )
-    upper_residual_saturation = float(
-        np.nanmean(arrays["upper_residual_saturation_fraction"])
+    upper_residual_actor_boundary = float(
+        np.nanmean(arrays["upper_residual_actor_boundary_fraction"])
+    )
+    upper_residual_joint_limit = float(
+        np.nanmean(arrays["upper_residual_joint_limit_fraction"])
     )
     raw_actor_abs = np.abs(arrays["upper_actor_raw_mean"])
     raw_actor_abs = raw_actor_abs[np.isfinite(raw_actor_abs)]
@@ -1836,29 +1703,23 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"arm_joint_err={arm_error:.3f} rad  waist_joint_err={trunk_error:.3f} rad  "
         f"waist_action_step={trunk_action_step:.3f}  torso_rel_tilt={torso_rel_tilt:.3f} rad  "
         f"torso_rel_tilt_err={torso_rel_tilt_error:.3f} rad  "
-        f"torso_rel_ang_vel={torso_rel_ang_vel:.3f} rad/s  manifold_projection={projection_error:.3f} rad  "
-        f"manifold_nullspace={nullspace_residual:.3f} rad  "
-        f"reference_raw_dev={reference_raw_deviation:.3f} rad  "
-        f"reference_bounded_dev={reference_bounded_deviation:.3f} rad  "
-        f"reference_post_dev={reference_post_projection_deviation:.3f} rad  "
-        f"reference_saturation={reference_saturation:.3f}  "
+        f"torso_rel_ang_vel={torso_rel_ang_vel:.3f} rad/s  "
         f"upper_residual_policy_abs={upper_residual_policy_abs:.3f}  "
-        f"upper_residual_projected_abs={upper_residual_projected_abs:.3f} rad  "
+        f"upper_residual_commanded_abs={upper_residual_commanded_abs:.3f} rad  "
         f"upper_residual_executed_abs={upper_residual_executed_abs:.3f} rad  "
-        f"upper_residual_saturation={upper_residual_saturation:.3f}  "
+        f"upper_residual_actor_boundary={upper_residual_actor_boundary:.3f}  "
+        f"upper_residual_joint_limit={upper_residual_joint_limit:.3f}  "
         f"upper_actor_raw_abs={upper_actor_raw_abs_mean:.3f}/p95={upper_actor_raw_abs_p95:.3f}"
         f"/max={upper_actor_raw_abs_max:.3f}  "
         f"upper_actor_boundary_090={upper_actor_boundary_090:.3f}  "
         f"upper_actor_boundary_094={upper_actor_boundary_094:.3f}  "
         f"waist_target_err={trunk_target_error:.3f} rad  "
         f"waist_target_ref_offset={trunk_target_reference_offset:.3f} rad  "
-        f"waist_pitch_filter_delta={trunk_pitch_filter_delta:.3f} rad  "
-        f"waist_pitch_overflow={trunk_pitch_overflow:.3f} rad  "
         f"waist_computed_effort_util_p95={computed_effort_utilization_p95:.3f}  "
         f"waist_effort_util_p95={effort_utilization_p95:.3f}  "
         f"waist_effort_sat={effort_saturation_fraction:.3f}  "
         f"waist_limit_margin_p05={limit_margin_p05:.3f} rad  "
-        f"latent_clip={latent_clip:.3f}  terminations={terminations} ({reason_summary})"
+        f"terminations={terminations} ({reason_summary})"
     )
 
 
@@ -2492,7 +2353,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # env stepping
             obs, reward, dones, _ = env.step(actions)
             if recorded_diagnostic_sample:
-                _append_upper_body_manifold_diagnostic(diagnostic, env)
+                _append_upper_body_action_diagnostic(diagnostic, env)
                 diagnostic["step_reward"][-1] = float(reward[0].item())
                 diagnostic["done"].append(bool(dones[0].item()))
                 diagnostic["reward_terms"].append(_reward_term_values(base_env))

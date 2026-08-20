@@ -27,11 +27,27 @@ def action_rate_l2_clip(env: ManagerBasedRLEnv) -> torch.Tensor:
 def effective_action_rate_l2_clip(
     env: ManagerBasedRLEnv, action_name: str = "joint_pos"
 ) -> torch.Tensor:
-    """Penalize changes in the normalized command that the action term actually executes."""
+    """Penalize effective command changes without charging arm-reference motion.
+
+    The recurrent observation still receives the final absolute normalized
+    joint target. For reference-relative arm joints, however, smoothness is a
+    property of the policy correction, not of the moving motion reference.
+    """
     action_term = env.action_manager.get_term(action_name)
     current = getattr(action_term, "effective_raw_actions", action_term.raw_actions)
     previous = getattr(action_term, "prev_effective_raw_actions", env.action_manager.prev_action)
-    return torch.sum(torch.square(current - previous), dim=1).clamp(max=100.0)
+    delta = current - previous
+    upper_action_ids = getattr(action_term, "_upper_action_ids", None)
+    current_upper = getattr(action_term, "effective_upper_residual_actions", None)
+    previous_upper = getattr(action_term, "prev_effective_upper_residual_actions", None)
+    if (
+        isinstance(upper_action_ids, torch.Tensor)
+        and isinstance(current_upper, torch.Tensor)
+        and isinstance(previous_upper, torch.Tensor)
+    ):
+        delta = delta.clone()
+        delta[:, upper_action_ids] = current_upper - previous_upper
+    return torch.sum(torch.square(delta), dim=1).clamp(max=100.0)
 
 
 def _pelvis_yaw_w(command: MotionCommand, pelvis_body_name: str = "pelvis") -> torch.Tensor:

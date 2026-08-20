@@ -188,62 +188,6 @@ def _state_dict_needs_obs_expand(checkpoint_sd: dict[str, torch.Tensor], current
     return False
 
 
-def _direct_upper_latent_layout(runner) -> tuple[list[int], int] | None:
-    """Return old joint-action rows and new action size for a latent-action task.
-
-    The direct upper-body interface keeps the original lower-body action order,
-    then appends PCA latent coordinates.  It is therefore possible to preserve
-    the trained lower-body output rows while intentionally reinitializing only
-    the new latent rows.
-    """
-    env = getattr(runner, "env", None)
-    base_env = getattr(env, "unwrapped", env)
-    try:
-        action_term = base_env.action_manager.get_term("joint_pos")
-    except (AttributeError, KeyError):
-        return None
-    if not getattr(action_term, "uses_direct_upper_body_latent", False):
-        return None
-    lower_ids = getattr(action_term, "_lower_action_ids", None)
-    if not isinstance(lower_ids, torch.Tensor):
-        return None
-    return [int(index) for index in lower_ids.detach().cpu().tolist()], int(action_term.action_dim)
-
-
-def _migrate_direct_latent_action_output(
-    old: torch.Tensor,
-    cur: torch.Tensor,
-    *,
-    key: str,
-    lower_action_ids: list[int],
-) -> torch.Tensor:
-    """Warm-start a 29-D joint-action head into a 21-D latent-action head.
-
-    Lower-body action rows are copied exactly.  The six new upper-body latent
-    rows are initialized at zero mean (and conservative exploration variance),
-    which decodes to the current reference pose.  A fixed linear conversion of
-    old arm targets is deliberately avoided: those targets were absolute and
-    reference-clamped, whereas the new coordinates are reference-relative.
-    """
-    if old.ndim != cur.ndim or old.shape[0] <= max(lower_action_ids, default=-1):
-        raise ValueError(f"Cannot migrate direct-latent action tensor {key}: {old.shape} -> {cur.shape}")
-    if old.ndim == 2 and old.shape[1] != cur.shape[1]:
-        raise ValueError(f"Cannot migrate direct-latent action tensor {key}: {old.shape} -> {cur.shape}")
-
-    migrated = cur.clone()
-    lower_count = len(lower_action_ids)
-    migrated[:lower_count] = old[lower_action_ids]
-    if old.ndim == 1:
-        # ``std`` is the only 1-D action parameter.  Start the new latent
-        # coordinates with moderate exploration so tanh does not saturate.
-        migrated[lower_count:] = 0.5
-    else:
-        # Actor-output weights and biases for latent rows must decode to the
-        # reference pose at the first step of fine-tuning.
-        migrated[lower_count:] = 0.0
-    return migrated
-
-
 # TEMPORARY LEGACY MIGRATION -------------------------------------------------
 # Remove this block, its CLI flags, and the call sites once every retained
 # Stage-2 baseline checkpoint has been converted to bounded_reference_residual_v2.
@@ -309,7 +253,6 @@ def prepare_loaded_dict_for_obs_expand(
 
     ckpt_sd = loaded_dict[model_key]
     current_sd = policy.state_dict()
-    layout = _direct_upper_latent_layout(runner)
     residual_layout = _reference_upper_residual_layout(runner)
     checkpoint_semantics = _checkpoint_upper_body_action_semantics(loaded_dict)
     migrate_residual_output = False
@@ -356,9 +299,6 @@ def prepare_loaded_dict_for_obs_expand(
             f"Unsupported upper-body action semantics {checkpoint_semantics!r}; expected "
             f"{UPPER_BODY_BOUNDED_REFERENCE_RESIDUAL_V2!r}."
         )
-    old_action_dim = int(ckpt_sd["std"].numel()) if isinstance(ckpt_sd.get("std"), torch.Tensor) else None
-    new_action_dim = int(current_sd["std"].numel()) if isinstance(current_sd.get("std"), torch.Tensor) else None
-
     transformed_sd: dict[str, torch.Tensor] = {}
     notes: list[str] = []
     changed = False
@@ -395,23 +335,6 @@ def prepare_loaded_dict_for_obs_expand(
 
         if old.shape == cur.shape:
             transformed_sd[key] = old
-            continue
-
-        is_action_output = (
-            layout is not None
-            and old_action_dim is not None
-            and new_action_dim is not None
-            and old.shape[0] == old_action_dim
-            and cur.shape[0] == new_action_dim
-            and (old.ndim == 1 or (old.ndim == 2 and old.shape[1] == cur.shape[1]))
-        )
-        if is_action_output:
-            lower_action_ids, _ = layout
-            transformed_sd[key] = _migrate_direct_latent_action_output(
-                old, cur, key=key, lower_action_ids=lower_action_ids
-            )
-            notes.append(f"{key}: migrated {old_action_dim}-D joint actions -> {new_action_dim}-D latent actions")
-            changed = True
             continue
 
         can_migrate_obs = (
