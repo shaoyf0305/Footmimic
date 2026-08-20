@@ -2,9 +2,34 @@
 
 > **维护约定：本文件是当前 S1/S2 MDP 的唯一持续更新总表。** 后续 input、reward、termination、reset 或 diagnostics 发生变化时，直接修改 `MDP_SUMMARY.md`，不再新建 `MDP_SUMMARY_09.md` 等编号文件；旧的编号版中间总结已删除。
 
-## 0.2 当前更新：速度工作点校准
+## 0.3 Essay 13：冻结的 full-method baseline
 
-Essay 12 在稳定 `1.5 m/s` command 段的瞬时/EMA 前向球速仅约 `1.172/1.146 m/s`。旧 velocity reward 在 `1.325--1.675 m/s` 全部满分，而瞬时安全 penalty 从 `1.70 m/s` 开始；它既给了欠速一个偏宽的平台，又会压制触球后的必要速度峰值。
+当前论文主方法冻结在 commit `a589bd71168bd876fe4db93a3d887039c94005a8`（`essay 13`）。`e13.npz` 是当前同一套 1800-step、两轮手动 command sequence 的代表性诊断；它用于记录当前实测分布，不改变下文 MDP 定义。
+
+| 指标 | E12 | E13 | 当前判断 |
+|---|---:|---:|---|
+| 平均 `step_reward` | 0.3586 | **0.3721** | 提升 3.8% |
+| EMA command-frame 前向球速 | 1.098 m/s | **1.258 m/s** | 速度校准有效 |
+| EMA 球速 MAE | 0.357 m/s | **0.219 m/s** | 达到 `<=0.25 m/s` 验收线 |
+| 预测球位误差 | 0.369 | **0.301** | 改善 18.5% |
+| heading MAE | 0.0609 rad | **0.0565 rad** | 保持稳定 |
+| useful-touch 事件数 | 27 | **35** | 触球更积极 |
+| 右脚接触间隔中位数 | 1.17 s | **0.86 s** | 典型节奏已改善 |
+| undesired-contact 帧数 | 5 | **1** | 接触安全改善 |
+| 最大逐-link 接触力 | 638.8 N | **39.7 N** | E12 的小腿异常冲击消失 |
+| 实际失败 termination | 0 | **0** | 两轮均完成 |
+
+E13 已满足冻结并开始 ablation 的条件：速度、位置、heading、接触安全和 reset 前后平均表现同时稳定，reference 总贡献没有因任务提升而明显下降。此后 ablation 期间不再调整 input、reward、termination、reset、action manifold 或 command 采样范围；若以后修改其中任一项，必须建立新的 full-method baseline，不能继续沿用 Essay 13 的名称或结果。
+
+当前已知但不阻塞冻结的边界情况：
+
+- 稳定 `1.5 m/s` command 段的瞬时/EMA 前向球速约为 `1.307/1.281 m/s`，仍低于优选工作区 `1.35--1.60 m/s`，但相对 E12 的 `1.150/1.125 m/s` 已明显提高；
+- 典型接触间隔已缩短，但第一次 rollout 在早期触球后出现一次 `2.60 s` 无接触长尾。原因是 startup grace 由绝对 episode age 控制，早期触球不会取消尚未用完的 grace，之后附近可控球又按 `0.5/step` 慢速累计；
+- bounded policy 的实际 squashed action P95 为 `0.933`，`|a|>=0.90/0.94` 比例为 `9.50%/3.76%`；内部 boundary pressure 上升，但 projected residual 达到 `0.25 rad` 的比例仅 `0.028%`，executed residual 最大 `0.235 rad`，物理 clamp 没有复发。
+
+## 0.2 Essay 13：速度工作点校准
+
+Essay 12 在 effective command 已达到 `1.5 m/s` 的帧中，瞬时/EMA 前向球速仅约 `1.150/1.126 m/s`。旧 velocity reward 在 `1.325--1.675 m/s` 全部满分，而瞬时安全 penalty 从 `1.70 m/s` 开始；它既给了欠速一个偏宽的平台，又会压制触球后的必要速度峰值。
 
 本次只校准速度工作点，不调整任何 reward 权重或 reference 权重：
 
@@ -13,7 +38,7 @@ Essay 12 在稳定 `1.5 m/s` command 段的瞬时/EMA 前向球速仅约 `1.172/
 - `dribbling_ball_speed_excess` 保持 `-2.5`，`speed_margin` 从 `+0.20` 增为 `+0.30 m/s`；`1.5` command 的瞬时 Huber safety cap 从 `1.70` 移到 `1.80 m/s`，超过 cap 后仍保持非饱和减速梯度；
 - diagnostics 新增欠速/超速 excess，并直接保存上肢 `actor_raw_mean`、bounded pre-squash mean 与 squashed action，不再依赖接近 `0.95` 时数值敏感的反推。
 
-## 0.1 当前更新：contact 语义校验与 bounded policy
+## 0.1 Essay 12：contact 语义校验与 bounded policy
 
 `diagnostic_20260819_142724.npz` 暴露出两个不能继续靠后处理掩盖的问题：接触诊断把挂在 `right_knee_link` 下的整段小腿碰撞圆柱显示成“膝盖”，而 S2 actor 的 14 维手臂原始 residual 已有 `89.65%` 落入旧 tanh/clamp 饱和区。
 
@@ -49,7 +74,7 @@ Essay 12 在稳定 `1.5 m/s` command 段的瞬时/EMA 前向球速仅约 `1.172/
 
 网络接口保持 Actor 163 / Critic 295 / Action 29，不需要重训 S1。S2 的 `actions` observation 仍是 action term 真正执行的 normalized joint target，因此 S1/S2 输入含义不变；改变的是 S2 actor 双臂输出的控制语义。旧 checkpoint 必须做一次显式迁移，不能直接 normal resume，具体见 7.1。
 
-## 1. 本次更新解决什么问题
+## 1. 闭环重构的历史动机
 
 Essay 08 已经把球速压到安全范围，但 `diagnostic_20260818_003056.npz` 表明动作并未恢复到 5.0 水平：
 
@@ -171,7 +196,7 @@ S1 与 S2 的 Actor、Critic 输入顺序和维度完全一致；本次 reward �
 
 ## 4. 当前完整 Reward 表
 
-控制周期为 `control_dt = 0.005 × 4 = 0.02 s`。表中“每步系数”是 `weight × 0.02`；真实贡献还要乘 reward raw value。Diagnostic 中的 `reward_term_weights` 和 `reward_term_step_weights` 是 runtime 最终值。
+控制周期为 `control_dt = 0.005 × 4 = 0.02 s`。表中“每步系数”是 `weight × 0.02`；真实贡献还要乘 reward raw value。Diagnostic 中的 `reward_term_weights` 和 `reward_term_step_weights` 是 runtime 最终值。Stage 2 表的“E13 实际均值”来自 `e13.npz` 的 `reward_terms × 0.02`，表示该固定评测轨迹中 PPO 每步实际收到的分项贡献，不是新的配置权重。
 
 `dribbling_useful_foot_touch` 和 `dribbling_rapid_retouch_penalty` 是离散事件项，raw value 已除以 `control_dt`，所以一次事件的积分回报直接等于 `weight × event_score`，不应再把表中的每步系数当成单次事件强度。
 
@@ -199,32 +224,34 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 
 任务：`Tracking-CG-G1-Dribbling-RNN-control`
 
-| # | Reward | Weight | 每步系数 | 当前作用与门控 |
-|---:|---|---:|---:|---|
-| 1 | `motion_body_pos` | +0.45 | +0.009 | 12 个主要 body 的相对位置风格跟踪；orientation term 已禁用 |
-| 2 | `motion_foot_pos` | +0.55 | +0.011 | 双脚 demo 相对位置跟踪，唯一常驻 gait/foot style 项 |
-| 3 | `foot_distance` | +0.35 | +0.007 | 保持双脚安全间距，阈值 `0.24 m` |
-| 4 | `motion_anchor_lin_vel` | +5.0 | +0.100 | 闭环 pelvis 速度：正常时跟 command，恢复时跟 blended ball-relative target |
-| 5 | `motion_anchor_ang_vel` | +1.0 | +0.020 | heading error 生成 yaw-rate target；gain 2.0，限幅 `1.2 rad/s` |
-| 6 | `locomotion_heading_tracking` | +1.0 | +0.020 | command heading 跟踪；`0--0.25 m/s` 速度门控 |
-| 7 | `dribbling_dynamic_proximity` | +3.0 | +0.060 | 平滑跟踪 0.2 s 预测球位 `[0.45,0]`，不依赖 contact timer |
-| 8 | `dribbling_ball_too_close_penalty` | -8.0 | -0.160 | pelvis--ball XY 距离 `<0.28 m` 起罚，`<=0.14 m` 满罚 |
-| 9 | `dribbling_pelvis_quat_tracking` | +2.0 | +0.040 | pelvis 姿态跟踪 motion reference，`std=0.45` |
-| 10 | `dribbling_ball_velocity_tracking` | +7.5 | +0.150 | 10-step EMA 球速非对称双向跟踪；欠速/超速容差 `0.05/0.20 m/s`，由 controllability gate 在恢复期降权 |
-| 11 | `dribbling_ball_speed_excess` | -2.5 | -0.050 | 瞬时 XY 球速 command-relative Huber 安全项，cap=`max(0.35,target+0.30)` |
-| 12 | `dribbling_sustained_contact_penalty` | -6.0 | -0.120 | 20-step per-link contact duty EMA；25% 起罚、60% 满罚 |
-| 13 | `dribbling_ball_bounce_penalty` | -3.0 | -0.060 | 接触时球垂直速度绝对值超过 `0.32 m/s` 起罚 |
-| 14 | `dribbling_rapid_retouch_penalty` | -1.0 | -0.020 | event-normalized；两次右脚 `<=14 N` 触球间隔 `<14 steps` 时实际回报 `-1.0/event` |
-| 15 | `dribbling_useful_foot_touch` | +1.0 | +0.020 | event-normalized；新轻触给 25% 基础分，5 steps 后按控制改善给其余 75%，单次最高 `+1.0`；CG 窗口为软系数 |
-| 16 | `dribbling_micro_contact_filter` | -4.0 | -0.080 | 右 ankle force EMA 超过 `22 N` 后连续惩罚，raw 上限 2 |
-| 17 | `dribbling_undesired_contact_penalty` | -12.0 | -0.240 | 右 ankle 以外所有机器人碰撞体触球均惩罚，包括左脚和左右小腿；URDF 的小腿碰撞体挂在 `*_knee_link` 下 |
-| 18 | `dribbling_cg_foot_ball_distance` | +3.5 | +0.070 | 仅在 CG reference foot--ball distance `<=0.55 m` 的接近/触球窗口跟踪，`std=0.22` |
-| 19 | `action_rate_l2` | -0.1 | -0.002 | 对 effective action 做变化率惩罚 |
-| 20 | `joint_limit` | -10.0 | -0.200 | soft joint limit 越界惩罚 |
+| # | Reward | Weight | 每步系数 | E13 实际均值 | 当前作用与门控 |
+|---:|---|---:|---:|---:|---|
+| 1 | `motion_body_pos` | +0.45 | +0.009 | +0.007496 | 12 个主要 body 的相对位置风格跟踪；orientation term 已禁用 |
+| 2 | `motion_foot_pos` | +0.55 | +0.011 | +0.005964 | 双脚 demo 相对位置跟踪，唯一常驻 gait/foot style 项 |
+| 3 | `foot_distance` | +0.35 | +0.007 | +0.006854 | 保持双脚安全间距，阈值 `0.24 m` |
+| 4 | `motion_anchor_lin_vel` | +5.0 | +0.100 | +0.079880 | 闭环 pelvis 速度：正常时跟 command，恢复时跟 blended ball-relative target |
+| 5 | `motion_anchor_ang_vel` | +1.0 | +0.020 | +0.013007 | heading error 生成 yaw-rate target；gain 2.0，限幅 `1.2 rad/s` |
+| 6 | `locomotion_heading_tracking` | +1.0 | +0.020 | +0.019537 | command heading 跟踪；`0--0.25 m/s` 速度门控 |
+| 7 | `dribbling_dynamic_proximity` | +3.0 | +0.060 | +0.053644 | 平滑跟踪 0.2 s 预测球位 `[0.45,0]`，不依赖 contact timer |
+| 8 | `dribbling_ball_too_close_penalty` | -8.0 | -0.160 | 0.000000 | pelvis--ball XY 距离 `<0.28 m` 起罚，`<=0.14 m` 满罚 |
+| 9 | `dribbling_pelvis_quat_tracking` | +2.0 | +0.040 | +0.036251 | pelvis 姿态跟踪 motion reference，`std=0.45` |
+| 10 | `dribbling_ball_velocity_tracking` | +7.5 | +0.150 | +0.091167 | 10-step EMA 球速非对称双向跟踪；欠速/超速容差 `0.05/0.20 m/s`，由 controllability gate 在恢复期降权 |
+| 11 | `dribbling_ball_speed_excess` | -2.5 | -0.050 | -0.000308 | 瞬时 XY 球速 command-relative Huber 安全项，cap=`max(0.35,target+0.30)` |
+| 12 | `dribbling_sustained_contact_penalty` | -6.0 | -0.120 | -0.000014 | 20-step per-link contact duty EMA；25% 起罚、60% 满罚 |
+| 13 | `dribbling_ball_bounce_penalty` | -3.0 | -0.060 | -0.000367 | 接触时球垂直速度绝对值超过 `0.32 m/s` 起罚 |
+| 14 | `dribbling_rapid_retouch_penalty` | -1.0 | -0.020 | -0.001111 | event-normalized；两次右脚 `<=14 N` 触球间隔 `<14 steps` 时实际回报 `-1.0/event` |
+| 15 | `dribbling_useful_foot_touch` | +1.0 | +0.020 | +0.013387 | event-normalized；新轻触给 25% 基础分，5 steps 后按控制改善给其余 75%，单次最高 `+1.0`；CG 窗口为软系数 |
+| 16 | `dribbling_micro_contact_filter` | -4.0 | -0.080 | 0.000000 | 右 ankle force EMA 超过 `22 N` 后连续惩罚，raw 上限 2 |
+| 17 | `dribbling_undesired_contact_penalty` | -12.0 | -0.240 | -0.000133 | 右 ankle 以外所有机器人碰撞体触球均惩罚，包括左脚和左右小腿；URDF 的小腿碰撞体挂在 `*_knee_link` 下 |
+| 18 | `dribbling_cg_foot_ball_distance` | +3.5 | +0.070 | +0.062237 | 仅在 CG reference foot--ball distance `<=0.55 m` 的接近/触球窗口跟踪，`std=0.22` |
+| 19 | `action_rate_l2` | -0.1 | -0.002 | -0.011339 | 对 effective action 做变化率惩罚 |
+| 20 | `joint_limit` | -10.0 | -0.200 | -0.004023 | soft joint limit 越界惩罚 |
 
 球速正预算仍为 `+7.5`，没有比 5.0/06 扩张。区别是 Essay 08 的 `progress +5.0` 和 `velocity +2.5` 已合并为一个 `velocity +7.5`：它同时惩罚过慢、过快和侧向速度，不再存在只要求“至少够快”的单边目标。
 
-## 5. 本次直接删除/合并的 Reward
+E13 的 runtime 分组均值为：reference（`body_pos + foot_pos + pelvis_quat + cg_foot_ball_distance`）`+0.111948/step`；带球连续项与事件正奖励 `+0.270622/step`，带球安全惩罚 `-0.001933/step`，带球净贡献 `+0.268689/step`；通用 `foot_distance + action_rate + joint_limit` 净贡献 `-0.008508/step`。带球/reference 净比例约 `2.40:1`，总和为 `0.372129/step`。安全惩罚在成功轨迹中应当稀疏，不能仅凭接近零的长期均值判断其早期训练作用为零。
+
+## 5. 当前已删除/合并的 Reward
 
 | Essay 08 reward | 原权重 | 处理 | 删除原因 |
 |---|---:|---|---|
@@ -261,6 +288,8 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 
 除删除与新 smooth bound 冲突的 `upper_body_reference_overflow`，以及对 useful/rapid touch 的局部事件尺度修正外，本次没有整体重排 reward。`no_contact` 保持安全终止职责；正常触球节奏由有意义的正负事件回报学习，而不是继续收紧 termination 强制实现。
 
+当前冻结实现中的 `grace_steps=50` 只检查绝对 `episode_length_buf`，不是“直到首次触球”的状态机：如果策略在第 50 step 前已经触球，剩余 startup grace 仍继续生效。E13 第一轮在 step 12 触球后出现 `2.60 s` 无接触长尾正是这个边界情况；附近可控球的慢速计数最高只到 `42.75/50`。Essay 13 ablation 保持此逻辑不变并对所有 variant 使用同一 termination；报告接触间隔时同时给出 median、P90 和包含 reset 过渡的 max，不隐藏该长尾。若以后改为 `ever_contact` 锁存并提前结束 grace，该结果属于新 baseline。
+
 ## 7. Reset 与 command 行为
 
 - control step 为 0.02 s；默认 episode 10 s。
@@ -271,6 +300,7 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 - command 训练范围为 speed `0.40--1.65 m/s`、heading `-0.75--0.75 rad`、duration `3--6 s`；`1.5 m/s` 不再位于训练上边界。
 - 输入与 action 维度不变：Actor 163、Critic 295、Action 29，因此现有 S1/S2 checkpoint 在结构上兼容；本次不需要重训 S1。
 - reset 后首个 control step 的接触传感器值按初始化保护帧处理，不会把 pre-reset/stale PhysX 冲量计入触球 reward、termination 或 diagnostics。
+- Essay 13 两轮评测的平均 reward 与 EMA 球速分别为 `0.37235/0.37191` 和 `1.259/1.257 m/s`，说明第一次与第二次 rollout 的平均控制表现已经一致；第一轮的单次长接触间隔属于上述 grace 长尾，不是旧 command-frame 球位置错位复发。
 
 ### 7.1 旧 checkpoint 的一次性迁移
 
@@ -310,7 +340,7 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 - `reward_terms`
 - `step_reward`
 
-本次新增或改写的闭环字段：
+当前保存的闭环与 action-quality 字段：
 
 - `ball_predicted_forward_offset`、`ball_predicted_lateral_offset`
 - `ball_position_error_norm`、`ball_control_position_reward`
@@ -346,19 +376,36 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 
 旧 possession timer 和独立 CG contact-consistency telemetry 已删除，避免把不再参与当前 MDP 的状态误认为有效门控。
 
-## 9. 下一次训练的验收重点
+## 9. Essay 13 验收结果与 ablation 协议
 
-| 指标 | 目标 |
-|---|---:|
-| EMA 球速 MAE | `<=0.25 m/s` |
-| `1.5 m/s` command 平均前向球速 | 优先达到 `1.35--1.60 m/s`，同时避免只靠高冲击峰值抬均值 |
-| 球速 `>2.5 m/s` 比例 | `<5%` |
-| 平均绝对 heading error | `<=0.12 rad` |
-| 1800-step 实际失败 termination | `<=2` |
-| 右脚接触间隔中位数 | 先恢复到约 `25--40 steps`，同时 `<14 steps` 高频触球受控 |
-| recovery 中 closing speed | 大部分为正，不再出现 chase reward 满分但距离持续增大 |
-| useful touch 改善成功率 | 随训练上升；轻触基础分与延迟改善分必须分开看 |
-| 手臂、腰部参考误差 | 至少保持 06 水平，并继续向 5.0 靠近 |
-| 上肢 residual 饱和比例 | `upper_residual_policy` 必须始终位于 `[-1,1]`；同时直接检查 `upper_actor_raw_mean` P95 与 squashed action 的 `>=0.90/0.94` boundary pressure |
+### 9.1 冻结时的验收结果
+
+| 指标 | 目标 | E13 | 状态 |
+|---|---:|---:|---|
+| EMA 球速 MAE | `<=0.25 m/s` | **0.219 m/s** | 通过 |
+| 稳定 `1.5 m/s` command 瞬时/EMA 前向球速 | 优选 `1.35--1.60 m/s` | **1.307/1.281 m/s** | 未到优选区，但相对 E12 明显改善；冻结接受 |
+| 球速 `>2.5 m/s` 比例 | `<5%` | **0%** | 通过 |
+| 平均绝对 heading error | `<=0.12 rad` | **0.0565 rad** | 通过 |
+| 1800-step 实际失败 termination | `<=2` | **0** | 通过 |
+| 右脚接触间隔中位数 | `0.7--1.0 s` | **0.86 s** | 通过 |
+| 右脚接触间隔 P90 | `<=1.5 s` 为优选 | **1.55 s** | 接近；保留监控 |
+| 包含 reset 过渡的最长内部无接触段 | 必须报告 | **2.60 s** | 已知 startup-grace 长尾 |
+| undesired-contact 帧数 | 越低越好 | **1/1800** | 通过 |
+| 最大逐-link 接触力 | 不出现数百牛初始化/小腿异常冲击 | **39.7 N** | 通过 |
+| reference 总贡献 | 不因任务提升显著坍缩 | **0.111948/step**；E12 为 0.112546 | 通过 |
+| projected residual 达到 `0.25 rad` | `<1%` | **0.028%** | 通过 |
+| squashed action `>=0.90/0.94` | 直接报告 boundary pressure | **9.50%/3.76%** | 可接受，继续作为论文指标 |
+
+这些结果说明 Essay 13 已完成“可冻结的论文主方法原型”，但单个 checkpoint、单个 seed 和一条 1800-step diagnostic 不能单独构成论文统计证据。论文级结论由后续多 seed、统一评测和 ablation 建立，而不是继续针对 E13 单条轨迹调 reward。
+
+### 9.2 Ablation 公平性约束
+
+- Full method 固定为 `essay 13` commit `a589bd71168bd876fe4db93a3d887039c94005a8` 及其对应 checkpoint/config；保存 `e13.npz` 作为代表性诊断，不把它当作多 seed 统计结果。
+- 所有 variant 使用相同 S1 初始化、S2 motion clip、训练步数、seed 集合、command curriculum、reset/termination 和 evaluation command；每次只移除或替换被考察模块。
+- 至少报告 3 个独立训练 seed 的均值和标准差；算力允许时优先 5 个 seed。不能挑选单个最好 checkpoint 代替跨 seed 结果。
+- 统一评测至少覆盖 speed `0.5/1.0/1.5 m/s` 与 heading `0/+0.65/-0.65 rad`，并分开报告直行、转向、reset 后第一轮和连续第二轮。
+- 核心指标固定为：成功率、EMA 球速 MAE、预测球位误差、heading MAE、接触间隔 median/P90/max、useful/rapid/undesired contact、最大逐-link force、reference 跟踪误差、action-rate/joint-limit 贡献及 upper-body boundary pressure。
+- 所有 variant 从 diagnostic 的 `reward_term_weights`、`reward_term_step_weights` 和 `reward_terms` 读取实际 runtime 权重与贡献；不根据配置文件手工推测。
+- Ablation 期间不修 no-contact grace、不改 reward 权重，也不清理一次性 checkpoint 迁移模块。任何这些改变都需要新 commit、新 full baseline，并让所有 variant 重新使用同一实现。
 
 网络参数结构不变，但旧 checkpoint 的双臂输出分布或语义不同。无 marker 的旧 S1/S2 使用 `--migrate_legacy_upper_body_residual`；Essay 11 `reference_residual_v1` 使用 `--migrate_bounded_upper_body_policy`。两者都只迁移一次并写入新 run，之后从 `bounded_reference_residual_v2` checkpoint 正常 resume，绝不能继续携带迁移参数。

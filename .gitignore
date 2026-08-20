@@ -54,7 +54,8 @@ temp/
 pipeline/
 inputs/
 docs/
-
+figures/
+tmp/
 *_original.*
 *_temp.*
 *_backup.*

@@ -9,6 +9,20 @@ This repository supports one two-stage pipeline.
 
 No aliases or historical environment variants are registered.
 
+## Frozen Essay 13 baseline
+
+The current full-method baseline is commit
+`a589bd71168bd876fe4db93a3d887039c94005a8` (`essay 13`). Its representative
+1800-step `e13.npz` rollout has zero failure terminations, `0.219 m/s` filtered
+ball-speed MAE, `0.301` predicted-position error, `0.0565 rad` heading MAE, and
+one undesired-contact frame. Median right-foot contact interval is `0.86 s`,
+and the maximum per-link contact force is `39.7 N`.
+
+This version is frozen as the paper's full-method baseline. Ablations must not
+silently change observations, reward weights or formulas, termination/reset,
+the bounded residual action, or command sampling. A later MDP correction
+requires a new full baseline and cannot reuse Essay 13 results.
+
 ## Train
 
 Run both stages:
@@ -135,6 +149,13 @@ or `0.25` during a command-transition window while the pelvis closes on the
 ball. Any valid right-ankle contact clears it. IDLE and STOP do not accumulate
 this counter, and `ball_lost` is likewise gated to DRIBBLE.
 
+The frozen implementation applies the initial 50-step grace by absolute episode
+age. An early valid touch does not cancel the unused part of that grace. E13
+therefore contains one reset-adjacent `2.60 s` no-contact tail even though its
+typical interval improved to `0.86 s` median and `1.55 s` P90. Keep this logic
+identical across Essay 13 ablations and report median, P90, and reset-inclusive
+maximum interval. Changing to an `ever_contact` latch creates a new baseline.
+
 The 14 arm outputs in Stage 2 are reference-relative residuals while the full
 29-D action interface remains unchanged. These 14 dimensions now use a
 tanh-transformed Gaussian inside the actor policy, including the transformed
@@ -168,6 +189,22 @@ converted, the clearly marked temporary loader block and both CLI flags can be
 removed without changing the runtime bounded residual controller.
 
 Use `--diagnostic_stride N` to record every Nth control step.
+
+## Ablation evaluation
+
+Use the same Stage-1 initialization, Stage-2 motion clip, training budget, seed
+set, command curriculum, reset/termination, and evaluation sequence for every
+variant. Report at least three independent training seeds (prefer five when
+compute permits), and evaluate speeds `0.5/1.0/1.5 m/s` with headings
+`0/+0.65/-0.65 rad`.
+
+The fixed primary metrics are success rate, filtered ball-speed MAE, predicted
+ball-position error, heading MAE, contact-interval median/P90/maximum,
+useful/rapid/undesired contacts, maximum per-link force, reference tracking,
+action-rate and joint-limit contributions, and upper-body actor boundary
+pressure. Read effective weights and contributions from each diagnostic's
+`reward_term_weights`, `reward_term_step_weights`, and `reward_terms`; do not
+infer them from source configuration alone.
 
 The complete current Stage-1/Stage-2 reward inventory and action-quality
 correction are maintained in [MDP_SUMMARY.md](MDP_SUMMARY.md). Future MDP
