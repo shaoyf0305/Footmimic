@@ -792,6 +792,9 @@ def _create_diagnostic(
         "actual_joint_vel": [],
         "policy_action": [],
         "applied_action": [],
+        "upper_actor_raw_mean": [],
+        "upper_actor_bounded_mean": [],
+        "upper_actor_squashed_action": [],
         "upper_policy_latent": [],
         "trunk_reference_joint_pos": [],
         "trunk_reference_joint_vel": [],
@@ -870,6 +873,10 @@ def _create_diagnostic(
         "ball_filtered_command_forward_speed": [],
         "ball_filtered_command_lateral_speed": [],
         "ball_filtered_speed_error": [],
+        "ball_filtered_underspeed_error": [],
+        "ball_filtered_overspeed_error": [],
+        "ball_velocity_underspeed_tolerance": [],
+        "ball_velocity_overspeed_tolerance": [],
         "ball_velocity_ema_window_steps": [],
         "ball_speed_cap": [],
         "ball_velocity_tracking_reward": [],
@@ -944,6 +951,7 @@ def _create_diagnostic(
 def _append_diagnostic(
     diagnostic: dict,
     env,
+    policy_module,
     policy_actions: torch.Tensor,
     applied_actions: torch.Tensor,
     step: int,
@@ -978,6 +986,14 @@ def _append_diagnostic(
         diagnostic[key].append(
             np.full(2, np.nan, dtype=np.float32) if value is None else _cpu(value)
         )
+
+    def _policy_arm_telemetry(attr: str) -> np.ndarray:
+        value = getattr(policy_module, attr, None)
+        if not isinstance(value, torch.Tensor) or value.ndim != 2:
+            return np.full(len(action_ids), np.nan, dtype=np.float32)
+        if action_ids.numel() and int(action_ids.max().item()) >= value.shape[1]:
+            return np.full(len(action_ids), np.nan, dtype=np.float32)
+        return _cpu(value[:, action_ids])
 
     diagnostic["step"].append(int(step))
     diagnostic["motion_idx"].append(int(command.motion_idx[0].item()))
@@ -1015,6 +1031,15 @@ def _append_diagnostic(
         diagnostic["policy_action"].append(_cpu(policy_actions[:, action_ids]))
         diagnostic["applied_action"].append(_cpu(applied_actions[:, action_ids]))
         diagnostic["upper_policy_latent"].append(np.empty(0, dtype=np.float32))
+    diagnostic["upper_actor_raw_mean"].append(
+        _policy_arm_telemetry("last_inference_actor_raw_mean")
+    )
+    diagnostic["upper_actor_bounded_mean"].append(
+        _policy_arm_telemetry("last_inference_actor_bounded_mean")
+    )
+    diagnostic["upper_actor_squashed_action"].append(
+        _policy_arm_telemetry("last_inference_actor_action")
+    )
     diagnostic["trunk_reference_joint_pos"].append(_cpu(command.joint_pos[:, trunk_ids]))
     diagnostic["trunk_reference_joint_vel"].append(_cpu(command.joint_vel[:, trunk_ids]))
     diagnostic["trunk_actual_joint_pos"].append(_cpu(robot.data.joint_pos[:, trunk_ids]))
@@ -1191,6 +1216,20 @@ def _append_diagnostic(
     )
     diagnostic["ball_velocity_tracking_reward"].append(
         np.nan if velocity_tracking_reward is None else float(velocity_tracking_reward[0].item())
+    )
+    _append_scalar_attr(
+        "ball_filtered_underspeed_error",
+        "_dribbling_ball_velocity_underspeed_error",
+    )
+    _append_scalar_attr(
+        "ball_filtered_overspeed_error",
+        "_dribbling_ball_velocity_overspeed_error",
+    )
+    diagnostic["ball_velocity_underspeed_tolerance"].append(
+        float(getattr(base_env, "_dribbling_ball_velocity_underspeed_tolerance", np.nan))
+    )
+    diagnostic["ball_velocity_overspeed_tolerance"].append(
+        float(getattr(base_env, "_dribbling_ball_velocity_overspeed_tolerance", np.nan))
     )
     _append_scalar_attr(
         "ball_velocity_controllability_gate",
@@ -1544,6 +1583,24 @@ def _save_diagnostic(diagnostic: dict) -> None:
         float(np.mean(np.abs(finite_filtered_speed_error)))
         if finite_filtered_speed_error.size else np.nan
     )
+    finite_underspeed_error = arrays["ball_filtered_underspeed_error"][
+        np.isfinite(arrays["ball_filtered_underspeed_error"])
+    ]
+    finite_overspeed_error = arrays["ball_filtered_overspeed_error"][
+        np.isfinite(arrays["ball_filtered_overspeed_error"])
+    ]
+    underspeed_excess = (
+        float(np.mean(finite_underspeed_error)) if finite_underspeed_error.size else np.nan
+    )
+    overspeed_excess = (
+        float(np.mean(finite_overspeed_error)) if finite_overspeed_error.size else np.nan
+    )
+    underspeed_active_rate = (
+        float(np.mean(finite_underspeed_error > 0.0)) if finite_underspeed_error.size else np.nan
+    )
+    overspeed_active_rate = (
+        float(np.mean(finite_overspeed_error > 0.0)) if finite_overspeed_error.size else np.nan
+    )
     finite_speed_cap = np.isfinite(arrays["ball_speed_cap"])
     ball_overspeed_rate = (
         float(
@@ -1723,6 +1780,25 @@ def _save_diagnostic(diagnostic: dict) -> None:
     upper_residual_saturation = float(
         np.nanmean(arrays["upper_residual_saturation_fraction"])
     )
+    raw_actor_abs = np.abs(arrays["upper_actor_raw_mean"])
+    raw_actor_abs = raw_actor_abs[np.isfinite(raw_actor_abs)]
+    upper_actor_raw_abs_mean = (
+        float(np.mean(raw_actor_abs)) if raw_actor_abs.size else np.nan
+    )
+    upper_actor_raw_abs_p95 = (
+        float(np.percentile(raw_actor_abs, 95)) if raw_actor_abs.size else np.nan
+    )
+    upper_actor_raw_abs_max = (
+        float(np.max(raw_actor_abs)) if raw_actor_abs.size else np.nan
+    )
+    squashed_actor_abs = np.abs(arrays["upper_actor_squashed_action"])
+    squashed_actor_abs = squashed_actor_abs[np.isfinite(squashed_actor_abs)]
+    upper_actor_boundary_090 = (
+        float(np.mean(squashed_actor_abs >= 0.90)) if squashed_actor_abs.size else np.nan
+    )
+    upper_actor_boundary_094 = (
+        float(np.mean(squashed_actor_abs >= 0.94)) if squashed_actor_abs.size else np.nan
+    )
     term_reasons = arrays["termination_reason"][arrays["termination_reason"] != ""]
     unique_reasons, reason_counts = np.unique(term_reasons, return_counts=True)
     reason_summary = ", ".join(f"{name}={count}" for name, count in zip(unique_reasons, reason_counts)) or "none"
@@ -1747,6 +1823,8 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"ball_xy_speed={ball_speed:.3f} m/s  ball_cmd_speed={ball_forward_speed:.3f} m/s  "
         f"ball_speed_mae={ball_speed_error:.3f} m/s  "
         f"filtered_ball_speed_mae={filtered_ball_speed_error:.3f} m/s  "
+        f"underspeed_excess={underspeed_excess:.3f} ({underspeed_active_rate:.3f})  "
+        f"overspeed_excess={overspeed_excess:.3f} ({overspeed_active_rate:.3f})  "
         f"overspeed_rate={ball_overspeed_rate:.3f}  "
         f"velocity_track={velocity_tracking_score:.3f}  speed_excess={speed_excess_score:.3f}  "
         f"pelvis_xy_speed={pelvis_speed:.3f} m/s  "
@@ -1768,6 +1846,10 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"upper_residual_projected_abs={upper_residual_projected_abs:.3f} rad  "
         f"upper_residual_executed_abs={upper_residual_executed_abs:.3f} rad  "
         f"upper_residual_saturation={upper_residual_saturation:.3f}  "
+        f"upper_actor_raw_abs={upper_actor_raw_abs_mean:.3f}/p95={upper_actor_raw_abs_p95:.3f}"
+        f"/max={upper_actor_raw_abs_max:.3f}  "
+        f"upper_actor_boundary_090={upper_actor_boundary_090:.3f}  "
+        f"upper_actor_boundary_094={upper_actor_boundary_094:.3f}  "
         f"waist_target_err={trunk_target_error:.3f} rad  "
         f"waist_target_ref_offset={trunk_target_reference_offset:.3f} rad  "
         f"waist_pitch_filter_delta={trunk_pitch_filter_delta:.3f} rad  "
@@ -2271,6 +2353,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
+    policy_module = _get_alg_policy(ppo_runner)
 
     reference_constraints: list[dict] = []
     if args_cli.upper_body_reference_margin is not None:
@@ -2404,7 +2487,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             recorded_diagnostic_sample = False
             if diagnostic is not None:
                 recorded_diagnostic_sample = _append_diagnostic(
-                    diagnostic, env, policy_actions, actions, timestep
+                    diagnostic, env, policy_module, policy_actions, actions, timestep
                 )
             # env stepping
             obs, reward, dones, _ = env.step(actions)

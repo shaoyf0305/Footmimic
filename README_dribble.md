@@ -74,10 +74,13 @@ and ball recovery share one predicted position--velocity state. Inside the
 controllable region the pelvis follows the locomotion command; outside it, a
 smooth recovery gate blends toward the filtered ball velocity plus a bounded
 position correction. The `+7.5` positive ball-speed budget is now one direct,
-two-sided velocity-vector tracking term rather than separate progress and
-tracking objectives. Its score is softly reduced during recovery, while the
-instantaneous command-relative Huber excess penalty remains the high-speed
-safety envelope.
+asymmetric two-sided velocity-vector tracking term rather than separate progress
+and tracking objectives. Forward speed receives full credit from `target-0.05`
+through `target+0.20 m/s`; its score is softly reduced during recovery. The
+instantaneous command-relative Huber excess penalty now begins at
+`target+0.30 m/s` and remains the high-speed safety envelope. Stage-2 training
+samples speed uniformly over `0.40--1.65 m/s`, placing the common `1.5 m/s`
+evaluation command inside rather than at the edge of the training range.
 
 The current Control task accepts only right-ankle ball contact as legal. Both
 feet remain in gait tracking, but a left-foot ball touch is an undesired
@@ -112,6 +115,10 @@ episode without leaking across episodes.
 Diagnostics also store `bounded_upper_body_policy_action`. It is true for the
 current Stage 2 controller, whose 14 arm residuals are bounded by the policy
 distribution itself, and false for Stage 1.
+They additionally store the upper-body actor raw mean, bounded pre-squash mean,
+and squashed action, plus the velocity reward's separate under-speed and
+over-speed excess. These fields distinguish internal actor boundary pressure
+from the physical post-projection safety clamp.
 
 After any Control episode termination, playback clears the recurrent policy
 hidden state. An ordinary failure preserves the active manual segment, target

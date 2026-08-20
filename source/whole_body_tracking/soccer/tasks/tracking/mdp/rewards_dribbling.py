@@ -968,8 +968,8 @@ def dribbling_pelvis_quat_tracking_exp(
 def dribbling_command_ball_velocity_tracking_reward(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
-    absolute_tolerance: float = 0.10,
-    relative_tolerance: float = 0.05,
+    underspeed_tolerance: float = 0.05,
+    overspeed_tolerance: float = 0.20,
     speed_error_std: float = 0.30,
     lateral_speed_std: float = 0.35,
     minimum_controllability_gate: float = 0.10,
@@ -994,6 +994,8 @@ def dribbling_command_ball_velocity_tracking_reward(
     is reduced so the pelvis can first recover the ball instead of optimizing
     an unchangeable free-rolling velocity.
     """
+    if underspeed_tolerance < 0.0 or overspeed_tolerance < 0.0:
+        raise ValueError("Speed tolerances must be non-negative.")
     if speed_error_std <= 0.0 or lateral_speed_std <= 0.0:
         raise ValueError("speed_error_std and lateral_speed_std must be positive.")
     if not 0.0 <= minimum_controllability_gate <= 1.0:
@@ -1021,9 +1023,13 @@ def dribbling_command_ball_velocity_tracking_reward(
         ball_vel_xy, state["direction_xy"]
     )
 
-    tolerance = float(absolute_tolerance) + float(relative_tolerance) * target_speed
     signed_speed_error = forward_speed - target_speed
-    error_outside_band = torch.relu(torch.abs(signed_speed_error) - tolerance)
+    underspeed_error = torch.relu(-signed_speed_error - float(underspeed_tolerance))
+    overspeed_error = torch.relu(signed_speed_error - float(overspeed_tolerance))
+    # The two errors are mutually exclusive.  A narrow lower tolerance asks
+    # the policy to replace rolling losses, while the wider upper tolerance
+    # permits a short post-touch speed pulse without redefining the command.
+    error_outside_band = underspeed_error + overspeed_error
     forward_score = torch.exp(-error_outside_band.square() / float(speed_error_std) ** 2)
     lateral_score = torch.exp(-lateral_speed.square() / float(lateral_speed_std) ** 2)
 
@@ -1034,6 +1040,10 @@ def dribbling_command_ball_velocity_tracking_reward(
     reward = reward * state["dribble_active"].to(reward.dtype)
     setattr(env, "_dribbling_ball_speed_target", target_speed)
     setattr(env, "_dribbling_ball_speed_error", signed_speed_error)
+    setattr(env, "_dribbling_ball_velocity_underspeed_error", underspeed_error)
+    setattr(env, "_dribbling_ball_velocity_overspeed_error", overspeed_error)
+    setattr(env, "_dribbling_ball_velocity_underspeed_tolerance", float(underspeed_tolerance))
+    setattr(env, "_dribbling_ball_velocity_overspeed_tolerance", float(overspeed_tolerance))
     setattr(env, "_dribbling_filtered_ball_velocity_xy", ball_vel_xy)
     setattr(env, "_dribbling_filtered_ball_forward_speed", forward_speed)
     setattr(env, "_dribbling_filtered_ball_lateral_speed", lateral_speed)
@@ -1052,7 +1062,7 @@ def dribbling_command_ball_velocity_tracking_reward(
 def dribbling_ball_xy_speed_excess_penalty(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
-    speed_margin: float = 0.20,
+    speed_margin: float = 0.30,
     min_speed_cap: float = 0.35,
     huber_scale: float = 0.45,
     max_penalty: float = 6.0,

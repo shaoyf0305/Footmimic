@@ -99,6 +99,11 @@ class BoundedUpperBodyActorCriticRecurrent(ActorCriticRecurrent):
         )
         self._bounded_mean_limit = float(math.atanh(0.95))
         self._squash_epsilon = 1.0e-6
+        # Inference-only diagnostics.  These tensors are deliberately not
+        # buffers and therefore never enter a checkpoint state dict.
+        self.last_inference_actor_raw_mean: torch.Tensor | None = None
+        self.last_inference_actor_bounded_mean: torch.Tensor | None = None
+        self.last_inference_actor_action: torch.Tensor | None = None
 
     @property
     def bounded_action_indices(self) -> torch.Tensor:
@@ -163,7 +168,12 @@ class BoundedUpperBodyActorCriticRecurrent(ActorCriticRecurrent):
     def act_inference(self, observations: torch.Tensor) -> torch.Tensor:
         input_a = self.memory_a(observations)
         raw_mean = self.actor(input_a.squeeze(0))
-        return self._squash_deterministic_actions(self._distribution_mean(raw_mean))
+        bounded_mean = self._distribution_mean(raw_mean)
+        actions = self._squash_deterministic_actions(bounded_mean)
+        self.last_inference_actor_raw_mean = raw_mean.detach()
+        self.last_inference_actor_bounded_mean = bounded_mean.detach()
+        self.last_inference_actor_action = actions.detach()
+        return actions
 
 
 def register_bounded_actor_critic() -> None:

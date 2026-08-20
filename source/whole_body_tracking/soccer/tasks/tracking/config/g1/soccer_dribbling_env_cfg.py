@@ -89,7 +89,9 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
         setattr(self.commands.motion, "dribble_cg_front_ball_height", SOCCER_BALL_RADIUS)
 
         self.commands.motion.locomotion_command_mode = "resampled"
-        self.commands.motion.locomotion_cmd_speed_range = (0.40, 1.50)
+        # Keep the 1.50 m/s evaluation command inside the training
+        # distribution instead of exactly on its upper boundary.
+        self.commands.motion.locomotion_cmd_speed_range = (0.40, 1.65)
         self.commands.motion.locomotion_cmd_heading_range = (-0.75, 0.75)
         self.commands.motion.locomotion_cmd_duration_range = (3.0, 6.0)
         self.commands.motion.locomotion_cmd_wz_range = (0.0, 0.0)
@@ -206,8 +208,11 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             weight=7.5,
             params={
                 "command_name": "motion",
-                "absolute_tolerance": 0.10,
-                "relative_tolerance": 0.05,
+                # Prefer a slight transient overspeed to persistent
+                # underspeed: rolling decay then brings the average back
+                # toward the commanded velocity.
+                "underspeed_tolerance": 0.05,
+                "overspeed_tolerance": 0.20,
                 "speed_error_std": 0.30,
                 "lateral_speed_std": 0.35,
                 "minimum_controllability_gate": 0.10,
@@ -219,7 +224,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             weight=-2.5,
             params={
                 "command_name": "motion",
-                "speed_margin": 0.20,
+                "speed_margin": 0.30,
                 "min_speed_cap": 0.35,
                 "huber_scale": 0.45,
                 "max_penalty": 6.0,

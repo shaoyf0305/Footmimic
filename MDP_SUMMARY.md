@@ -2,6 +2,17 @@
 
 > **维护约定：本文件是当前 S1/S2 MDP 的唯一持续更新总表。** 后续 input、reward、termination、reset 或 diagnostics 发生变化时，直接修改 `MDP_SUMMARY.md`，不再新建 `MDP_SUMMARY_09.md` 等编号文件；旧的编号版中间总结已删除。
 
+## 0.2 当前更新：速度工作点校准
+
+Essay 12 在稳定 `1.5 m/s` command 段的瞬时/EMA 前向球速仅约 `1.172/1.146 m/s`。旧 velocity reward 在 `1.325--1.675 m/s` 全部满分，而瞬时安全 penalty 从 `1.70 m/s` 开始；它既给了欠速一个偏宽的平台，又会压制触球后的必要速度峰值。
+
+本次只校准速度工作点，不调整任何 reward 权重或 reference 权重：
+
+- S2 训练 speed 均匀采样从 `0.40--1.50` 扩到 `0.40--1.65 m/s`，使常用 `1.5 m/s` 从分布边界变成内部工作点；
+- `dribbling_ball_velocity_tracking` 保持 `+7.5`，改为非对称满分带：欠速容差 `0.05 m/s`、超速容差 `0.20 m/s`；`1.5` command 对应满分区间 `1.45--1.70 m/s`；
+- `dribbling_ball_speed_excess` 保持 `-2.5`，`speed_margin` 从 `+0.20` 增为 `+0.30 m/s`；`1.5` command 的瞬时 Huber safety cap 从 `1.70` 移到 `1.80 m/s`，超过 cap 后仍保持非饱和减速梯度；
+- diagnostics 新增欠速/超速 excess，并直接保存上肢 `actor_raw_mean`、bounded pre-squash mean 与 squashed action，不再依赖接近 `0.95` 时数值敏感的反推。
+
 ## 0.1 当前更新：contact 语义校验与 bounded policy
 
 `diagnostic_20260819_142724.npz` 暴露出两个不能继续靠后处理掩盖的问题：接触诊断把挂在 `right_knee_link` 下的整段小腿碰撞圆柱显示成“膝盖”，而 S2 actor 的 14 维手臂原始 residual 已有 `89.65%` 落入旧 tanh/clamp 饱和区。
@@ -199,8 +210,8 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 | 7 | `dribbling_dynamic_proximity` | +3.0 | +0.060 | 平滑跟踪 0.2 s 预测球位 `[0.45,0]`，不依赖 contact timer |
 | 8 | `dribbling_ball_too_close_penalty` | -8.0 | -0.160 | pelvis--ball XY 距离 `<0.28 m` 起罚，`<=0.14 m` 满罚 |
 | 9 | `dribbling_pelvis_quat_tracking` | +2.0 | +0.040 | pelvis 姿态跟踪 motion reference，`std=0.45` |
-| 10 | `dribbling_ball_velocity_tracking` | +7.5 | +0.150 | 10-step EMA 球速双向跟踪；由 controllability gate 在恢复期降权 |
-| 11 | `dribbling_ball_speed_excess` | -2.5 | -0.050 | 瞬时 XY 球速 command-relative Huber 安全项，cap=`max(0.35,target+0.20)` |
+| 10 | `dribbling_ball_velocity_tracking` | +7.5 | +0.150 | 10-step EMA 球速非对称双向跟踪；欠速/超速容差 `0.05/0.20 m/s`，由 controllability gate 在恢复期降权 |
+| 11 | `dribbling_ball_speed_excess` | -2.5 | -0.050 | 瞬时 XY 球速 command-relative Huber 安全项，cap=`max(0.35,target+0.30)` |
 | 12 | `dribbling_sustained_contact_penalty` | -6.0 | -0.120 | 20-step per-link contact duty EMA；25% 起罚、60% 满罚 |
 | 13 | `dribbling_ball_bounce_penalty` | -3.0 | -0.060 | 接触时球垂直速度绝对值超过 `0.32 m/s` 起罚 |
 | 14 | `dribbling_rapid_retouch_penalty` | -1.0 | -0.020 | event-normalized；两次右脚 `<=14 N` 触球间隔 `<14 steps` 时实际回报 `-1.0/event` |
@@ -257,7 +268,7 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 - S2 的 motion clip 作为循环 style phase 使用，clip 结束不会单独重置场景。
 - play 中任意 episode termination 都会清空 RNN hidden state；普通失败保留当前手动 segment、heading 和剩余 duration，重置后的 robot yaw 与球使用当前有效 heading。只有完整 sequence 的 `reset_on_end` 会回到 segment 0。
 - CLI manual command 安装后会立即同步 robot yaw 和球，因此第一次 rollout 与之后的 reset 使用相同 command frame。
-- command 训练范围保持 speed `0.40--1.50 m/s`、heading `-0.75--0.75 rad`、duration `3--6 s`。
+- command 训练范围为 speed `0.40--1.65 m/s`、heading `-0.75--0.75 rad`、duration `3--6 s`；`1.5 m/s` 不再位于训练上边界。
 - 输入与 action 维度不变：Actor 163、Critic 295、Action 29，因此现有 S1/S2 checkpoint 在结构上兼容；本次不需要重训 S1。
 - reset 后首个 control step 的接触传感器值按初始化保护帧处理，不会把 pre-reset/stale PhysX 冲量计入触球 reward、termination 或 diagnostics。
 
@@ -324,6 +335,9 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 - `reference_relative_upper_body_residual`
 - `upper_residual_policy`、`upper_residual_projected`
 - `upper_residual_executed`、`upper_residual_saturation_fraction`
+- `upper_actor_raw_mean`、`upper_actor_bounded_mean`、`upper_actor_squashed_action`
+- `ball_filtered_underspeed_error`、`ball_filtered_overspeed_error`
+- `ball_velocity_underspeed_tolerance`、`ball_velocity_overspeed_tolerance`
 - `ball_contact_body_names`：Isaac articulation body/link 名
 - `ball_contact_collision_names`：用于视频解释的碰撞语义名；例如 `right_knee_link -> right_shin_collision`
 - `ball_contact_filter_count`、`ball_contact_expected_filter_count`
@@ -337,7 +351,7 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 | 指标 | 目标 |
 |---|---:|
 | EMA 球速 MAE | `<=0.25 m/s` |
-| `1.5 m/s` command 平均前向球速 | `1.25--1.75 m/s` |
+| `1.5 m/s` command 平均前向球速 | 优先达到 `1.35--1.60 m/s`，同时避免只靠高冲击峰值抬均值 |
 | 球速 `>2.5 m/s` 比例 | `<5%` |
 | 平均绝对 heading error | `<=0.12 rad` |
 | 1800-step 实际失败 termination | `<=2` |
@@ -345,6 +359,6 @@ S1 没有球任务 reward。球位置、球速度和 locomotion command 仍作�
 | recovery 中 closing speed | 大部分为正，不再出现 chase reward 满分但距离持续增大 |
 | useful touch 改善成功率 | 随训练上升；轻触基础分与延迟改善分必须分开看 |
 | 手臂、腰部参考误差 | 至少保持 06 水平，并继续向 5.0 靠近 |
-| 上肢 residual 饱和比例 | 从 Essay 11 的 `89.65%` 降到 `<10%`；`upper_residual_policy` 必须始终位于 `[-1,1]`，且 play/ONNX 一致 |
+| 上肢 residual 饱和比例 | `upper_residual_policy` 必须始终位于 `[-1,1]`；同时直接检查 `upper_actor_raw_mean` P95 与 squashed action 的 `>=0.90/0.94` boundary pressure |
 
 网络参数结构不变，但旧 checkpoint 的双臂输出分布或语义不同。无 marker 的旧 S1/S2 使用 `--migrate_legacy_upper_body_residual`；Essay 11 `reference_residual_v1` 使用 `--migrate_bounded_upper_body_policy`。两者都只迁移一次并写入新 run，之后从 `bounded_reference_residual_v2` checkpoint 正常 resume，绝不能继续携带迁移参数。
