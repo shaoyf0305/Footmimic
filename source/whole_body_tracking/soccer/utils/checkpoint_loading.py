@@ -15,6 +15,7 @@ UPPER_BODY_REFERENCE_RESIDUAL_V1 = "reference_residual_v1"
 UPPER_BODY_BOUNDED_REFERENCE_RESIDUAL_V2 = "bounded_reference_residual_v2"
 UPPER_BODY_DIRECT_REFERENCE_RESIDUAL_V3 = "direct_reference_residual_v3"
 UPPER_BODY_PRE_SQUASH_REFERENCE_RESIDUAL_V4 = "pre_squash_reference_residual_v4"
+UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5 = "regularized_reference_residual_v5"
 
 
 def _get_alg_policy(runner):
@@ -67,7 +68,7 @@ def checkpoint_infos_with_action_semantics(runner, infos):
         stamped_infos = dict(infos)
     else:
         raise TypeError(f"Checkpoint infos must be a dict or None, got {type(infos)!r}.")
-    stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_PRE_SQUASH_REFERENCE_RESIDUAL_V4
+    stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5
     return stamped_infos
 
 
@@ -192,8 +193,8 @@ def _state_dict_needs_obs_expand(checkpoint_sd: dict[str, torch.Tensor], current
 
 # TEMPORARY LEGACY MIGRATION -------------------------------------------------
 # Remove this block, its CLI flags, and the call sites once every retained
-# Pre-Essay-12 baselines still need an explicit output-head migration. Bounded
-# v2/direct v3 checkpoints enter the automatic v4 arm-head reset path above.
+# pre-Essay-12 baseline has been converted. Bounded v2, direct v3, and
+# unregularized v4 checkpoints enter the automatic v5 arm-head reset path.
 # The runtime residual action term does not depend on this compatibility code.
 def _is_legacy_joint_action_output(
     key: str,
@@ -270,25 +271,26 @@ def prepare_loaded_dict_for_obs_expand(
                 "An upper-body migration was requested, but this task does not use "
                 "reference-relative upper-body residual actions."
             )
-    elif checkpoint_semantics == UPPER_BODY_PRE_SQUASH_REFERENCE_RESIDUAL_V4:
+    elif checkpoint_semantics == UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5:
         if migrate_legacy_upper_body_residual or migrate_bounded_upper_body_policy:
             raise ValueError(
-                "This checkpoint already uses pre_squash_reference_residual_v4. Remove the migration flag; "
+                "This checkpoint already uses regularized_reference_residual_v5. Remove the migration flag; "
                 "normal resume must never reset the arm head."
             )
     elif checkpoint_semantics in (
         UPPER_BODY_BOUNDED_REFERENCE_RESIDUAL_V2,
         UPPER_BODY_DIRECT_REFERENCE_RESIDUAL_V3,
+        UPPER_BODY_PRE_SQUASH_REFERENCE_RESIDUAL_V4,
     ):
         if migrate_legacy_upper_body_residual or migrate_bounded_upper_body_policy:
             raise ValueError(
-                "Bounded v2/direct v3 checkpoints upgrade to the stable pre-squash v4 controller "
+                "Bounded v2/direct v3/unregularized v4 checkpoints upgrade to the regularized v5 controller "
                 "automatically. Remove both legacy migration flags."
             )
-        # The old arm heads learned very large means behind a saturating action
-        # transform. They are unsafe as Gaussian pre-squash variables. Preserve
-        # the shared/lower-body network but reset only the 14 arm output rows
-        # and their std, then discard Adam's old moments exactly once.
+        # These arm heads either use an incompatible transform or learned very
+        # large means behind the unregularized v4 tanh. Preserve the shared and
+        # lower-body network but reset only the 14 arm output rows and their
+        # std, then discard Adam's old moments exactly once.
         migrate_residual_output = True
         upgrade_saturated_residual_head = True
     elif checkpoint_semantics == UPPER_BODY_REFERENCE_RESIDUAL_V1:
@@ -307,7 +309,7 @@ def prepare_loaded_dict_for_obs_expand(
             )
         if not migrate_legacy_upper_body_residual:
             raise RuntimeError(
-                "This Stage-2 task expects pre_squash_reference_residual_v4 arm actions, but the checkpoint has "
+                "This Stage-2 task expects regularized_reference_residual_v5 arm actions, but the checkpoint has "
                 "no residual-action marker. For a pre-residual checkpoint, load it once with "
                 "--migrate_legacy_upper_body_residual. Do not use that flag for checkpoints saved "
                 "after migration."
@@ -316,7 +318,7 @@ def prepare_loaded_dict_for_obs_expand(
     else:
         raise ValueError(
             f"Unsupported upper-body action semantics {checkpoint_semantics!r}; expected "
-            f"{UPPER_BODY_PRE_SQUASH_REFERENCE_RESIDUAL_V4!r}."
+            f"{UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5!r}."
         )
     transformed_sd: dict[str, torch.Tensor] = {}
     notes: list[str] = []
@@ -348,7 +350,7 @@ def prepare_loaded_dict_for_obs_expand(
                 upper_action_ids=upper_action_ids,
             )
             migrated_residual_keys.append(key)
-            notes.append(f"{key}: reset 14 incompatible arm rows for pre-squash residual actions")
+            notes.append(f"{key}: reset 14 incompatible arm rows for regularized residual actions")
             changed = True
             continue
 
@@ -389,10 +391,10 @@ def prepare_loaded_dict_for_obs_expand(
                 "the one-time upper-body residual migration."
             )
     if migrate_residual_output:
-        loaded_dict[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_PRE_SQUASH_REFERENCE_RESIDUAL_V4
+        loaded_dict[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5
         infos = loaded_dict.get("infos")
         stamped_infos = dict(infos) if isinstance(infos, dict) else {}
-        stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_PRE_SQUASH_REFERENCE_RESIDUAL_V4
+        stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5
         loaded_dict["infos"] = stamped_infos
 
     if not changed:
@@ -405,9 +407,9 @@ def prepare_loaded_dict_for_obs_expand(
     print("[INFO] Warm-start: adapted a legacy checkpoint to the current interface.")
     if upgrade_saturated_residual_head:
         print(
-            "[INFO] One-time pre-squash v4 upgrade: preserved lower-body/shared/critic/normalizer "
+            "[INFO] One-time regularized v5 upgrade: preserved lower-body/shared/critic/normalizer "
             "weights, reset only the 14 saturated arm output rows and their std, discarded the old "
-            "optimizer, and started the stable Gaussian pre-squash action path."
+            "optimizer, and started the bounded-mean Gaussian residual path."
         )
     elif migrate_residual_output:
         print(

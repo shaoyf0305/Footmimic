@@ -3,7 +3,6 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-import math
 import os
 
 import torch
@@ -14,6 +13,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab_rl.rsl_rl.exporter import _OnnxPolicyExporter
 
 from soccer.tasks.tracking.mdp import MotionCommand
+from soccer.utils.bounded_actor_critic import DEFAULT_ARM_ACTION_MEAN_LIMIT
 
 
 def export_motion_policy_as_onnx(
@@ -41,7 +41,7 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
             bounded_mask[bounded_indices.detach().cpu().long()] = 1.0
         self.register_buffer("bounded_action_mask", bounded_mask)
         self.bounded_mean_limit = float(
-            getattr(actor_critic, "_bounded_mean_limit", math.atanh(0.95))
+            getattr(actor_critic, "_bounded_mean_limit", DEFAULT_ARM_ACTION_MEAN_LIMIT)
         )
         cmd: MotionCommand = env.command_manager.get_term("motion")
         # import ipdb; ipdb.set_trace()
@@ -68,8 +68,10 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
 
     def _policy_actions(self, actor_input: torch.Tensor) -> torch.Tensor:
         raw_actions = self.actor(actor_input)
-        # Algebraic masking exports cleanly to ONNX and leaves Stage-1 actions
-        # unchanged because its mask is all zeros.
+        # Runtime inference returns ``bounded_mean`` and the action term applies
+        # the sole physical tanh.  The standalone ONNX policy has no action
+        # term, so it exports that post-tanh arm action directly. Algebraic
+        # masking leaves Stage 1 unchanged and exports cleanly to ONNX.
         bounded_mean = self.bounded_mean_limit * torch.tanh(
             raw_actions / self.bounded_mean_limit
         )
@@ -200,7 +202,12 @@ def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filen
         bounded_action_ids, torch.Tensor
     ):
         metadata["bounded_policy_action_indices"] = bounded_action_ids.detach().cpu().tolist()
-        metadata["bounded_policy_action_transform"] = "tanh_normal"
+        metadata["bounded_policy_action_transform"] = "smooth_mean_cap_then_tanh"
+        metadata["bounded_policy_action_output"] = "post_squash"
+        metadata["bounded_policy_pre_squash_mean_limit"] = DEFAULT_ARM_ACTION_MEAN_LIMIT
+        metadata["upper_body_reference_target_margin"] = float(
+            action_term.cfg.reference_target_margin
+        )
 
     model = onnx.load(onnx_path)
 

@@ -371,3 +371,8 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
 
         self.rewards.action_rate_l2.func = mdp.effective_action_rate_l2_clip
         self.rewards.action_rate_l2.params = {"action_name": "joint_pos"}
+        self.rewards.upper_body_reference_residual_l2 = RewTerm(
+            func=mdp.upper_body_reference_residual_l2,
+            weight=-0.5,
+            params={"action_name": "joint_pos"},
+        )

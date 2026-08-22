@@ -62,5 +62,6 @@ tmp/
 *_old.*
 *copy*
 logs/
+msc_essay/
 *.pt
 .codex_tmp/

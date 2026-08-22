@@ -50,6 +50,26 @@ def effective_action_rate_l2_clip(
     return torch.sum(torch.square(delta), dim=1).clamp(max=100.0)
 
 
+def upper_body_reference_residual_l2(
+    env: ManagerBasedRLEnv, action_name: str = "joint_pos"
+) -> torch.Tensor:
+    """Penalize persistent arm deviation from the live motion reference.
+
+    The action term exposes the executed residual normalized by its common
+    physical margin.  Averaging across joints keeps this regularizer
+    independent of the number of controlled arm degrees of freedom.  Unlike
+    action-rate, this term gives a constant saturated correction a restoring
+    signal toward the exact-reference zero action.
+    """
+    action_term = env.action_manager.get_term(action_name)
+    normalized_residual = getattr(
+        action_term, "effective_upper_residual_actions", None
+    )
+    if not isinstance(normalized_residual, torch.Tensor):
+        return torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
+    return torch.mean(torch.square(normalized_residual), dim=1)
+
+
 def _pelvis_yaw_w(command: MotionCommand, pelvis_body_name: str = "pelvis") -> torch.Tensor:
     """Return pelvis yaw in the world frame."""
     robot = command.robot

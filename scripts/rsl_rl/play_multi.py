@@ -783,6 +783,7 @@ def _create_diagnostic(
         "policy_action": [],
         "applied_action": [],
         "upper_actor_raw_mean": [],
+        "upper_actor_bounded_mean": [],
         "upper_actor_squashed_action": [],
         "trunk_reference_joint_pos": [],
         "trunk_reference_joint_vel": [],
@@ -995,6 +996,9 @@ def _append_diagnostic(
     diagnostic["applied_action"].append(_cpu(applied_actions[:, action_ids]))
     diagnostic["upper_actor_raw_mean"].append(
         _policy_arm_telemetry("last_inference_actor_raw_mean")
+    )
+    diagnostic["upper_actor_bounded_mean"].append(
+        _policy_arm_telemetry("last_inference_actor_bounded_mean")
     )
     diagnostic["upper_actor_squashed_action"].append(
         _policy_arm_telemetry("last_inference_actor_action")
@@ -1665,6 +1669,14 @@ def _save_diagnostic(diagnostic: dict) -> None:
     upper_actor_raw_abs_max = (
         float(np.max(raw_actor_abs)) if raw_actor_abs.size else np.nan
     )
+    bounded_actor_abs = np.abs(arrays["upper_actor_bounded_mean"])
+    bounded_actor_abs = bounded_actor_abs[np.isfinite(bounded_actor_abs)]
+    upper_actor_bounded_abs_mean = (
+        float(np.mean(bounded_actor_abs)) if bounded_actor_abs.size else np.nan
+    )
+    upper_actor_bounded_abs_max = (
+        float(np.max(bounded_actor_abs)) if bounded_actor_abs.size else np.nan
+    )
     squashed_actor_abs = np.abs(arrays["upper_actor_squashed_action"])
     squashed_actor_abs = squashed_actor_abs[np.isfinite(squashed_actor_abs)]
     upper_actor_boundary_090 = (
@@ -1719,6 +1731,8 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"upper_residual_joint_limit={upper_residual_joint_limit:.3f}  "
         f"upper_actor_raw_abs={upper_actor_raw_abs_mean:.3f}/p95={upper_actor_raw_abs_p95:.3f}"
         f"/max={upper_actor_raw_abs_max:.3f}  "
+        f"upper_actor_bounded_abs={upper_actor_bounded_abs_mean:.3f}"
+        f"/max={upper_actor_bounded_abs_max:.3f}  "
         f"upper_actor_boundary_090={upper_actor_boundary_090:.3f}  "
         f"upper_actor_boundary_094={upper_actor_boundary_094:.3f}  "
         f"waist_target_err={trunk_target_error:.3f} rad  "

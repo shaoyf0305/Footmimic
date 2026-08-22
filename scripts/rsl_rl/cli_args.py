@@ -41,7 +41,7 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
         help=(
             "One-time migration for a reference_residual_v1 Stage-2 checkpoint: preserve the "
             "lower body and reset only the 14 saturated arm output rows before switching to the "
-            "bounded tanh-Normal policy. Never use for a checkpoint saved after migration."
+            "regularized bounded-mean residual policy. Never use for a checkpoint saved after migration."
         ),
     )
     # -- logger arguments
