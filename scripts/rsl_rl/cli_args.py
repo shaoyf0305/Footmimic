@@ -30,7 +30,8 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
         default=False,
         help=(
             "One-time migration for a pre-reference-residual Stage-2 checkpoint: preserve the "
-            "lower body and reset only the 14 arm output rows. Never use for a checkpoint saved "
+            "15 lower/waist outputs, remove six wrist outputs, and initialize eight shoulder/elbow "
+            "residual outputs. Never use for a checkpoint saved "
             "after migration. This temporary compatibility flag can be removed with the legacy loader."
         ),
     )
@@ -40,8 +41,8 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
         default=False,
         help=(
             "One-time migration for a reference_residual_v1 Stage-2 checkpoint: preserve the "
-            "lower body and reset only the 14 saturated arm output rows before switching to the "
-            "regularized bounded-mean residual policy. Never use for a checkpoint saved after migration."
+            "15 lower/waist outputs, remove six wrist outputs, and initialize eight shoulder/elbow "
+            "residual outputs. Never use for a checkpoint saved after migration."
         ),
     )
     # -- logger arguments

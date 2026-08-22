@@ -522,7 +522,7 @@ def _get_joint_position_action_term(base_env):
 
 
 def _action_ids_for_robot_joint_ids(action_joint_ids: torch.Tensor, robot_joint_ids) -> list[int]:
-    """Map robot joint ids to their positions in the policy action vector."""
+    """Map robot joint ids to their positions in the full processed-action vector."""
     robot_to_action = {int(robot_id): action_id for action_id, robot_id in enumerate(action_joint_ids.tolist())}
     try:
         return [robot_to_action[int(robot_id)] for robot_id in robot_joint_ids]
@@ -530,6 +530,29 @@ def _action_ids_for_robot_joint_ids(action_joint_ids: torch.Tensor, robot_joint_
         raise RuntimeError(
             f"joint_pos action does not control robot joint id {exc.args[0]}."
         ) from exc
+
+
+def _policy_action_ids_for_robot_joint_ids(
+    action_term,
+    action_joint_ids: torch.Tensor,
+    robot_joint_ids,
+    *,
+    allow_missing: bool = False,
+) -> list[int]:
+    """Map robot joints to public policy outputs, preserving missing wrists as ``-1``."""
+    mapper = getattr(action_term, "policy_action_ids_for_robot_joint_ids", None)
+    if not callable(mapper):
+        return _action_ids_for_robot_joint_ids(action_joint_ids, robot_joint_ids)
+
+    action_ids: list[int] = []
+    for robot_joint_id in robot_joint_ids:
+        try:
+            action_ids.append(int(mapper([int(robot_joint_id)])[0]))
+        except ValueError:
+            if not allow_missing:
+                raise
+            action_ids.append(-1)
+    return action_ids
 
 
 def _world_quat_to_rpy(quat: torch.Tensor) -> torch.Tensor:
@@ -554,7 +577,19 @@ def _create_joint_reference_constraint(env, margin: float, group: str, joint_nam
     if len(robot_joint_ids) != len(joint_names):
         raise RuntimeError(f"Could not resolve all {group} constraint joints; found {found_names}.")
 
-    action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, robot_joint_ids)
+    policy_action_ids = _policy_action_ids_for_robot_joint_ids(
+        action_term,
+        action_joint_ids,
+        robot_joint_ids,
+        allow_missing=True,
+    )
+    active_local_ids = [index for index, action_id in enumerate(policy_action_ids) if action_id >= 0]
+    active_robot_joint_ids = [robot_joint_ids[index] for index in active_local_ids]
+    active_joint_names = [joint_names[index] for index in active_local_ids]
+    action_ids = [policy_action_ids[index] for index in active_local_ids]
+    processed_action_ids = _action_ids_for_robot_joint_ids(
+        action_joint_ids, active_robot_joint_ids
+    )
 
     scale = getattr(action_term, "_scale", None)
     offset = getattr(action_term, "_offset", None)
@@ -563,10 +598,22 @@ def _create_joint_reference_constraint(env, margin: float, group: str, joint_nam
 
     return {
         "group": group,
-        "joint_names": np.asarray(joint_names),
+        "joint_names": np.asarray(active_joint_names),
         "margin": float(margin),
-        "robot_joint_ids": torch.as_tensor(robot_joint_ids, dtype=torch.long, device=base_env.device),
+        "robot_joint_ids": torch.as_tensor(
+            active_robot_joint_ids, dtype=torch.long, device=base_env.device
+        ),
         "action_ids": torch.as_tensor(action_ids, dtype=torch.long, device=base_env.device),
+        "processed_action_ids": torch.as_tensor(
+            processed_action_ids, dtype=torch.long, device=base_env.device
+        ),
+        "reference_residual": bool(
+            getattr(action_term, "uses_reference_relative_upper_body_residual", False)
+            and group != _WAIST_REFERENCE_CONSTRAINT_GROUP
+        ),
+        "reference_residual_margin": float(
+            getattr(action_term.cfg, "reference_target_margin", 1.0)
+        ),
         "scale": scale,
         "offset": offset,
     }
@@ -595,9 +642,26 @@ def _constrain_reference_actions(env, actions: torch.Tensor, constraint: dict) -
     base_env = _resolve_base_env(env)
     command = base_env.command_manager.get_term("motion")
     action_ids = constraint["action_ids"]
+    if action_ids.numel() == 0:
+        return actions
+    if constraint["reference_residual"]:
+        margin_ratio = min(
+            float(constraint["margin"]) / constraint["reference_residual_margin"],
+            1.0,
+        )
+        if margin_ratio >= 1.0:
+            return actions
+        pre_squash_limit = float(np.arctanh(margin_ratio))
+        constrained_actions = actions.clone()
+        constrained_actions[:, action_ids] = torch.clamp(
+            actions[:, action_ids], min=-pre_squash_limit, max=pre_squash_limit
+        )
+        return constrained_actions
+
     robot_joint_ids = constraint["robot_joint_ids"]
-    scale = constraint["scale"][:, action_ids]
-    offset = constraint["offset"][:, action_ids]
+    processed_action_ids = constraint["processed_action_ids"]
+    scale = constraint["scale"][:, processed_action_ids]
+    offset = constraint["offset"][:, processed_action_ids]
     if torch.any(torch.abs(scale) < 1.0e-8):
         raise RuntimeError(f"Cannot constrain {constraint['group']} actions with a zero action scale.")
 
@@ -700,14 +764,33 @@ def _create_diagnostic(
             f"Motion command does not expose every trunk diagnostic body: {_TRUNK_DIAGNOSTIC_BODY_NAMES}."
         ) from exc
     action_term, action_joint_ids = _get_joint_position_action_term(base_env)
-    arm_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, joint_ids)
+    arm_action_ids = _policy_action_ids_for_robot_joint_ids(
+        action_term, action_joint_ids, joint_ids, allow_missing=True
+    )
     reference_relative_upper_residual = bool(
         getattr(action_term, "uses_reference_relative_upper_body_residual", False)
     )
     bounded_upper_body_policy_action = bool(
         getattr(action_term, "uses_bounded_upper_body_policy_action", False)
     )
-    trunk_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, trunk_joint_ids)
+    trunk_action_ids = _policy_action_ids_for_robot_joint_ids(
+        action_term, action_joint_ids, trunk_joint_ids
+    )
+    trunk_processed_action_ids = _action_ids_for_robot_joint_ids(
+        action_joint_ids, trunk_joint_ids
+    )
+    residual_upper_local_ids = getattr(action_term, "_residual_local_ids", None)
+    residual_upper_local_ids = (
+        residual_upper_local_ids.detach().cpu().numpy().astype(np.int64)
+        if isinstance(residual_upper_local_ids, torch.Tensor)
+        else np.arange(len(_ARM_DIAGNOSTIC_JOINT_NAMES), dtype=np.int64)
+    )
+    residual_upper_joint_names = np.asarray(
+        getattr(action_term, "_residual_joint_names", _ARM_DIAGNOSTIC_JOINT_NAMES)
+    )
+    reference_only_upper_joint_names = np.asarray(
+        getattr(action_term, "_reference_only_joint_names", ())
+    )
 
     output_dir = os.path.join(log_dir, "diagnostics")
     os.makedirs(output_dir, exist_ok=True)
@@ -739,11 +822,18 @@ def _create_diagnostic(
         "joint_ids": torch.as_tensor(joint_ids, dtype=torch.long, device=base_env.device),
         "joint_names": np.asarray(_ARM_DIAGNOSTIC_JOINT_NAMES),
         "action_ids": torch.as_tensor(arm_action_ids, dtype=torch.long, device=base_env.device),
+        "policy_action_dim": int(action_term.action_dim),
+        "residual_upper_local_ids": residual_upper_local_ids,
+        "residual_upper_joint_names": residual_upper_joint_names,
+        "reference_only_upper_joint_names": reference_only_upper_joint_names,
         "reference_relative_upper_body_residual": reference_relative_upper_residual,
         "bounded_upper_body_policy_action": bounded_upper_body_policy_action,
         "trunk_joint_ids": torch.as_tensor(trunk_joint_ids, dtype=torch.long, device=base_env.device),
         "trunk_joint_names": np.asarray(_TRUNK_DIAGNOSTIC_JOINT_NAMES),
         "trunk_action_ids": torch.as_tensor(trunk_action_ids, dtype=torch.long, device=base_env.device),
+        "trunk_processed_action_ids": torch.as_tensor(
+            trunk_processed_action_ids, dtype=torch.long, device=base_env.device
+        ),
         "trunk_body_ids": torch.as_tensor(trunk_body_ids, dtype=torch.long, device=base_env.device),
         "trunk_reference_body_ids": torch.as_tensor(
             trunk_reference_body_ids, dtype=torch.long, device=base_env.device
@@ -783,7 +873,6 @@ def _create_diagnostic(
         "policy_action": [],
         "applied_action": [],
         "upper_actor_raw_mean": [],
-        "upper_actor_bounded_mean": [],
         "upper_actor_squashed_action": [],
         "trunk_reference_joint_pos": [],
         "trunk_reference_joint_vel": [],
@@ -963,9 +1052,20 @@ def _append_diagnostic(
         value = getattr(policy_module, attr, None)
         if not isinstance(value, torch.Tensor) or value.ndim != 2:
             return np.full(len(action_ids), np.nan, dtype=np.float32)
-        if action_ids.numel() and int(action_ids.max().item()) >= value.shape[1]:
+        valid = action_ids >= 0
+        if torch.any(valid) and int(action_ids[valid].max().item()) >= value.shape[1]:
             return np.full(len(action_ids), np.nan, dtype=np.float32)
-        return _cpu(value[:, action_ids])
+        result = np.full(len(action_ids), np.nan, dtype=np.float32)
+        if torch.any(valid):
+            result[valid.detach().cpu().numpy()] = _cpu(value[:, action_ids[valid]])
+        return result
+
+    def _policy_arm_values(value: torch.Tensor) -> np.ndarray:
+        result = np.full(len(action_ids), np.nan, dtype=np.float32)
+        valid = action_ids >= 0
+        if torch.any(valid):
+            result[valid.detach().cpu().numpy()] = _cpu(value[:, action_ids[valid]])
+        return result
 
     diagnostic["step"].append(int(step))
     diagnostic["motion_idx"].append(int(command.motion_idx[0].item()))
@@ -992,13 +1092,10 @@ def _append_diagnostic(
     diagnostic["actual_joint_pos"].append(_cpu(robot.data.joint_pos[:, ids]))
     diagnostic["actual_joint_vel"].append(_cpu(robot.data.joint_vel[:, ids]))
     action_term = base_env.action_manager.get_term("joint_pos")
-    diagnostic["policy_action"].append(_cpu(policy_actions[:, action_ids]))
-    diagnostic["applied_action"].append(_cpu(applied_actions[:, action_ids]))
+    diagnostic["policy_action"].append(_policy_arm_values(policy_actions))
+    diagnostic["applied_action"].append(_policy_arm_values(applied_actions))
     diagnostic["upper_actor_raw_mean"].append(
         _policy_arm_telemetry("last_inference_actor_raw_mean")
-    )
-    diagnostic["upper_actor_bounded_mean"].append(
-        _policy_arm_telemetry("last_inference_actor_bounded_mean")
     )
     diagnostic["upper_actor_squashed_action"].append(
         _policy_arm_telemetry("last_inference_actor_action")
@@ -1368,13 +1465,13 @@ def _append_upper_body_action_diagnostic(diagnostic: dict, env) -> None:
     command = base_env.command_manager.get_term("motion")
     robot = base_env.scene[command.cfg.asset_name]
     trunk_ids = diagnostic["trunk_joint_ids"]
-    trunk_action_ids = diagnostic["trunk_action_ids"]
+    trunk_processed_action_ids = diagnostic["trunk_processed_action_ids"]
     processed_actions = getattr(action_term, "processed_actions", None)
     if processed_actions is None:
         processed_actions = getattr(action_term, "_processed_actions", None)
 
     if isinstance(processed_actions, torch.Tensor):
-        trunk_target = processed_actions[0, trunk_action_ids]
+        trunk_target = processed_actions[0, trunk_processed_action_ids]
     else:
         trunk_target = torch.full(
             (len(_TRUNK_DIAGNOSTIC_JOINT_NAMES),),
@@ -1434,12 +1531,15 @@ def _save_diagnostic(diagnostic: dict) -> None:
         "ball_contact_body_names", "ball_contact_collision_names", "ball_contact_filter_available",
         "ball_contact_filter_count", "ball_contact_expected_filter_count",
         "ball_contact_filter_mapping_valid",
-        "trunk_joint_ids", "trunk_joint_names", "trunk_action_ids", "trunk_body_ids",
+        "trunk_joint_ids", "trunk_joint_names", "trunk_action_ids", "trunk_processed_action_ids",
+        "trunk_body_ids",
         "trunk_reference_body_ids", "trunk_body_names",
         "constraint_group", "constraint_margin", "constraint_joint_names", "constraint_groups",
         "constraint_margins", "waist_roll_stiffness_scale", "waist_roll_damping_scale",
         "reference_relative_upper_body_residual",
         "bounded_upper_body_policy_action",
+        "policy_action_dim", "residual_upper_local_ids", "residual_upper_joint_names",
+        "reference_only_upper_joint_names",
     }
     arrays = {
         key: np.asarray(value)
@@ -1447,7 +1547,18 @@ def _save_diagnostic(diagnostic: dict) -> None:
         if key not in metadata_keys
     }
     arrays["joint_names"] = diagnostic["joint_names"]
+    arrays["policy_action_ids"] = diagnostic["action_ids"].detach().cpu().numpy()
+    arrays["policy_action_dim"] = np.asarray(diagnostic["policy_action_dim"])
+    arrays["residual_upper_local_ids"] = diagnostic["residual_upper_local_ids"]
+    arrays["residual_upper_joint_names"] = diagnostic["residual_upper_joint_names"]
+    arrays["reference_only_upper_joint_names"] = diagnostic[
+        "reference_only_upper_joint_names"
+    ]
     arrays["trunk_joint_names"] = diagnostic["trunk_joint_names"]
+    arrays["trunk_policy_action_ids"] = diagnostic["trunk_action_ids"].detach().cpu().numpy()
+    arrays["trunk_processed_action_ids"] = diagnostic[
+        "trunk_processed_action_ids"
+    ].detach().cpu().numpy()
     arrays["trunk_body_names"] = diagnostic["trunk_body_names"]
     arrays["reward_term_names"] = diagnostic["reward_term_names"]
     arrays["reward_term_weights"] = diagnostic["reward_term_weights"]
@@ -1642,15 +1753,24 @@ def _save_diagnostic(diagnostic: dict) -> None:
         float(np.percentile(finite_limit_margin, 5)) if finite_limit_margin.size else np.nan
     )
     terminations = int(np.sum(arrays["done"]))
+    residual_upper_local_ids = arrays["residual_upper_local_ids"].astype(np.int64)
     upper_residual_pre_squash_abs = float(
-        np.nanmean(np.abs(arrays["upper_residual_pre_squash"]))
+        np.nanmean(
+            np.abs(arrays["upper_residual_pre_squash"][:, residual_upper_local_ids])
+        )
     )
-    upper_residual_policy_abs = float(np.nanmean(np.abs(arrays["upper_residual_policy"])))
+    upper_residual_policy_abs = float(
+        np.nanmean(np.abs(arrays["upper_residual_policy"][:, residual_upper_local_ids]))
+    )
     upper_residual_commanded_abs = float(
-        np.nanmean(np.abs(arrays["upper_residual_commanded"]))
+        np.nanmean(
+            np.abs(arrays["upper_residual_commanded"][:, residual_upper_local_ids])
+        )
     )
     upper_residual_executed_abs = float(
-        np.nanmean(np.abs(arrays["upper_residual_executed"]))
+        np.nanmean(
+            np.abs(arrays["upper_residual_executed"][:, residual_upper_local_ids])
+        )
     )
     upper_residual_actor_boundary = float(
         np.nanmean(arrays["upper_residual_actor_boundary_fraction"])
@@ -1668,14 +1788,6 @@ def _save_diagnostic(diagnostic: dict) -> None:
     )
     upper_actor_raw_abs_max = (
         float(np.max(raw_actor_abs)) if raw_actor_abs.size else np.nan
-    )
-    bounded_actor_abs = np.abs(arrays["upper_actor_bounded_mean"])
-    bounded_actor_abs = bounded_actor_abs[np.isfinite(bounded_actor_abs)]
-    upper_actor_bounded_abs_mean = (
-        float(np.mean(bounded_actor_abs)) if bounded_actor_abs.size else np.nan
-    )
-    upper_actor_bounded_abs_max = (
-        float(np.max(bounded_actor_abs)) if bounded_actor_abs.size else np.nan
     )
     squashed_actor_abs = np.abs(arrays["upper_actor_squashed_action"])
     squashed_actor_abs = squashed_actor_abs[np.isfinite(squashed_actor_abs)]
@@ -1731,8 +1843,6 @@ def _save_diagnostic(diagnostic: dict) -> None:
         f"upper_residual_joint_limit={upper_residual_joint_limit:.3f}  "
         f"upper_actor_raw_abs={upper_actor_raw_abs_mean:.3f}/p95={upper_actor_raw_abs_p95:.3f}"
         f"/max={upper_actor_raw_abs_max:.3f}  "
-        f"upper_actor_bounded_abs={upper_actor_bounded_abs_mean:.3f}"
-        f"/max={upper_actor_bounded_abs_max:.3f}  "
         f"upper_actor_boundary_090={upper_actor_boundary_090:.3f}  "
         f"upper_actor_boundary_094={upper_actor_boundary_094:.3f}  "
         f"waist_target_err={trunk_target_error:.3f} rad  "

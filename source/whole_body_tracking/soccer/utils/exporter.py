@@ -13,7 +13,6 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab_rl.rsl_rl.exporter import _OnnxPolicyExporter
 
 from soccer.tasks.tracking.mdp import MotionCommand
-from soccer.utils.bounded_actor_critic import DEFAULT_ARM_ACTION_MEAN_LIMIT
 
 
 def export_motion_policy_as_onnx(
@@ -40,9 +39,6 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
         if isinstance(bounded_indices, torch.Tensor) and bounded_indices.numel() > 0:
             bounded_mask[bounded_indices.detach().cpu().long()] = 1.0
         self.register_buffer("bounded_action_mask", bounded_mask)
-        self.bounded_mean_limit = float(
-            getattr(actor_critic, "_bounded_mean_limit", DEFAULT_ARM_ACTION_MEAN_LIMIT)
-        )
         cmd: MotionCommand = env.command_manager.get_term("motion")
         # import ipdb; ipdb.set_trace()
         if len(cmd.motion.joint_pos.shape) == 2:  # Single motion.
@@ -68,14 +64,10 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
 
     def _policy_actions(self, actor_input: torch.Tensor) -> torch.Tensor:
         raw_actions = self.actor(actor_input)
-        # Runtime inference returns ``bounded_mean`` and the action term applies
-        # the sole physical tanh.  The standalone ONNX policy has no action
-        # term, so it exports that post-tanh arm action directly. Algebraic
-        # masking leaves Stage 1 unchanged and exports cleanly to ONNX.
-        bounded_mean = self.bounded_mean_limit * torch.tanh(
-            raw_actions / self.bounded_mean_limit
-        )
-        bounded_actions = torch.tanh(bounded_mean)
+        # Runtime returns the Gaussian variable and the environment owns the
+        # physical tanh. A standalone ONNX policy exports the eight residual
+        # variables after that same sole tanh.
+        bounded_actions = torch.tanh(raw_actions)
         return raw_actions + self.bounded_action_mask * (bounded_actions - raw_actions)
 
 
@@ -184,6 +176,7 @@ def list_to_csv_str(arr, *, decimals: int = 3, delimiter: str = ",") -> str:
 
 def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filename="policy.onnx") -> None:
     onnx_path = os.path.join(path, filename)
+    action_term = env.action_manager.get_term("joint_pos")
     metadata = {
         "run_path": run_path,
         "joint_names": env.scene["robot"].data.joint_names,
@@ -192,22 +185,36 @@ def attach_onnx_metadata(env: ManagerBasedRLEnv, run_path: str, path: str, filen
         "default_joint_pos": env.scene["robot"].data.default_joint_pos_nominal.cpu().tolist(),
         "command_names": env.command_manager.active_terms,
         "observation_names": env.observation_manager.active_terms["policy"],
-        "action_scale": env.action_manager.get_term("joint_pos")._scale[0].cpu().tolist(),
         "anchor_body_name": env.command_manager.get_term("motion").cfg.anchor_body_name,
         "body_names": env.command_manager.get_term("motion").cfg.body_names,
     }
-    action_term = env.action_manager.get_term("joint_pos")
-    bounded_action_ids = getattr(action_term, "_upper_action_ids", None)
+    bounded_action_ids = getattr(action_term, "residual_policy_action_ids", None)
     if getattr(action_term, "uses_bounded_upper_body_policy_action", False) and isinstance(
         bounded_action_ids, torch.Tensor
     ):
         metadata["bounded_policy_action_indices"] = bounded_action_ids.detach().cpu().tolist()
-        metadata["bounded_policy_action_transform"] = "smooth_mean_cap_then_tanh"
+        metadata["bounded_policy_action_transform"] = "tanh"
         metadata["bounded_policy_action_output"] = "post_squash"
-        metadata["bounded_policy_pre_squash_mean_limit"] = DEFAULT_ARM_ACTION_MEAN_LIMIT
         metadata["upper_body_reference_target_margin"] = float(
             action_term.cfg.reference_target_margin
         )
+        metadata["policy_action_dim"] = int(action_term.action_dim)
+        metadata["upper_body_residual_joint_names"] = list(
+            action_term._residual_joint_names
+        )
+        metadata["upper_body_reference_only_joint_names"] = list(
+            action_term._reference_only_joint_names
+        )
+        lower_action_ids = action_term._lower_action_ids
+        lower_scale = action_term._scale[0, lower_action_ids]
+        residual_scale = action_term._upper_residual_margins[0]
+        metadata["action_scale"] = torch.cat((lower_scale, residual_scale)).cpu().tolist()
+        metadata["full_processed_action_scale"] = action_term._scale[0].cpu().tolist()
+        metadata["policy_action_robot_joint_ids"] = torch.cat(
+            (action_term._lower_robot_ids, action_term._residual_robot_ids)
+        ).detach().cpu().tolist()
+    else:
+        metadata["action_scale"] = action_term._scale[0].cpu().tolist()
 
     model = onnx.load(onnx_path)
 

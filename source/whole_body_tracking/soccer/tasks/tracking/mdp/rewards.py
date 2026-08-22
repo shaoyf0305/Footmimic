@@ -38,36 +38,38 @@ def effective_action_rate_l2_clip(
     previous = getattr(action_term, "prev_effective_raw_actions", env.action_manager.prev_action)
     delta = current - previous
     upper_action_ids = getattr(action_term, "_upper_action_ids", None)
+    residual_action_ids = getattr(action_term, "_residual_action_ids", None)
     current_upper = getattr(action_term, "effective_upper_residual_actions", None)
     previous_upper = getattr(action_term, "prev_effective_upper_residual_actions", None)
     if (
         isinstance(upper_action_ids, torch.Tensor)
+        and isinstance(residual_action_ids, torch.Tensor)
         and isinstance(current_upper, torch.Tensor)
         and isinstance(previous_upper, torch.Tensor)
     ):
         delta = delta.clone()
-        delta[:, upper_action_ids] = current_upper - previous_upper
+        delta[:, upper_action_ids] = 0.0
+        delta[:, residual_action_ids] = current_upper - previous_upper
     return torch.sum(torch.square(delta), dim=1).clamp(max=100.0)
 
 
-def upper_body_reference_residual_l2(
+def upper_body_pre_squash_action_l2(
     env: ManagerBasedRLEnv, action_name: str = "joint_pos"
 ) -> torch.Tensor:
-    """Penalize persistent arm deviation from the live motion reference.
+    """Penalize the eight shoulder/elbow Gaussian variables before ``tanh``.
 
-    The action term exposes the executed residual normalized by its common
-    physical margin.  Averaging across joints keeps this regularizer
-    independent of the number of controlled arm degrees of freedom.  Unlike
-    action-rate, this term gives a constant saturated correction a restoring
-    signal toward the exact-reference zero action.
+    A post-tanh cost becomes nearly flat at the boundary and cannot reliably
+    recover a saturated Gaussian mean. This unbounded quadratic acts on the
+    real pre-squash variables; reference-only wrists are excluded.
     """
     action_term = env.action_manager.get_term(action_name)
-    normalized_residual = getattr(
-        action_term, "effective_upper_residual_actions", None
-    )
-    if not isinstance(normalized_residual, torch.Tensor):
+    pre_squash = getattr(action_term, "upper_residual_pre_squash", None)
+    residual_local_ids = getattr(action_term, "_residual_local_ids", None)
+    if not isinstance(pre_squash, torch.Tensor) or not isinstance(
+        residual_local_ids, torch.Tensor
+    ):
         return torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
-    return torch.mean(torch.square(normalized_residual), dim=1)
+    return torch.mean(torch.square(pre_squash[:, residual_local_ids]), dim=1)
 
 
 def _pelvis_yaw_w(command: MotionCommand, pelvis_body_name: str = "pelvis") -> torch.Tensor:

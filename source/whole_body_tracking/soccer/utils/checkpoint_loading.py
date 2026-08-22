@@ -16,6 +16,7 @@ UPPER_BODY_BOUNDED_REFERENCE_RESIDUAL_V2 = "bounded_reference_residual_v2"
 UPPER_BODY_DIRECT_REFERENCE_RESIDUAL_V3 = "direct_reference_residual_v3"
 UPPER_BODY_PRE_SQUASH_REFERENCE_RESIDUAL_V4 = "pre_squash_reference_residual_v4"
 UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5 = "regularized_reference_residual_v5"
+UPPER_BODY_SHOULDER_ELBOW_REFERENCE_RESIDUAL_V6 = "shoulder_elbow_reference_residual_v6"
 
 
 def _get_alg_policy(runner):
@@ -30,8 +31,10 @@ def _get_alg_policy(runner):
     )
 
 
-def _reference_upper_residual_layout(runner) -> tuple[list[int], int] | None:
-    """Return arm action rows when the environment uses the 29-D residual interface."""
+def _reference_upper_residual_layout(
+    runner,
+) -> tuple[list[int], list[int], int, int] | None:
+    """Return the old-row/new-row mapping for the reduced residual interface."""
     env = getattr(runner, "env", None)
     base_env = getattr(env, "unwrapped", env)
     try:
@@ -40,10 +43,19 @@ def _reference_upper_residual_layout(runner) -> tuple[list[int], int] | None:
         return None
     if not getattr(action_term, "uses_reference_relative_upper_body_residual", False):
         return None
-    upper_ids = getattr(action_term, "_upper_action_ids", None)
-    if not isinstance(upper_ids, torch.Tensor):
+    lower_source_ids = getattr(action_term, "_lower_action_ids", None)
+    residual_policy_ids = getattr(action_term, "residual_policy_action_ids", None)
+    full_action_dim = getattr(action_term, "_full_action_dim", None)
+    if not isinstance(lower_source_ids, torch.Tensor) or not isinstance(
+        residual_policy_ids, torch.Tensor
+    ):
         return None
-    return [int(index) for index in upper_ids.detach().cpu().tolist()], int(action_term.action_dim)
+    return (
+        [int(index) for index in lower_source_ids.detach().cpu().tolist()],
+        [int(index) for index in residual_policy_ids.detach().cpu().tolist()],
+        int(action_term.action_dim),
+        int(full_action_dim),
+    )
 
 
 def _checkpoint_upper_body_action_semantics(loaded_dict: dict[str, Any]) -> str | None:
@@ -68,7 +80,9 @@ def checkpoint_infos_with_action_semantics(runner, infos):
         stamped_infos = dict(infos)
     else:
         raise TypeError(f"Checkpoint infos must be a dict or None, got {type(infos)!r}.")
-    stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5
+    stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = (
+        UPPER_BODY_SHOULDER_ELBOW_REFERENCE_RESIDUAL_V6
+    )
     return stamped_infos
 
 
@@ -193,18 +207,24 @@ def _state_dict_needs_obs_expand(checkpoint_sd: dict[str, torch.Tensor], current
 
 # TEMPORARY LEGACY MIGRATION -------------------------------------------------
 # Remove this block, its CLI flags, and the call sites once every retained
-# pre-Essay-12 baseline has been converted. Bounded v2, direct v3, and
-# unregularized v4 checkpoints enter the automatic v5 arm-head reset path.
+# pre-Essay-12 baseline has been converted. V2--v5 checkpoints enter the
+# automatic reduced-output v6 migration path.
 # The runtime residual action term does not depend on this compatibility code.
 def _is_legacy_joint_action_output(
     key: str,
     old: torch.Tensor,
     cur: torch.Tensor,
     *,
-    action_dim: int,
+    old_action_dim: int,
+    new_action_dim: int,
 ) -> bool:
     """Identify actor-head rows without touching hidden layers or the critic."""
-    if old.shape != cur.shape or old.ndim not in (1, 2) or old.shape[0] != action_dim:
+    if (
+        old.ndim not in (1, 2)
+        or cur.ndim != old.ndim
+        or old.shape[0] != old_action_dim
+        or cur.shape[0] != new_action_dim
+    ):
         return False
     if key == "std" or key.endswith(".std"):
         return old.ndim == 1
@@ -216,18 +236,22 @@ def _is_legacy_joint_action_output(
 
 def _migrate_legacy_upper_body_output_to_residual(
     old: torch.Tensor,
+    cur: torch.Tensor,
     *,
     key: str,
-    upper_action_ids: list[int],
+    lower_source_action_ids: list[int],
+    residual_policy_action_ids: list[int],
 ) -> torch.Tensor:
-    """Reset only the 14 arm rows incompatible with the bounded residual policy."""
-    migrated = old.clone()
+    """Keep 15 direct rows, drop wrists, and initialize eight residual rows."""
+    migrated = cur.clone()
+    lower_count = len(lower_source_action_ids)
+    migrated[:lower_count] = old[lower_source_action_ids]
     if key == "std" or key.endswith(".std"):
-        migrated[upper_action_ids] = 0.5
-    elif old.ndim == 1:
-        migrated[upper_action_ids] = 0.0
+        migrated[residual_policy_action_ids] = 0.5
+    elif cur.ndim == 1:
+        migrated[residual_policy_action_ids] = 0.0
     else:
-        migrated[upper_action_ids, :] = 0.0
+        migrated[residual_policy_action_ids, :] = 0.0
     return migrated
 # END TEMPORARY LEGACY MIGRATION ---------------------------------------------
 
@@ -260,7 +284,6 @@ def prepare_loaded_dict_for_obs_expand(
     residual_layout = _reference_upper_residual_layout(runner)
     checkpoint_semantics = _checkpoint_upper_body_action_semantics(loaded_dict)
     migrate_residual_output = False
-    upgrade_saturated_residual_head = False
     if migrate_legacy_upper_body_residual and migrate_bounded_upper_body_policy:
         raise ValueError(
             "Choose exactly one upper-body migration flag; they represent different source checkpoint semantics."
@@ -271,28 +294,24 @@ def prepare_loaded_dict_for_obs_expand(
                 "An upper-body migration was requested, but this task does not use "
                 "reference-relative upper-body residual actions."
             )
-    elif checkpoint_semantics == UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5:
+    elif checkpoint_semantics == UPPER_BODY_SHOULDER_ELBOW_REFERENCE_RESIDUAL_V6:
         if migrate_legacy_upper_body_residual or migrate_bounded_upper_body_policy:
             raise ValueError(
-                "This checkpoint already uses regularized_reference_residual_v5. Remove the migration flag; "
+                "This checkpoint already uses shoulder_elbow_reference_residual_v6. Remove the migration flag; "
                 "normal resume must never reset the arm head."
             )
     elif checkpoint_semantics in (
         UPPER_BODY_BOUNDED_REFERENCE_RESIDUAL_V2,
         UPPER_BODY_DIRECT_REFERENCE_RESIDUAL_V3,
         UPPER_BODY_PRE_SQUASH_REFERENCE_RESIDUAL_V4,
+        UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5,
     ):
         if migrate_legacy_upper_body_residual or migrate_bounded_upper_body_policy:
             raise ValueError(
-                "Bounded v2/direct v3/unregularized v4 checkpoints upgrade to the regularized v5 controller "
+                "V2--v5 residual checkpoints upgrade to the reduced v6 controller "
                 "automatically. Remove both legacy migration flags."
             )
-        # These arm heads either use an incompatible transform or learned very
-        # large means behind the unregularized v4 tanh. Preserve the shared and
-        # lower-body network but reset only the 14 arm output rows and their
-        # std, then discard Adam's old moments exactly once.
         migrate_residual_output = True
-        upgrade_saturated_residual_head = True
     elif checkpoint_semantics == UPPER_BODY_REFERENCE_RESIDUAL_V1:
         if not migrate_bounded_upper_body_policy:
             raise RuntimeError(
@@ -309,7 +328,7 @@ def prepare_loaded_dict_for_obs_expand(
             )
         if not migrate_legacy_upper_body_residual:
             raise RuntimeError(
-                "This Stage-2 task expects regularized_reference_residual_v5 arm actions, but the checkpoint has "
+                "This Stage-2 task expects shoulder_elbow_reference_residual_v6 actions, but the checkpoint has "
                 "no residual-action marker. For a pre-residual checkpoint, load it once with "
                 "--migrate_legacy_upper_body_residual. Do not use that flag for checkpoints saved "
                 "after migration."
@@ -318,7 +337,7 @@ def prepare_loaded_dict_for_obs_expand(
     else:
         raise ValueError(
             f"Unsupported upper-body action semantics {checkpoint_semantics!r}; expected "
-            f"{UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5!r}."
+            f"{UPPER_BODY_SHOULDER_ELBOW_REFERENCE_RESIDUAL_V6!r}."
         )
     transformed_sd: dict[str, torch.Tensor] = {}
     notes: list[str] = []
@@ -339,18 +358,23 @@ def prepare_loaded_dict_for_obs_expand(
                 key,
                 old,
                 cur,
-                action_dim=residual_layout[1],
+                old_action_dim=residual_layout[3],
+                new_action_dim=residual_layout[2],
             )
         )
         if is_residual_action_output:
-            upper_action_ids, _ = residual_layout
+            lower_source_ids, residual_policy_ids, _, _ = residual_layout
             transformed_sd[key] = _migrate_legacy_upper_body_output_to_residual(
                 old,
+                cur,
                 key=key,
-                upper_action_ids=upper_action_ids,
+                lower_source_action_ids=lower_source_ids,
+                residual_policy_action_ids=residual_policy_ids,
             )
             migrated_residual_keys.append(key)
-            notes.append(f"{key}: reset 14 incompatible arm rows for regularized residual actions")
+            notes.append(
+                f"{key}: 29 -> 23 actions; kept 15 lower/waist rows, reset 8 shoulder/elbow rows"
+            )
             changed = True
             continue
 
@@ -391,10 +415,14 @@ def prepare_loaded_dict_for_obs_expand(
                 "the one-time upper-body residual migration."
             )
     if migrate_residual_output:
-        loaded_dict[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5
+        loaded_dict[UPPER_BODY_ACTION_SEMANTICS_KEY] = (
+            UPPER_BODY_SHOULDER_ELBOW_REFERENCE_RESIDUAL_V6
+        )
         infos = loaded_dict.get("infos")
         stamped_infos = dict(infos) if isinstance(infos, dict) else {}
-        stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = UPPER_BODY_REGULARIZED_REFERENCE_RESIDUAL_V5
+        stamped_infos[UPPER_BODY_ACTION_SEMANTICS_KEY] = (
+            UPPER_BODY_SHOULDER_ELBOW_REFERENCE_RESIDUAL_V6
+        )
         loaded_dict["infos"] = stamped_infos
 
     if not changed:
@@ -405,16 +433,11 @@ def prepare_loaded_dict_for_obs_expand(
     loaded_dict.pop("rnd_optimizer_state_dict", None)
 
     print("[INFO] Warm-start: adapted a legacy checkpoint to the current interface.")
-    if upgrade_saturated_residual_head:
+    if migrate_residual_output:
         print(
-            "[INFO] One-time regularized v5 upgrade: preserved lower-body/shared/critic/normalizer "
-            "weights, reset only the 14 saturated arm output rows and their std, discarded the old "
-            "optimizer, and started the bounded-mean Gaussian residual path."
-        )
-    elif migrate_residual_output:
-        print(
-            "[INFO] One-time residual-policy migration: kept lower-body/hidden/critic weights, reset only "
-            "the 14 incompatible arm output rows, and started a fresh optimizer."
+            "[INFO] One-time v6 migration: kept shared/RNN/critic/normalizer and the 15 lower/waist "
+            "output rows, dropped six wrist outputs, reset eight shoulder/elbow residual rows with "
+            "std=0.5, and started a fresh optimizer."
         )
         print(
             "[INFO] Future resumes from checkpoints saved by this run must NOT use "

@@ -44,6 +44,17 @@ _CONTROL_UPPER_BODY_JOINT_NAMES = [
     "right_wrist_yaw_joint",
 ]
 
+_CONTROL_RESIDUAL_UPPER_BODY_JOINT_NAMES = [
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+]
+
 
 @configclass
 class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
@@ -352,14 +363,15 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             params={"command_name": "motion"},
         )
 
-        # Preserve the 29-D policy interface. Arm actions are direct bounded
-        # corrections around the live reference with one shared physical scale.
+        # Stage 2 exposes 15 lower/waist actions plus eight shoulder/elbow
+        # residuals. The six wrist joints follow the live reference exactly.
         old_action_cfg = self.actions.joint_pos
         self.actions.joint_pos = mdp.ReferenceResidualJointPositionActionCfg(
             asset_name=old_action_cfg.asset_name,
             joint_names=old_action_cfg.joint_names,
             use_default_offset=old_action_cfg.use_default_offset,
             upper_body_joint_names=_CONTROL_UPPER_BODY_JOINT_NAMES,
+            residual_joint_names=_CONTROL_RESIDUAL_UPPER_BODY_JOINT_NAMES,
             command_name="motion",
             reference_target_margin=0.25,
         )
@@ -371,8 +383,8 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
 
         self.rewards.action_rate_l2.func = mdp.effective_action_rate_l2_clip
         self.rewards.action_rate_l2.params = {"action_name": "joint_pos"}
-        self.rewards.upper_body_reference_residual_l2 = RewTerm(
-            func=mdp.upper_body_reference_residual_l2,
-            weight=-0.5,
+        self.rewards.upper_body_pre_squash_action_l2 = RewTerm(
+            func=mdp.upper_body_pre_squash_action_l2,
+            weight=-0.15,
             params={"action_name": "joint_pos"},
         )

@@ -9,7 +9,7 @@ This repository supports one two-stage pipeline.
 
 No aliases or historical environment variants are registered.
 
-## Essay 13 baseline and current upper-body candidate
+## Essay 13 baseline and Essay 16 upper-body candidate
 
 The last frozen full-method baseline is commit
 `a589bd71168bd876fe4db93a3d887039c94005a8` (`essay 13`). Its representative
@@ -18,8 +18,8 @@ ball-speed MAE, `0.301` predicted-position error, `0.0565 rad` heading MAE, and
 one undesired-contact frame. Median right-foot contact interval is `0.86 s`,
 and the maximum per-link contact force is `39.7 N`.
 
-The current working tree intentionally diverges from that baseline only in the
-Stage-2 upper-body action path. It is a new candidate and must be evaluated
+Essay 16 intentionally diverges from that baseline in the Stage-2 upper-body
+action path and its supporting regularizer/interface migration. It is a new candidate and must be evaluated
 against E13 before being frozen; its results cannot reuse the Essay 13 label.
 
 ## Train
@@ -36,8 +36,9 @@ Stage 1 keeps the existing broad mimic/style bank. Stage 2 sees only the single
 right-foot `master-v2` clip; the script does not mirror it or mix in another
 kick dataset. The script applies `--migrate_legacy_upper_body_residual` exactly
 once at the Stage-1-to-Stage-2 boundary, preserving the lower body and shared
-network while initializing the 14 arm rows for the direct residual interface.
-Checkpoints saved by the current Stage 2 are v5 and must not use that flag when resumed.
+network while converting the 29-D S1 output into 15 lower/waist outputs plus
+eight initialized shoulder/elbow residuals; the six wrist outputs are removed.
+Checkpoints saved by the current Stage 2 are v6 and must not use that flag when resumed.
 
 Stage 1 and Stage 2 use the same ordered network inputs: 163 actor dimensions
 and 295 critic dimensions. Ball position, locomotion speed/heading, and the
@@ -157,27 +158,26 @@ typical interval improved to `0.86 s` median and `1.55 s` P90. Keep this logic
 identical across Essay 13 ablations and report median, P90, and reset-inclusive
 maximum interval. Changing to an `ever_contact` latch creates a new baseline.
 
-The 14 arm outputs in Stage 2 are reference-relative residuals while the full
-29-D action interface remains unchanged. PPO stores ordinary Gaussian
-pre-squash variables for every dimension. The arm Gaussian mean is smoothly
-limited to `±atanh(0.95)` so it cannot drift into the float32-flat part of the
-tanh; the Stage-2 action term then applies
-exactly one tanh to the 14 arm variables. This avoids inverse-tanh likelihood
-reconstruction at float32 saturation; the fixed transform's Jacobian cancels
-in PPO's new/old ratio. Lower-body actions remain Gaussian. Zero arm action
-means the live motion reference exactly. The correction is applied directly as
-`q_ref + 0.25 * action`: all 14 arm joints currently use the same `0.25 rad`
-margin. PCA tangent projection, orthogonal
-residual squashing, the second `±0.25 rad` envelope, and the 1.8 Hz residual
-filter have been removed. Simulator soft joint limits and the existing PD
-actuator remain physical execution safeguards. The policy still observes the
-final normalized absolute joint target, while `action_rate_l2` measures arm
-residual changes so reference motion is not counted as policy jitter.
-`upper_body_reference_residual_l2` has weight `-0.5` and measures the mean
-squared executed residual normalized by the common `0.25 rad` margin. It gives
-a persistent saturated offset a restoring signal while remaining exactly zero
-for reference-following action; full 14-joint saturation contributes at most
-about `-0.010` per control step.
+Stage 2 now has a 23-D policy action: 15 direct lower-body/waist actions plus
+eight Gaussian pre-squash residuals for bilateral shoulder pitch/roll/yaw and
+elbows. The six wrist roll/pitch/yaw joints have no policy outputs and follow
+the live motion reference exactly. Each learned residual has one physical
+transform, `q_target = q_ref + 0.25 * tanh(z)`, followed only by simulator soft
+joint limits and the existing PD actuator. There is no PCA projection, actor
+mean cap, temporal filter, or second residual envelope.
+
+Stage 1 still outputs 29 actions. Both stages keep identical 163-D actor and
+295-D critic inputs, and both feed the complete 29-D final normalized joint
+target back through the recurrent `actions` observation. Thus the Stage-1
+checkpoint does not need retraining; its 29-D output head is migrated once when
+initializing Stage 2.
+
+`upper_body_pre_squash_action_l2` has weight `-0.15` and measures the mean
+squared `z` of the eight learned residuals. Unlike the old post-tanh penalty it
+does not become flat at saturation: `|z| = atanh(0.95)` contributes about
+`-0.0101` per control step, while exact reference following remains zero.
+`action_rate_l2` likewise measures only changes in the eight learned residuals;
+reference motion and reference-only wrists are not counted as policy jitter.
 RSL-RL's directly optimized scalar exploration standard deviation is projected
 to a `0.05` floor before constructing the Normal distribution; this is a
 distribution-validity guard, not another action-space squash. NaN/Inf still
@@ -195,16 +195,16 @@ Essay 11 checkpoints carrying `reference_residual_v1` instead require:
 --migrate_bounded_upper_body_policy
 ```
 
-Both explicit legacy paths preserve the lower-body output, hidden layers,
-critic, and observation normalizer while resetting only the 14 incompatible
-arm output rows. Essay 12/13 checkpoints carrying
+Both explicit legacy paths preserve the shared/RNN/critic/normalizer state and
+the 15 lower-body/waist output rows while removing six wrist outputs and
+initializing eight shoulder/elbow residual outputs. Essay 12/13 checkpoints carrying
 `bounded_reference_residual_v2`, as well as checkpoints from the unstable
 `direct_reference_residual_v3` attempt and unregularized Essay 14b checkpoints
-carrying `pre_squash_reference_residual_v4`, need no flag. The loader preserves the
-lower-body/shared/RNN/critic/normalizer weights, resets only the 14 saturated
-arm output rows and their std, and drops the old optimizer once. Newly saved
-checkpoints carry `regularized_reference_residual_v5` and resume normally with
-their optimizer. Never pass either migration flag for v2, v3, v4, or v5.
+carrying `pre_squash_reference_residual_v4`, and Essay 15 checkpoints carrying
+`regularized_reference_residual_v5`, need no flag. They migrate automatically
+to the 23-D output and drop the old optimizer once. Newly saved checkpoints
+carry `shoulder_elbow_reference_residual_v6` and resume normally with their
+optimizer. Never pass either migration flag for v2, v3, v4, v5, or v6.
 
 Use `--diagnostic_stride N` to record every Nth control step.
 
