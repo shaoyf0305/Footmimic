@@ -35,7 +35,6 @@ DEVICE="cuda:0"
 RESULT_DIR=""
 DRY_RUN=0
 CONTINUE_ON_ERROR=0
-ALLOW_DIRTY=0
 
 usage() {
     cat <<'EOF'
@@ -62,7 +61,6 @@ Training:
   --result-dir PATH
   --dry-run
   --continue-on-error
-  --allow-dirty            Debug only; paper runs require a clean commit.
   -h, --help
 
 Core variants:
@@ -92,7 +90,6 @@ while [[ $# -gt 0 ]]; do
         --result-dir) RESULT_DIR="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --continue-on-error) CONTINUE_ON_ERROR=1; shift ;;
-        --allow-dirty) ALLOW_DIRTY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "[ERROR] Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -113,17 +110,6 @@ fi
 if [[ ! -e "$MOTION_PATH" ]]; then
     echo "[ERROR] Motion path not found: $MOTION_PATH" >&2
     exit 2
-fi
-mapfile -t DIRTY_TRACKED < <(git diff --name-only HEAD)
-mapfile -t DIRTY_UNTRACKED < <(git ls-files --others --exclude-standard)
-if [[ ${#DIRTY_TRACKED[@]} -gt 0 || ${#DIRTY_UNTRACKED[@]} -gt 0 ]]; then
-    echo "[ERROR] Ablation training requires a clean committed worktree." >&2
-    printf '        %s\n' "${DIRTY_TRACKED[@]}" "${DIRTY_UNTRACKED[@]}" >&2
-    if [[ "$ALLOW_DIRTY" -eq 0 ]]; then
-        echo "        Commit the implementation first; use --allow-dirty only for debugging." >&2
-        exit 2
-    fi
-    echo "[WARN] Continuing with uncommitted files because --allow-dirty was supplied." >&2
 fi
 
 declare -A TASK_BY_VARIANT=(

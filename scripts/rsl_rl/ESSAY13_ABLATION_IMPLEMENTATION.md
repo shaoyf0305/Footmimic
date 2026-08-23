@@ -119,6 +119,9 @@ bash scripts/rsl_rl/run_essay13_ablation_training.sh \
 
 ## 6. 统一评估
 
+Baseline 和消融评估脚本只记录 Git commit、status、源码 SHA-256 和 diff，
+不会对当前分支或源码差异作阻断判断。
+
 所有 checkpoint 使用与 Full 相同的测试脚本和 scenario。先建立一个文本文件：
 
 ```text

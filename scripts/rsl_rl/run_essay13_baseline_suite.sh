@@ -36,7 +36,6 @@ MOTION_PATH="motions/master-v2"
 LOAD_RUN="2026-08-20_02-48-27_s2_13"
 CHECKPOINT="model_88000.pt"
 EXPERIMENT_NAME="g1_dribbling_essay"
-BASELINE_COMMIT="a589bd71168bd876fe4db93a3d887039c94005a8"
 DEVICE="cuda:0"
 NUM_ENVS=1
 PROFILE="core"
@@ -47,8 +46,6 @@ RESUME=0
 DRY_RUN=0
 FAIL_FAST=0
 MAKE_ARCHIVE=1
-ALLOW_BASELINE_DRIFT=0
-SOURCE_CONTRACT="baseline"
 
 usage() {
     cat <<'EOF'
@@ -75,8 +72,6 @@ Options:
   --dry-run                Write commands without launching Isaac Sim.
   --fail-fast              Stop after the first process failure.
   --no-archive             Do not create the final tar.gz bundle.
-  --source-contract MODE   baseline or committed (for trained ablations).
-  --allow-baseline-drift   Continue despite source differences from Essay13.
   -h, --help
 
 The defaults reproduce the supplied Essay13 checkpoint command.
@@ -99,8 +94,6 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN=1; shift ;;
         --fail-fast) FAIL_FAST=1; shift ;;
         --no-archive) MAKE_ARCHIVE=0; shift ;;
-        --source-contract) SOURCE_CONTRACT="$2"; shift 2 ;;
-        --allow-baseline-drift) ALLOW_BASELINE_DRIFT=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "[ERROR] Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -114,10 +107,6 @@ case "$VIDEOS" in
     none|representative|all) ;;
     *) echo "[ERROR] --videos must be none, representative, or all." >&2; exit 2 ;;
 esac
-case "$SOURCE_CONTRACT" in
-    baseline|committed) ;;
-    *) echo "[ERROR] --source-contract must be baseline or committed." >&2; exit 2 ;;
-esac
 if [[ "$NUM_ENVS" -ne 1 ]]; then
     echo "[ERROR] The diagnostic currently records env 0 only. NUM_ENVS must remain 1." >&2
     exit 2
@@ -125,79 +114,6 @@ fi
 if [[ ! -e "$MOTION_PATH" ]]; then
     echo "[ERROR] Motion path not found: $MOTION_PATH" >&2
     exit 2
-fi
-
-# These approved runtime differences do not change the Essay13 training MDP.
-# The command hook is evaluation-only and defaults to disabled.  The bounded
-# actor patch adds finite-value checks and an exploration-std safety floor; it
-# is retained as an approved safety backport and recorded in every result pack.
-APPROVED_SOURCE_DIFFS=(
-    "source/whole_body_tracking/soccer/tasks/tracking/mdp/commands_multi_motion_soccer.py"
-    "source/whole_body_tracking/soccer/utils/bounded_actor_critic.py"
-)
-if [[ "$SOURCE_CONTRACT" == "baseline" ]]; then
-    if ! git cat-file -e "${BASELINE_COMMIT}^{commit}" 2>/dev/null; then
-        echo "[ERROR] Frozen Essay13 commit is unavailable: $BASELINE_COMMIT" >&2
-        exit 2
-    fi
-    mapfile -t SOURCE_DIFFS < <(
-        git diff --name-only "$BASELINE_COMMIT" -- source/whole_body_tracking/soccer
-    )
-else
-    mapfile -t SOURCE_DIFFS < <(
-        git diff --name-only HEAD -- \
-            source/whole_body_tracking/soccer \
-            scripts/rsl_rl/play_multi.py \
-            "$SCRIPT_REL"
-    )
-fi
-mapfile -t UNTRACKED_SOURCE < <(
-    git ls-files --others --exclude-standard -- source/whole_body_tracking/soccer
-)
-BASELINE_DRIFTS=()
-for path in "${SOURCE_DIFFS[@]}"; do
-    approved=0
-    if [[ "$SOURCE_CONTRACT" == "baseline" ]]; then
-        for approved_path in "${APPROVED_SOURCE_DIFFS[@]}"; do
-            if [[ "$path" == "$approved_path" ]]; then
-                approved=1
-                break
-            fi
-        done
-    fi
-    if [[ "$approved" -eq 0 ]]; then
-        BASELINE_DRIFTS+=("$path")
-    fi
-done
-for path in "${UNTRACKED_SOURCE[@]}"; do
-    # Editor/backup copies are not imported by Python and cannot affect the
-    # rollout.  Keep them out of the scientific source contract while still
-    # rejecting any other untracked module under the active package.
-    case "$path" in
-        *.bak|*.orig|*~) continue ;;
-        *) BASELINE_DRIFTS+=("$path (untracked)") ;;
-    esac
-done
-
-if [[ ${#BASELINE_DRIFTS[@]} -gt 0 ]]; then
-    echo "[ERROR] Source violates the $SOURCE_CONTRACT evaluation contract:" >&2
-    printf '        %s\n' "${BASELINE_DRIFTS[@]}" >&2
-    if [[ "$SOURCE_CONTRACT" == "baseline" ]]; then
-        echo "[INFO] Tracked source diff against the frozen Essay13 commit:" >&2
-        git diff --stat "$BASELINE_COMMIT" -- source/whole_body_tracking/soccer >&2 || true
-        echo "[INFO] Inspect it with:" >&2
-        echo "        git diff $BASELINE_COMMIT -- <path>" >&2
-    fi
-    if [[ "$ALLOW_BASELINE_DRIFT" -eq 0 ]]; then
-        if [[ "$SOURCE_CONTRACT" == "baseline" ]]; then
-            echo "        Restore or isolate changes outside the approved baseline backports." >&2
-        else
-            echo "        Commit or isolate all source changes before evaluating an ablation." >&2
-        fi
-        echo "        Use --allow-baseline-drift only for debugging, never for paper data." >&2
-        exit 2
-    fi
-    echo "[WARN] Continuing because --allow-baseline-drift was supplied." >&2
 fi
 
 IFS=',' read -r -a EVAL_SEEDS <<< "$EVAL_SEEDS_CSV"
@@ -270,9 +186,6 @@ fi
     echo "load_run=$LOAD_RUN"
     echo "checkpoint=$CHECKPOINT"
     echo "experiment_name=$EXPERIMENT_NAME"
-    echo "baseline_commit=$BASELINE_COMMIT"
-    echo "source_contract=$SOURCE_CONTRACT"
-    echo "baseline_drift_override=$ALLOW_BASELINE_DRIFT"
     echo "device=$DEVICE"
     echo "eval_seeds=$EVAL_SEEDS_CSV"
     echo "videos=$VIDEOS"

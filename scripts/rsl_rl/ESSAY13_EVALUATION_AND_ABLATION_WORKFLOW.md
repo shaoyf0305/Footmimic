@@ -197,7 +197,7 @@ git push origin baseline/essay13
 
 前两条已经完成，两个 `git push` 尚未执行。
 
-一键脚本会比较当前 soccer 源码与 `a589bd7`。允许的差异只有默认关闭的评估起始相位接口，以及已确认保留的 actor finite-value/std-floor 安全补丁。两者都会随结果保存源码快照、SHA-256 和 Git diff。发现其他源码漂移时脚本会停止。`--allow-baseline-drift` 只用于调试，不能用于采集论文数据。
+一键脚本不会阻断或判断当前源码版本。它只随结果保存源码快照、SHA-256、Git commit、status 和 diff，便于之后追溯。
 
 ### 4.2 建立一个消融实现分支
 

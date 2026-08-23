@@ -59,7 +59,7 @@ scripts/rsl_rl/run_essay13_baseline_suite.sh
 source/whole_body_tracking/soccer/utils/bounded_actor_critic.py
 ```
 
-该改动来自另一版本的运行经验，加入 exploration standard deviation floor 和 NaN/Inf 检查。按照当前实验约定，它作为不影响确定性策略输出的安全补丁保留，不视为 ablation。一键脚本允许这一项差异，并将文件快照、SHA-256 和完整 Git diff 保存到每个结果包中。其他未批准的 soccer 源码差异仍会使脚本停止。
+该改动来自另一版本的运行经验，加入 exploration standard deviation floor 和 NaN/Inf 检查。按照当前实验约定，它作为不影响确定性策略输出的安全补丁保留，不视为 ablation。一键脚本不会判断或阻断源码差异，只会将文件快照、SHA-256、Git status 和完整 diff 保存到每个结果包中。
 
 ## 5. 仍需由运行产物确认的内容
 
@@ -75,16 +75,6 @@ source/whole_body_tracking/soccer/utils/bounded_actor_critic.py
 
 在这些运行元数据可用之前，可以确认源码基线和 checkpoint 身份，但不能仅凭仓库无条件断言 Stage-I 初始化来源等运行时事实。
 
-## 6. 推荐的后续分支关系
+## 6. 版本关系
 
-```text
-a589bd7  essay13-baseline / baseline/essay13
-   |
-   +-- experiments/essay13-evaluation
-   |     只包含默认关闭的评估与诊断接口
-   |
-   +-- Ablation
-         后续加入共享消融开关和并列配置
-```
-
-baseline tag 保持不动。所有消融从同一个 tag 开始，最终在同一实现提交上通过配置区分变体。
+`essay13-baseline` tag 保持不动。Baseline 测试与消融实验分别使用各自的一键脚本，消融变体在同一实现提交上通过配置区分。

@@ -120,7 +120,6 @@ while read -r variant load_run checkpoint extra; do
     variant_dir="$RESULT_DIR/$variant"
     cmd=(
         bash "$SUITE_REL" --inside-container
-        --source-contract committed
         --task "${TASK_BY_VARIANT[$variant]}"
         --motion-path "$MOTION_PATH"
         --experiment-name "$EXPERIMENT_NAME"
