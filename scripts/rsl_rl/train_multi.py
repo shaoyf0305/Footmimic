@@ -32,6 +32,7 @@ cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+original_cli_argv = list(sys.argv)
 
 # always enable cameras to record video
 if args_cli.video:
@@ -47,8 +48,11 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
+import hashlib
+import json
 import os
 import glob
+import subprocess
 import torch
 from datetime import datetime
 
@@ -73,6 +77,104 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _git_capture(*args: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", *args], stderr=subprocess.STDOUT, text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return f"unavailable: {exc}"
+
+
+def _validate_ablation_initialization(env_cfg, agent_cfg) -> tuple[str | None, bool | None]:
+    """Enforce the single-factor initialization contract for ablation tasks."""
+    variant = getattr(env_cfg, "ablation_variant", None)
+    requires_stage1 = getattr(env_cfg, "requires_stage1_initialization", None)
+    if variant is None or requires_stage1 is None:
+        return None, None
+
+    variant = str(variant)
+    requires_stage1 = bool(requires_stage1)
+    if requires_stage1:
+        if not bool(agent_cfg.resume):
+            raise ValueError(
+                f"Ablation variant {variant!r} must initialize from the shared Stage-I checkpoint. "
+                "Pass --resume True together with explicit --load_run and --checkpoint values."
+            )
+        if args_cli.load_run is None or args_cli.checkpoint is None:
+            raise ValueError(
+                f"Ablation variant {variant!r} requires explicit --load_run and --checkpoint values; "
+                "implicit latest-checkpoint matching is not allowed."
+            )
+    else:
+        if bool(agent_cfg.resume) or args_cli.load_run is not None or args_cli.checkpoint is not None:
+            raise ValueError(
+                f"Ablation variant {variant!r} must start from random network weights. "
+                "Do not pass --resume, --load_run, --checkpoint, or migration flags."
+            )
+        if args_cli.migrate_legacy_upper_body_residual or args_cli.migrate_bounded_upper_body_policy:
+            raise ValueError(
+                f"Ablation variant {variant!r} cannot use checkpoint migration flags."
+            )
+    return variant, requires_stage1
+
+
+def _write_ablation_manifest(
+    log_dir: str,
+    *,
+    variant: str | None,
+    requires_stage1: bool | None,
+    agent_cfg,
+    num_envs: int,
+    motion_files: list[str],
+    resume_path: str | None,
+) -> None:
+    """Save the exact code, data, initialization, and budget identity."""
+    if variant is None:
+        return
+    params_dir = os.path.join(log_dir, "params")
+    os.makedirs(params_dir, exist_ok=True)
+    manifest = {
+        "schema_version": 1,
+        "ablation_variant": variant,
+        "task": args_cli.task,
+        "requires_stage1_initialization": requires_stage1,
+        "resumed_from_stage1": bool(agent_cfg.resume),
+        "initial_checkpoint": os.path.abspath(resume_path) if resume_path else None,
+        "initial_checkpoint_sha256": _sha256_file(resume_path) if resume_path else None,
+        "resume_experiment_name": (
+            args_cli.resume_experiment_name or agent_cfg.experiment_name
+            if resume_path
+            else None
+        ),
+        "motion_files": [
+            {"path": os.path.abspath(path), "sha256": _sha256_file(path)}
+            for path in motion_files
+        ],
+        "seed": int(agent_cfg.seed),
+        "num_envs": int(num_envs),
+        "max_iterations": int(agent_cfg.max_iterations),
+        "num_steps_per_env": int(agent_cfg.num_steps_per_env),
+        "experiment_name": str(agent_cfg.experiment_name),
+        "run_name": str(agent_cfg.run_name),
+        "git_commit": _git_capture("rev-parse", "HEAD"),
+        "git_branch": _git_capture("branch", "--show-current"),
+        "git_status": _git_capture("status", "--short"),
+        "argv": original_cli_argv,
+    }
+    with open(os.path.join(params_dir, "ablation_manifest.json"), "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, indent=2, sort_keys=True)
+        stream.write("\n")
 
 
 def get_motion_files(motion_path: str) -> list[str]:
@@ -111,6 +213,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
+    ablation_variant, requires_stage1 = _validate_ablation_initialization(env_cfg, agent_cfg)
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -151,6 +254,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
 
+    resume_path = None
+    if agent_cfg.resume:
+        resume_experiment_name = (
+            args_cli.resume_experiment_name or agent_cfg.experiment_name
+        )
+        resume_root_path = os.path.abspath(
+            os.path.join("logs", "rsl_rl", resume_experiment_name)
+        )
+        resume_path = get_checkpoint_path(
+            resume_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint
+        )
+        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+
+    _write_ablation_manifest(
+        log_dir,
+        variant=ablation_variant,
+        requires_stage1=requires_stage1,
+        agent_cfg=agent_cfg,
+        num_envs=env_cfg.scene.num_envs,
+        motion_files=motion_files,
+        resume_path=resume_path,
+    )
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     # wrap for video recording
@@ -180,9 +306,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.add_git_repo_to_log(__file__)
     # save resume path before creating a new log_dir
     if agent_cfg.resume:
-        # get path to previous checkpoint
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(
             resume_path,

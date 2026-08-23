@@ -453,6 +453,7 @@ def _dribbling_closed_loop_control_state(
     max_position_correction_speed: float,
     max_recovery_target_speed: float,
     velocity_ema_window_steps: int,
+    recovery_target_blending_enabled: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Build the shared position--velocity state for control and recovery.
 
@@ -529,6 +530,7 @@ def _dribbling_closed_loop_control_state(
         float(max_position_correction_speed),
         float(max_recovery_target_speed),
         int(velocity_ema_window_steps),
+        bool(recovery_target_blending_enabled),
     )
     valid_gate_state = (
         isinstance(gate_state, dict)
@@ -583,10 +585,15 @@ def _dribbling_closed_loop_control_state(
         recovery_target_velocity_xy * recovery_speed_scale.unsqueeze(-1)
     )
     command_target_velocity_xy = direction_xy * command_speed.unsqueeze(-1)
-    blended_target_velocity_xy = (
-        (1.0 - recovery_gate).unsqueeze(-1) * command_target_velocity_xy
-        + recovery_gate.unsqueeze(-1) * recovery_target_velocity_xy
-    )
+    if recovery_target_blending_enabled:
+        blended_target_velocity_xy = (
+            (1.0 - recovery_gate).unsqueeze(-1) * command_target_velocity_xy
+            + recovery_gate.unsqueeze(-1) * recovery_target_velocity_xy
+        )
+    else:
+        # Ablation path: retain the measured gate and recovery target for
+        # diagnostics while preventing them from changing the control target.
+        blended_target_velocity_xy = command_target_velocity_xy
 
     position_error_norm = torch.sqrt(
         ((predicted_forward - float(desired_forward_offset)) / float(position_forward_std)).square()
@@ -627,6 +634,11 @@ def _dribbling_closed_loop_control_state(
     setattr(env, "_dribbling_position_correction_velocity_xy", position_correction_xy)
     setattr(env, "_dribbling_recovery_target_velocity_xy", recovery_target_velocity_xy)
     setattr(env, "_dribbling_blended_pelvis_target_velocity_xy", blended_target_velocity_xy)
+    setattr(
+        env,
+        "_dribbling_recovery_target_blending_enabled",
+        bool(recovery_target_blending_enabled),
+    )
     setattr(env, "_dribbling_ball_closing_speed", closing_speed)
     return state
 
@@ -691,6 +703,7 @@ def dribbling_command_dynamic_proximity(
     max_position_correction_speed: float = 0.45,
     max_recovery_target_speed: float = 2.20,
     velocity_ema_window_steps: int = 10,
+    recovery_target_blending_enabled: bool = True,
 ) -> torch.Tensor:
     """Smoothly track the predicted command-frame ball position.
 
@@ -714,6 +727,7 @@ def dribbling_command_dynamic_proximity(
         max_position_correction_speed,
         max_recovery_target_speed,
         velocity_ema_window_steps,
+        recovery_target_blending_enabled,
     )
     reward = torch.exp(-state["position_error_norm"].square())
     reward = reward * state["dribble_active"].to(reward.dtype)
@@ -737,6 +751,7 @@ def dribbling_closed_loop_pelvis_velocity_tracking_exp(
     max_position_correction_speed: float = 0.45,
     max_recovery_target_speed: float = 2.20,
     velocity_ema_window_steps: int = 10,
+    recovery_target_blending_enabled: bool = True,
 ) -> torch.Tensor:
     """Track command velocity in control and a ball-relative target in recovery."""
     if std <= 0.0:
@@ -756,6 +771,7 @@ def dribbling_closed_loop_pelvis_velocity_tracking_exp(
         max_position_correction_speed,
         max_recovery_target_speed,
         velocity_ema_window_steps,
+        recovery_target_blending_enabled,
     )
     command: MotionCommand = env.command_manager.get_term(command_name)
     target_velocity_w = torch.zeros_like(command.robot_anchor_lin_vel_w)
@@ -985,6 +1001,7 @@ def dribbling_command_ball_velocity_tracking_reward(
     max_position_correction_speed: float = 0.45,
     max_recovery_target_speed: float = 2.20,
     velocity_ema_window_steps: int = 10,
+    recovery_target_blending_enabled: bool = True,
 ) -> torch.Tensor:
     """Track commanded ball velocity with a soft physical controllability gate.
 
@@ -1016,6 +1033,7 @@ def dribbling_command_ball_velocity_tracking_reward(
         max_position_correction_speed,
         max_recovery_target_speed,
         velocity_ema_window_steps,
+        recovery_target_blending_enabled,
     )
     target_speed = state["command_speed"]
     ball_vel_xy = state["filtered_ball_velocity_xy"]
@@ -1142,6 +1160,7 @@ def dribbling_useful_foot_touch(
     max_position_correction_speed: float = 0.45,
     max_recovery_target_speed: float = 2.20,
     velocity_ema_window_steps: int = 10,
+    recovery_target_blending_enabled: bool = True,
 ) -> torch.Tensor:
     """Reward a gentle right-foot touch, with an extra control-improvement bonus.
 
@@ -1188,6 +1207,7 @@ def dribbling_useful_foot_touch(
         max_position_correction_speed,
         max_recovery_target_speed,
         velocity_ema_window_steps,
+        recovery_target_blending_enabled,
     )
     forward_speed, lateral_speed = _command_frame_components(
         control_state["filtered_ball_velocity_xy"], control_state["direction_xy"]

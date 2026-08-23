@@ -93,3 +93,17 @@ def anchor_ball_velocity_polar_command(
         moving, sin_delta.clamp(min=-1.0, max=1.0), torch.zeros_like(sin_delta)
     )
     return torch.stack((ball_speed, cos_delta, sin_delta), dim=-1)
+
+
+def zero_anchor_ball_velocity_polar_command(
+    env: ManagerBasedEnv,
+    command_name: str = "motion",
+) -> torch.Tensor:
+    """Return a shape-preserving zero replacement for the ball-velocity input.
+
+    The command argument is retained so this function can replace
+    :func:`anchor_ball_velocity_polar_command` without changing an observation
+    term's configuration or the actor/critic input dimensions.
+    """
+    del command_name
+    return torch.zeros((env.num_envs, 3), device=env.device, dtype=torch.float32)

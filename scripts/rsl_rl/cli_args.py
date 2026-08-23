@@ -25,6 +25,15 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
     arg_group.add_argument(
+        "--resume_experiment_name",
+        type=str,
+        default=None,
+        help=(
+            "Optional source experiment folder for checkpoint initialization. "
+            "The new run is still written under --experiment_name."
+        ),
+    )
+    arg_group.add_argument(
         "--migrate_legacy_upper_body_residual",
         action="store_true",
         default=False,

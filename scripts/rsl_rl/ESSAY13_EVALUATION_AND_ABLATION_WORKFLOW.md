@@ -177,6 +177,8 @@ cases/
 
 ## 4. 消融实验不建议每个变体建立长期 Git 分支
 
+当前配置化实现和运行方式见 `scripts/rsl_rl/ESSAY13_ABLATION_IMPLEMENTATION.md`。
+
 推荐结构是一个冻结 baseline tag，加一个共同的消融实现分支，再用不同配置区分变体。
 
 ### 4.1 冻结 Essay13 baseline
@@ -199,8 +201,10 @@ git push origin baseline/essay13
 
 ### 4.2 建立一个消融实现分支
 
+当前共同实现分支已经建立为 `Ablation`：
+
 ```bash
-git switch -c experiments/essay13-ablations essay13-baseline
+git switch Ablation
 ```
 
 所有变体共享的开关、日志和配置类都放在这个分支中。建议让以下配置同时存在，而不是反复修改同一个配置文件。
@@ -238,7 +242,7 @@ commit 5  Freeze evaluation and training manifests
 ```bash
 git tag -a essay13-ablation-suite-v1 <共同实验commit> \
     -m "Config-controlled Essay13 ablation suite"
-git push origin experiments/essay13-ablations
+git push origin Ablation
 git push origin essay13-ablation-suite-v1
 ```
 
@@ -276,7 +280,7 @@ e13_no_timing_seed13
 如果集群任务需要在不同目录同时运行，可以让所有 worktree 指向同一个共同实验 commit。
 
 ```bash
-git worktree add ../Footmimic-e13-ablations experiments/essay13-ablations
+git worktree add ../Footmimic-e13-ablations Ablation
 ```
 
 通常一个 worktree 配合多个配置已经足够。只有运行系统会修改工作目录内文件时，才需要为不同任务再建立多个 worktree。重点是让所有训练读取同一个 commit，而不是为每个 seed 复制一套源代码。
@@ -288,7 +292,7 @@ git worktree add ../Footmimic-e13-ablations experiments/essay13-ablations
 3. 运行 evaluation smoke profile。
 4. 运行 core profile 并检查 diagnostic 是否完整。
 5. 运行 paper profile。
-6. 建立共同的 `experiments/essay13-ablations` 分支。
+6. 在共同的 `Ablation` 分支实现并冻结配置化变体。
 7. 先实现配置驱动的 Full、No velocity 和 No recovery。
 8. 用一个 seed 做短训练验证配置确实只改变目标因素。
 9. 冻结 `essay13-ablation-suite-v1` tag。

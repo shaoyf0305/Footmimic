@@ -83,7 +83,7 @@ a589bd7  essay13-baseline / baseline/essay13
    +-- experiments/essay13-evaluation
    |     只包含默认关闭的评估与诊断接口
    |
-   +-- experiments/essay13-ablations
+   +-- Ablation
          后续加入共享消融开关和并列配置
 ```
 

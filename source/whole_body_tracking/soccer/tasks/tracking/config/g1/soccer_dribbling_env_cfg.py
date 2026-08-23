@@ -134,6 +134,7 @@ class G1FlatCGDribblingControlEnvCfg(G1FlatMotionEnvCfg):
             "max_position_correction_speed": 0.45,
             "max_recovery_target_speed": 2.20,
             "velocity_ema_window_steps": 10,
+            "recovery_target_blending_enabled": True,
         }
 
         # Stage-2 keeps position style only; its orientation contribution was 0.17%.
