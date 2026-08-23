@@ -1,12 +1,28 @@
 """Validate that each Essay13 ablation changes only its declared factor.
 
-Run through Isaac Lab's Python launcher before starting expensive training:
+Run through Isaac Lab's Python launcher before starting expensive training.
+The script starts Kit headlessly so Isaac Sim extensions are available, but it
+does not create a simulation environment or run physics:
 
     /workspace/isaaclab/isaaclab.sh -p \
         scripts/rsl_rl/validate_essay13_ablation_configs.py
 """
 
 from __future__ import annotations
+
+import argparse
+
+from isaaclab.app import AppLauncher
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+args_cli.headless = True
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+"""Imports below require the running Isaac Sim application."""
 
 import gymnasium as gym
 
@@ -253,4 +269,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        simulation_app.close()

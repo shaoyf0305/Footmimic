@@ -48,7 +48,7 @@ No dense distance 仅删除 `dribbling_cg_foot_ball_distance`。No touch timing 
 
 ## 4. 训练前验证
 
-先在 Isaac 容器内执行配置验证，不会创建仿真环境或开始训练。
+先在 Isaac 容器内执行配置验证。脚本会以 headless 模式启动 Kit，以便加载 Isaac Sim 扩展，但不会创建仿真环境、运行物理或开始训练。
 
 ```bash
 /workspace/isaaclab/isaaclab.sh -p \
