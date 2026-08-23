@@ -46,6 +46,12 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=None,
+    help="Evaluation seed used for environment initialization and random events.",
+)
 parser.add_argument("--motion_file", type=str, default=None, help="Path to a single motion file. When specified, only this motion is played and exported.")
 parser.add_argument(
     "--motion_path",
@@ -839,6 +845,7 @@ def _create_diagnostic(
     waist_roll_stiffness_scale: float = 1.0,
     output_path: str | None = None,
     evaluation_case_id: str = "",
+    evaluation_seed: int | None = None,
 ) -> dict:
     """Prepare a per-step arm, waist, and trunk-motion trace for one playback env."""
     if stride <= 0:
@@ -916,6 +923,7 @@ def _create_diagnostic(
     return {
         "path": output_path,
         "evaluation_case_id": str(evaluation_case_id),
+        "evaluation_seed": -1 if evaluation_seed is None else int(evaluation_seed),
         "stride": int(stride),
         "joint_ids": torch.as_tensor(joint_ids, dtype=torch.long, device=base_env.device),
         "joint_names": np.asarray(_ARM_DIAGNOSTIC_JOINT_NAMES),
@@ -1712,7 +1720,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         print("[WARN] Diagnostic requested but no samples were recorded.")
         return
     metadata_keys = {
-        "path", "evaluation_case_id", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names",
+        "path", "evaluation_case_id", "evaluation_seed", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names",
         "reward_term_weights", "reward_term_step_weights", "reward_step_dt", "task_state_names",
         "ball_contact_body_names", "ball_contact_collision_names", "ball_contact_filter_available",
         "ball_contact_filter_count", "ball_contact_expected_filter_count",
@@ -1731,6 +1739,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
     }
     arrays["joint_names"] = diagnostic["joint_names"]
     arrays["evaluation_case_id"] = np.asarray(diagnostic["evaluation_case_id"])
+    arrays["evaluation_seed"] = np.asarray(diagnostic["evaluation_seed"])
     arrays["trunk_joint_names"] = diagnostic["trunk_joint_names"]
     arrays["trunk_body_names"] = diagnostic["trunk_body_names"]
     arrays["reward_term_names"] = diagnostic["reward_term_names"]
@@ -2402,6 +2411,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     """Play with RSL-RL agent."""
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    env_cfg.seed = agent_cfg.seed
 
     if args_cli.evaluation_reference_phase is not None:
         if not hasattr(env_cfg.commands.motion, "evaluation_start_phase"):
@@ -2604,6 +2614,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             waist_roll_stiffness_scale,
             output_path=args_cli.diagnostic_path,
             evaluation_case_id=args_cli.evaluation_case_id,
+            evaluation_seed=agent_cfg.seed,
         )
         print("[INFO] Diagnostic scope: arms + waist + pelvis/torso motion.")
         print(f"[INFO] Diagnostic enabled (stride={diagnostic['stride']}) → {diagnostic['path']}")
