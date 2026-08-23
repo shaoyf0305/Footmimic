@@ -29,6 +29,12 @@ parser.add_argument(
     help="Camera preset. task_front: on +X side, looks ~ -X (robot frontal); diagonal: legacy oblique.",
 )
 parser.add_argument(
+    "--video_output_dir",
+    type=str,
+    default=None,
+    help="Optional explicit output directory for --video or --dual_view.",
+)
+parser.add_argument(
     "--record_all_motions",
     action="store_true",
     default=False,
@@ -162,6 +168,72 @@ parser.add_argument(
     help="Record every N simulator steps with --diagnostic (default: 1).",
 )
 parser.add_argument(
+    "--diagnostic_path",
+    type=str,
+    default=None,
+    help=(
+        "Optional explicit .npz output path for --diagnostic. This is useful for "
+        "scripted evaluation suites that need stable case names."
+    ),
+)
+parser.add_argument(
+    "--evaluation_case_id",
+    type=str,
+    default="",
+    help="Optional case identifier stored in the diagnostic archive.",
+)
+parser.add_argument(
+    "--evaluation_reference_phase",
+    type=float,
+    default=None,
+    help="Evaluation-only initial reference phase in [0, 1).",
+)
+parser.add_argument(
+    "--evaluation_initial_ball_offset",
+    type=float,
+    nargs=2,
+    metavar=("FORWARD", "LATERAL"),
+    default=None,
+    help=(
+        "Evaluation-only initial ball offset from the pelvis in the active command frame, "
+        "given as forward and lateral metres."
+    ),
+)
+parser.add_argument(
+    "--evaluation_ball_perturb_step",
+    type=int,
+    default=None,
+    help="Evaluation-only control step at which to perturb the ball once.",
+)
+parser.add_argument(
+    "--evaluation_ball_position_delta",
+    type=float,
+    nargs=2,
+    metavar=("FORWARD", "LATERAL"),
+    default=None,
+    help="Ball-position displacement in command-frame metres at the perturbation step.",
+)
+parser.add_argument(
+    "--evaluation_ball_velocity_delta",
+    type=float,
+    nargs=2,
+    metavar=("FORWARD", "LATERAL"),
+    default=None,
+    help="Ball-velocity impulse in command-frame m/s at the perturbation step.",
+)
+parser.add_argument(
+    "--disable_interval_pushes",
+    action="store_true",
+    default=False,
+    help="Disable random interval robot pushes for controlled checkpoint evaluation.",
+)
+parser.add_argument(
+    "--stop_on_done",
+    action="store_true",
+    default=False,
+    help="Stop playback after any environment terminates instead of continuing after its reset.",
+)
+parser.add_argument(
     "--upper_body_reference_margin",
     type=float,
     default=None,
@@ -204,6 +276,27 @@ cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.diagnostic_path is not None:
+    args_cli.diagnostic = True
+if args_cli.evaluation_reference_phase is not None and not (
+    0.0 <= args_cli.evaluation_reference_phase < 1.0
+):
+    parser.error("--evaluation_reference_phase must be in [0, 1).")
+if args_cli.evaluation_ball_perturb_step is not None and args_cli.evaluation_ball_perturb_step < 0:
+    parser.error("--evaluation_ball_perturb_step must be non-negative.")
+has_ball_perturbation = (
+    args_cli.evaluation_ball_position_delta is not None
+    or args_cli.evaluation_ball_velocity_delta is not None
+)
+if has_ball_perturbation and args_cli.evaluation_ball_perturb_step is None:
+    parser.error(
+        "--evaluation_ball_perturb_step is required when a ball perturbation delta is supplied."
+    )
+if args_cli.evaluation_ball_perturb_step is not None and not has_ball_perturbation:
+    parser.error(
+        "--evaluation_ball_perturb_step requires --evaluation_ball_position_delta "
+        "or --evaluation_ball_velocity_delta."
+    )
 # always enable cameras to record video
 if args_cli.video or args_cli.dual_view:
     args_cli.enable_cameras = True
@@ -508,6 +601,76 @@ def _resolve_base_env(env):
     return base
 
 
+def _command_frame_xy(command) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return forward and left unit vectors for every active command heading."""
+    heading = command.locomotion_cmd_heading
+    forward = torch.stack((torch.cos(heading), torch.sin(heading)), dim=-1)
+    left = torch.stack((-torch.sin(heading), torch.cos(heading)), dim=-1)
+    return forward, left
+
+
+def _apply_evaluation_initial_ball_offset(env, offset: list[float] | tuple[float, float]) -> None:
+    """Place the ball at a deterministic command-frame offset from the pelvis."""
+    base_env = _resolve_base_env(env)
+    command = base_env.command_manager.get_term("motion")
+    soccer_ball = base_env.scene["soccer_ball"]
+    pelvis_pos_w = getattr(command, "robot_pelvis_pos_w", command.robot_anchor_pos_w)
+    forward, left = _command_frame_xy(command)
+    forward_offset, lateral_offset = (float(offset[0]), float(offset[1]))
+    target_xy = (
+        pelvis_pos_w[:, :2]
+        + forward_offset * forward
+        + lateral_offset * left
+    )
+
+    root_state = soccer_ball.data.root_state_w.clone()
+    root_state[:, :2] = target_xy
+    soccer_ball.write_root_state_to_sim(root_state)
+    print(
+        "[INFO] Evaluation initial ball offset: "
+        f"forward={forward_offset:+.3f} m  lateral={lateral_offset:+.3f} m"
+    )
+
+
+def _apply_evaluation_ball_perturbation(env, args_cli, timestep: int) -> bool:
+    """Apply one command-frame ball displacement/velocity change at a fixed step."""
+    perturb_step = args_cli.evaluation_ball_perturb_step
+    if perturb_step is None or timestep != int(perturb_step):
+        return False
+
+    base_env = _resolve_base_env(env)
+    command = base_env.command_manager.get_term("motion")
+    soccer_ball = base_env.scene["soccer_ball"]
+    forward, left = _command_frame_xy(command)
+    root_state = soccer_ball.data.root_state_w.clone()
+
+    position_delta = args_cli.evaluation_ball_position_delta or (0.0, 0.0)
+    velocity_delta = args_cli.evaluation_ball_velocity_delta or (0.0, 0.0)
+    position_delta_command = root_state.new_tensor(position_delta)
+    velocity_delta_command = root_state.new_tensor(velocity_delta)
+    position_delta_w = (
+        position_delta_command[0] * forward
+        + position_delta_command[1] * left
+    )
+    velocity_delta_w = (
+        velocity_delta_command[0] * forward
+        + velocity_delta_command[1] * left
+    )
+    root_state[:, :2] += position_delta_w
+    root_state[:, 7:9] += velocity_delta_w
+    soccer_ball.write_root_state_to_sim(root_state)
+
+    base_env._evaluation_ball_perturbation_step = int(timestep)
+    base_env._evaluation_ball_position_delta_command = position_delta_command.detach().clone()
+    base_env._evaluation_ball_velocity_delta_command = velocity_delta_command.detach().clone()
+    print(
+        "[INFO] Applied evaluation ball perturbation at step "
+        f"{timestep}: position=({position_delta[0]:+.3f}, {position_delta[1]:+.3f}) m  "
+        f"velocity=({velocity_delta[0]:+.3f}, {velocity_delta[1]:+.3f}) m/s"
+    )
+    return True
+
+
 def _get_joint_position_action_term(base_env):
     """Return the position-action term and its action-index → robot-joint mapping."""
     action_term = base_env.action_manager.get_term("joint_pos")
@@ -674,6 +837,8 @@ def _create_diagnostic(
     stride: int,
     constraints: list[dict] | None = None,
     waist_roll_stiffness_scale: float = 1.0,
+    output_path: str | None = None,
+    evaluation_case_id: str = "",
 ) -> dict:
     """Prepare a per-step arm, waist, and trunk-motion trace for one playback env."""
     if stride <= 0:
@@ -718,11 +883,17 @@ def _create_diagnostic(
     else:
         trunk_action_ids = _action_ids_for_robot_joint_ids(action_joint_ids, trunk_joint_ids)
 
-    output_dir = os.path.join(log_dir, "diagnostics")
+    if output_path is None:
+        output_dir = os.path.join(log_dir, "diagnostics")
+        output_path = os.path.join(
+            output_dir, f"diagnostic_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.npz"
+        )
+    else:
+        output_path = os.path.abspath(os.path.expanduser(output_path))
+        if not output_path.endswith(".npz"):
+            raise ValueError("--diagnostic_path must end with .npz.")
+        output_dir = os.path.dirname(output_path) or "."
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(
-        output_dir, f"diagnostic_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.npz"
-    )
     reward_manager = getattr(base_env, "reward_manager", None)
     reward_term_names = np.asarray(getattr(reward_manager, "_term_names", []))
     reward_term_weights = _reward_term_weights(base_env)
@@ -744,6 +915,7 @@ def _create_diagnostic(
     )
     return {
         "path": output_path,
+        "evaluation_case_id": str(evaluation_case_id),
         "stride": int(stride),
         "joint_ids": torch.as_tensor(joint_ids, dtype=torch.long, device=base_env.device),
         "joint_names": np.asarray(_ARM_DIAGNOSTIC_JOINT_NAMES),
@@ -828,6 +1000,9 @@ def _create_diagnostic(
         "ball_pelvis_xy_distance": [],
         "ball_command_forward_offset": [],
         "ball_command_lateral_offset": [],
+        "evaluation_ball_perturbation_applied": [],
+        "evaluation_ball_position_delta_command": [],
+        "evaluation_ball_velocity_delta_command": [],
         "ball_predicted_forward_offset": [],
         "ball_predicted_lateral_offset": [],
         "ball_position_error_norm": [],
@@ -1002,6 +1177,26 @@ def _append_diagnostic(
     task_state = getattr(command, "locomotion_task_state", None)
     diagnostic["task_state"].append(1 if task_state is None else int(task_state[0].item()))
     diagnostic["command_heading"].append(float(command.locomotion_cmd_heading[0].item()))
+    perturbation_step = getattr(base_env, "_evaluation_ball_perturbation_step", None)
+    diagnostic["evaluation_ball_perturbation_applied"].append(
+        perturbation_step is not None and int(perturbation_step) == int(step)
+    )
+    position_delta_command = getattr(
+        base_env, "_evaluation_ball_position_delta_command", None
+    )
+    velocity_delta_command = getattr(
+        base_env, "_evaluation_ball_velocity_delta_command", None
+    )
+    diagnostic["evaluation_ball_position_delta_command"].append(
+        np.zeros(2, dtype=np.float32)
+        if position_delta_command is None
+        else position_delta_command.detach().cpu().numpy().copy()
+    )
+    diagnostic["evaluation_ball_velocity_delta_command"].append(
+        np.zeros(2, dtype=np.float32)
+        if velocity_delta_command is None
+        else velocity_delta_command.detach().cpu().numpy().copy()
+    )
     target_speed = getattr(command, "locomotion_cmd_target_speed", command.locomotion_cmd_speed)
     target_heading = getattr(command, "locomotion_cmd_target_heading", command.locomotion_cmd_heading)
     diagnostic["command_target_speed"].append(float(target_speed[0].item()))
@@ -1517,7 +1712,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         print("[WARN] Diagnostic requested but no samples were recorded.")
         return
     metadata_keys = {
-        "path", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names",
+        "path", "evaluation_case_id", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names",
         "reward_term_weights", "reward_term_step_weights", "reward_step_dt", "task_state_names",
         "ball_contact_body_names", "ball_contact_collision_names", "ball_contact_filter_available",
         "ball_contact_filter_count", "ball_contact_expected_filter_count",
@@ -1535,6 +1730,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         if key not in metadata_keys
     }
     arrays["joint_names"] = diagnostic["joint_names"]
+    arrays["evaluation_case_id"] = np.asarray(diagnostic["evaluation_case_id"])
     arrays["trunk_joint_names"] = diagnostic["trunk_joint_names"]
     arrays["trunk_body_names"] = diagnostic["trunk_body_names"]
     arrays["reward_term_names"] = diagnostic["reward_term_names"]
@@ -2207,6 +2403,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
+    if args_cli.evaluation_reference_phase is not None:
+        if not hasattr(env_cfg.commands.motion, "evaluation_start_phase"):
+            raise RuntimeError(
+                "The selected task command does not support deterministic evaluation phases."
+            )
+        env_cfg.commands.motion.evaluation_start_phase = float(
+            args_cli.evaluation_reference_phase
+        )
+        print(
+            "[INFO] Evaluation reference start phase: "
+            f"{args_cli.evaluation_reference_phase:.3f}"
+        )
+
+    if args_cli.disable_interval_pushes:
+        events = getattr(env_cfg, "events", None)
+        if events is not None and hasattr(events, "push_robot"):
+            events.push_robot = None
+            print("[INFO] Controlled evaluation: random interval robot pushes disabled.")
+
     env_cfg.viewer.origin_type = None
     env_cfg.viewer.asset_name = None
 
@@ -2341,6 +2556,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if callable(reset_scene):
             reset_scene()
             print("[INFO] Robot yaw and soccer ball aligned with the active command frame.")
+    if args_cli.evaluation_initial_ball_offset is not None:
+        _apply_evaluation_initial_ball_offset(
+            env, args_cli.evaluation_initial_ball_offset
+        )
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
@@ -2383,6 +2602,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             args_cli.diagnostic_stride,
             reference_constraints,
             waist_roll_stiffness_scale,
+            output_path=args_cli.diagnostic_path,
+            evaluation_case_id=args_cli.evaluation_case_id,
         )
         print("[INFO] Diagnostic scope: arms + waist + pelvis/torso motion.")
         print(f"[INFO] Diagnostic enabled (stride={diagnostic['stride']}) → {diagnostic['path']}")
@@ -2445,9 +2666,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         from dual_view_recorder import DualViewRecorder, resolve_camera_offsets
 
         tag = "dual" if args_cli.dual_view else "play"
-        video_dir = os.path.join(
-            log_dir, "videos", f"{tag}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
+        if args_cli.video_output_dir is None:
+            video_dir = os.path.join(
+                log_dir, "videos", f"{tag}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+        else:
+            video_dir = os.path.abspath(os.path.expanduser(args_cli.video_output_dir))
+            os.makedirs(video_dir, exist_ok=True)
         front_offset, back_offset = resolve_camera_offsets(layout=args_cli.cam_layout)
         video_recorder = DualViewRecorder(
             env=env.unwrapped if hasattr(env, "unwrapped") else env,
@@ -2480,6 +2705,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     while simulation_app.is_running():
         # run everything in inference mode
         with torch.inference_mode():
+            if _apply_evaluation_ball_perturbation(env, args_cli, timestep):
+                # The root-state write occurs between control steps. Refresh the
+                # policy observation so the response starts from the perturbed state.
+                obs, _ = env.get_observations()
             policy_actions = policy(obs)
             actions = policy_actions
             for reference_constraint in reference_constraints:
@@ -2506,6 +2735,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             video_recorder.capture(overlay_text=overlay)
 
         timestep += 1
+        if args_cli.stop_on_done and bool(torch.any(dones).item()):
+            print(f"[INFO] --stop_on_done: terminating playback at step {timestep}.")
+            break
         if play_steps is not None and timestep >= play_steps:
             break
 

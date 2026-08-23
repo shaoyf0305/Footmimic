@@ -1485,10 +1485,18 @@ class MotionCommand(CommandTerm):
         self.motion_idx[env_ids] = motion_indices
         self.motion_length[env_ids] = self.motion.file_lengths[motion_indices]
         
-        # Then sample a time-step for each selected motion.
-        # time_phase = sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device)
-        # Start each selected motion from frame 0.
-        time_phase = torch.zeros(len(env_ids), device=self.device)
+        # Training starts each selected motion from frame 0. Evaluation can
+        # request a deterministic phase without changing the default MDP.
+        fixed_phase = getattr(self.cfg, "evaluation_start_phase", None)
+        if fixed_phase is None:
+            time_phase = torch.zeros(len(env_ids), device=self.device)
+        else:
+            fixed_phase = float(fixed_phase)
+            if not 0.0 <= fixed_phase < 1.0:
+                raise ValueError("evaluation_start_phase must be in [0, 1).")
+            time_phase = torch.full(
+                (len(env_ids),), fixed_phase, device=self.device
+            )
 
         self.time_steps[env_ids] = (time_phase * (self.motion_length[env_ids].float() - 1)).long()
 
@@ -2074,6 +2082,9 @@ class MotionCommandCfg(CommandTermCfg):
 
     joint_position_range: tuple[float, float] = (-0.52, 0.52)
     sampling_strategy: str = "uniform"
+    # Playback-only deterministic phase used by the Essay13 evaluation suite.
+    # None preserves the original training/reset behaviour.
+    evaluation_start_phase: float | None = None
 
     adaptive_kernel_size: int = 3
     adaptive_lambda: float = 0.1

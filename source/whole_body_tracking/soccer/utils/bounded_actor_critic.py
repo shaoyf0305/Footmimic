@@ -99,6 +99,8 @@ class BoundedUpperBodyActorCriticRecurrent(ActorCriticRecurrent):
         )
         self._bounded_mean_limit = float(math.atanh(0.95))
         self._squash_epsilon = 1.0e-6
+        self._minimum_scalar_std = 0.05
+        self._std_floor_warning_emitted = False
         # Inference-only diagnostics.  These tensors are deliberately not
         # buffers and therefore never enter a checkpoint state dict.
         self.last_inference_actor_raw_mean: torch.Tensor | None = None
@@ -148,11 +150,57 @@ class BoundedUpperBodyActorCriticRecurrent(ActorCriticRecurrent):
 
     def update_distribution(self, observations: torch.Tensor) -> None:
         raw_mean = self.actor(observations)
+        if not torch.isfinite(raw_mean).all():
+            invalid_ids = torch.nonzero(
+                ~torch.isfinite(raw_mean).all(dim=0), as_tuple=False
+            ).flatten()
+            raise RuntimeError(
+                "Actor raw mean contains NaN/Inf at action indices "
+                f"{invalid_ids.detach().cpu().tolist()}."
+            )
         mean = self._distribution_mean(raw_mean)
         if self.noise_std_type == "scalar":
+            if not torch.isfinite(self.std).all():
+                invalid_ids = torch.nonzero(
+                    ~torch.isfinite(self.std), as_tuple=False
+                ).flatten()
+                raise RuntimeError(
+                    "Actor exploration std contains NaN/Inf at action indices "
+                    f"{invalid_ids.detach().cpu().tolist()}."
+                )
+            minimum_before_projection = float(self.std.detach().min().item())
+            if minimum_before_projection < self._minimum_scalar_std:
+                # RSL-RL optimizes scalar std directly, so Adam can otherwise
+                # move it outside Normal's valid positive domain.
+                with torch.no_grad():
+                    self.std.clamp_(min=self._minimum_scalar_std)
+                if not self._std_floor_warning_emitted:
+                    print(
+                        "[WARN] Projected actor scalar std to the safety floor "
+                        f"{self._minimum_scalar_std:.3f}; minimum before projection was "
+                        f"{minimum_before_projection:.6f}."
+                    )
+                    self._std_floor_warning_emitted = True
             std = self.std.expand_as(mean)
         elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std).expand_as(mean)
+            if not torch.isfinite(self.log_std).all():
+                invalid_ids = torch.nonzero(
+                    ~torch.isfinite(self.log_std), as_tuple=False
+                ).flatten()
+                raise RuntimeError(
+                    "Actor exploration log_std contains NaN/Inf at action indices "
+                    f"{invalid_ids.detach().cpu().tolist()}."
+                )
+            std_parameter = torch.exp(self.log_std)
+            if not torch.isfinite(std_parameter).all():
+                invalid_ids = torch.nonzero(
+                    ~torch.isfinite(std_parameter), as_tuple=False
+                ).flatten()
+                raise RuntimeError(
+                    "Actor exploration std overflowed at action indices "
+                    f"{invalid_ids.detach().cpu().tolist()}."
+                )
+            std = std_parameter.clamp_min(self._minimum_scalar_std).expand_as(mean)
         else:
             raise ValueError(
                 f"Unknown standard deviation type: {self.noise_std_type}. "
