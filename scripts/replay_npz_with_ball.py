@@ -10,20 +10,20 @@ marker spheres and prints CG contact / foot–ball distance in the terminal.
 
     # Single clip
     python scripts/replay_npz_with_ball.py \\
-        --motion_path motions/dribble-distance/FAST-seg1_unitree_g1.npz
+        --motion_path motions/master-v2/master_001675_001884_unitree_g1.npz
 
-    # Whole folder (plays each clip in order; loops folder by default)
+    # A custom folder plays each clip in sorted order and loops by default
     python scripts/replay_npz_with_ball.py \\
-        --motion_path motions/dribble-distance --device cpu
+        --motion_path <MOTION_DIRECTORY> --device cpu
 
     # Headless MP4 recording (SSH-friendly) with HUD overlay
     python scripts/replay_npz_with_ball.py \\
-        --motion_path motions/dribble-distance \\
+        --motion_path motions/master-v2 \\
         --headless --dual_view --no_loop --no_playlist_loop
 
     # No GPU machine — always use CPU to avoid cudaErrorNoDevice
     python scripts/replay_npz_with_ball.py \\
-        --motion_path motions/dribble-distance --device cpu --real_time
+        --motion_path motions/master-v2 --device cpu --real_time
 """
 
 from __future__ import annotations

@@ -8,7 +8,7 @@
 # The script re-enters the Isaac container through $WORK/run_isaaclab.sh when
 # needed. Every case receives a stable diagnostic path and its own stdout log.
 
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_REL="scripts/rsl_rl/run_essay13_baseline_suite.sh"
 PROJECT_IN_CONTAINER="/workspace/projects/Footmimic"
@@ -153,7 +153,11 @@ for source_file in \
 done
 {
     printf '%s\0' "$SCRIPT_REL" scripts/rsl_rl/play_multi.py
-    git ls-files -z source/whole_body_tracking/soccer
+    while IFS= read -r -d '' source_file; do
+        if [[ -f "$source_file" ]]; then
+            printf '%s\0' "$source_file"
+        fi
+    done < <(git ls-files -z source/whole_body_tracking/soccer)
 } | xargs -0 -r sha256sum > "$RESULT_DIR/source_sha256.txt"
 
 CHECKPOINT_PATH="logs/rsl_rl/$EXPERIMENT_NAME/$LOAD_RUN/$CHECKPOINT"

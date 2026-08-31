@@ -1399,9 +1399,7 @@ class MotionCommand(CommandTerm):
             episode_failed = torch.tensor(episode_failed, dtype=torch.bool, device=self.device)
         # Clear failure histogram for the current update.
         self._current_bin_failed.zero_()
-        # import ipdb; ipdb.set_trace()
         if torch.any(episode_failed):
-            # import ipdb; ipdb.set_trace()
             # For failed environments, count the corresponding motion bins.
             failed_env_mask = episode_failed
             failed_motion_idx = self.motion_idx[env_ids][failed_env_mask]                       # [K]
@@ -1462,7 +1460,6 @@ class MotionCommand(CommandTerm):
         pmax, imax = probs.max(dim=0)
         top1_motion = (imax // self.bin_count).float()
         top1_bin = (imax % self.bin_count).float() / self.bin_count
-        # import ipdb; ipdb.set_trace()
 
         # Create metric entries only when needed.
         if "sampling_entropy" not in self.metrics or self.metrics["sampling_entropy"].shape[0] != self.num_envs:

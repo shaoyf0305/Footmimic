@@ -1,4 +1,4 @@
-"""Single-factor Essay13 ablation configurations.
+"""Ablation configurations reported for the formal full method.
 
 Every class starts from the frozen Stage-II environment and changes only the
 factor named by the class.  The explicit Full class is the re-trained control
@@ -72,32 +72,10 @@ class G1Essay13AblationFullEnvCfg(G1FlatCGDribblingControlEnvCfg):
 
 
 @configclass
-class G1Essay13NoBallVelocityObservationEnvCfg(G1Essay13AblationFullEnvCfg):
-    """Zero only the policy and critic ball-velocity observations."""
-
-    ablation_variant: str = "no_ball_velocity_observation"
-
-    def __post_init__(self):
-        super().__post_init__()
-        _zero_ball_velocity_observations(self)
-
-
-@configclass
-class G1Essay13NoBallVelocityRewardEnvCfg(G1Essay13AblationFullEnvCfg):
-    """Remove only the direct ball-velocity tracking reward."""
-
-    ablation_variant: str = "no_ball_velocity_reward"
-
-    def __post_init__(self):
-        super().__post_init__()
-        _disable_ball_velocity_tracking_reward(self)
-
-
-@configclass
 class G1Essay13NoExplicitBallVelocityEnvCfg(G1Essay13AblationFullEnvCfg):
     """Remove explicit ball-velocity feedback from both input and reward."""
 
-    ablation_variant: str = "no_explicit_ball_velocity"
+    ablation_variant: str = "no_ball_velocity"
 
     def __post_init__(self):
         super().__post_init__()
@@ -109,7 +87,7 @@ class G1Essay13NoExplicitBallVelocityEnvCfg(G1Essay13AblationFullEnvCfg):
 class G1Essay13NoRecoveryBlendingEnvCfg(G1Essay13AblationFullEnvCfg):
     """Measure recovery gates without letting them alter policy objectives."""
 
-    ablation_variant: str = "no_recovery_blending"
+    ablation_variant: str = "no_recovery"
 
     def __post_init__(self):
         super().__post_init__()
@@ -120,30 +98,8 @@ class G1Essay13NoRecoveryBlendingEnvCfg(G1Essay13AblationFullEnvCfg):
 class G1Essay13NoStage1InitializationEnvCfg(G1Essay13AblationFullEnvCfg):
     """Use the complete Stage-II MDP but require random network initialization."""
 
-    ablation_variant: str = "no_stage1_initialization"
+    ablation_variant: str = "no_stage1"
     requires_stage1_initialization: bool = False
-
-
-@configclass
-class G1Essay13NoDenseDistanceEnvCfg(G1Essay13AblationFullEnvCfg):
-    """Remove only the synthesized reference foot--ball distance reward."""
-
-    ablation_variant: str = "no_dense_distance"
-
-    def __post_init__(self):
-        super().__post_init__()
-        _disable_dense_interaction_distance(self)
-
-
-@configclass
-class G1Essay13NoTouchTimingEnvCfg(G1Essay13AblationFullEnvCfg):
-    """Remove only reference-window timing modulation from useful touches."""
-
-    ablation_variant: str = "no_touch_timing"
-
-    def __post_init__(self):
-        super().__post_init__()
-        _disable_touch_timing_scaling(self)
 
 
 @configclass
@@ -156,15 +112,3 @@ class G1Essay13NoInteractionReferenceEnvCfg(G1Essay13AblationFullEnvCfg):
         super().__post_init__()
         _disable_dense_interaction_distance(self)
         _disable_touch_timing_scaling(self)
-
-
-@configclass
-class G1Essay13NoBodyFootReferenceEnvCfg(G1Essay13AblationFullEnvCfg):
-    """Optional single-factor removal of Stage-II body/foot regularization."""
-
-    ablation_variant: str = "no_body_foot_reference"
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.rewards.motion_body_pos = None
-        self.rewards.motion_foot_pos = None

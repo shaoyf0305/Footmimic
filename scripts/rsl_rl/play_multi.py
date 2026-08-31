@@ -206,23 +206,6 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
-    "--evaluation_ball_mode",
-    type=str,
-    choices=["physical", "pelvis_locked"],
-    default="physical",
-    help=(
-        "Evaluation-only ball mode. 'physical' keeps the simulated ball unchanged. "
-        "'pelvis_locked' disables ball gravity and collisions and places a ghost ball "
-        "at a fixed command-frame offset from the pelvis with the pelvis planar velocity."
-    ),
-)
-parser.add_argument(
-    "--evaluation_pelvis_locked_ball_offset",
-    type=float,
-    default=0.45,
-    help="Forward pelvis-to-ball offset in metres for --evaluation_ball_mode pelvis_locked.",
-)
-parser.add_argument(
     "--evaluation_ball_perturb_step",
     type=int,
     default=None,
@@ -320,18 +303,6 @@ if args_cli.evaluation_ball_perturb_step is not None and not has_ball_perturbati
         "--evaluation_ball_perturb_step requires --evaluation_ball_position_delta "
         "or --evaluation_ball_velocity_delta."
     )
-if args_cli.evaluation_ball_mode == "pelvis_locked":
-    if args_cli.evaluation_pelvis_locked_ball_offset <= 0.0:
-        parser.error("--evaluation_pelvis_locked_ball_offset must be positive.")
-    if args_cli.evaluation_initial_ball_offset is not None:
-        parser.error(
-            "--evaluation_initial_ball_offset cannot be combined with "
-            "--evaluation_ball_mode pelvis_locked."
-        )
-    if has_ball_perturbation:
-        parser.error(
-            "Ball perturbations cannot be combined with --evaluation_ball_mode pelvis_locked."
-        )
 # always enable cameras to record video
 if args_cli.video or args_cli.dual_view:
     args_cli.enable_cameras = True
@@ -354,7 +325,6 @@ import glob
 import pathlib
 import numpy as np
 import torch
-import isaaclab.sim as sim_utils
 
 from soccer.tasks.tracking.mdp.rewards_dribbling import (
     soccer_ball_body_contact_force_magnitudes,
@@ -423,7 +393,7 @@ def _reset_recurrent_policy_on_done(runner, dones: torch.Tensor) -> None:
 
 
 def _disable_play_terminations(env_cfg) -> list[str]:
-    """Disable failure termination terms so playback runs full clips (v1.20 behaviour)."""
+    """Disable failure termination terms so playback runs full clips."""
     if not hasattr(env_cfg, "terminations"):
         return []
 
@@ -643,93 +613,6 @@ def _command_frame_xy(command) -> tuple[torch.Tensor, torch.Tensor]:
     forward = torch.stack((torch.cos(heading), torch.sin(heading)), dim=-1)
     left = torch.stack((-torch.sin(heading), torch.cos(heading)), dim=-1)
     return forward, left
-
-
-def _configure_evaluation_ball_mode(env_cfg, mode: str) -> None:
-    """Apply scene-only settings for an evaluation ball mode before env creation."""
-    if mode == "physical":
-        return
-    if mode != "pelvis_locked":
-        raise ValueError(f"Unsupported evaluation ball mode: {mode}")
-
-    ball_cfg = getattr(getattr(env_cfg, "scene", None), "soccer_ball", None)
-    spawn_cfg = getattr(ball_cfg, "spawn", None)
-    if spawn_cfg is None:
-        raise RuntimeError("The selected task does not expose scene.soccer_ball.spawn.")
-
-    rigid_props = getattr(spawn_cfg, "rigid_props", None)
-    if rigid_props is None:
-        rigid_props = sim_utils.RigidBodyPropertiesCfg(
-            disable_gravity=True,
-        )
-    else:
-        rigid_props = rigid_props.replace(
-            disable_gravity=True,
-        )
-
-    collision_props = getattr(spawn_cfg, "collision_props", None)
-    if collision_props is None:
-        collision_props = sim_utils.CollisionPropertiesCfg(collision_enabled=False)
-    else:
-        collision_props = collision_props.replace(collision_enabled=False)
-
-    ball_cfg.spawn = spawn_cfg.replace(
-        rigid_props=rigid_props,
-        collision_props=collision_props,
-    )
-
-    disabled_terms: list[str] = []
-    terminations = getattr(env_cfg, "terminations", None)
-    for name in ("ball_lost", "dribbling_no_contact"):
-        if terminations is not None and hasattr(terminations, name):
-            setattr(terminations, name, None)
-            disabled_terms.append(name)
-
-    print(
-        "[INFO] Evaluation ball mode: pelvis_locked "
-        "(gravity-free, collision-disabled, velocity follows pelvis)."
-    )
-    if disabled_terms:
-        print(
-            "[INFO] Pelvis-locked diagnostic disabled ball-specific terminations: "
-            + ", ".join(disabled_terms)
-        )
-
-
-def _sync_pelvis_locked_evaluation_ball(env, mode: str, forward_offset: float) -> bool:
-    """Keep a collision-free ghost ball at a fixed offset with pelvis velocity.
-
-    This is a play-only locomotion diagnostic. The physical task remains the
-    default path, and the policy observation shape is unchanged.
-    """
-    if mode != "pelvis_locked":
-        return False
-
-    base_env = _resolve_base_env(env)
-    command = base_env.command_manager.get_term("motion")
-    robot = base_env.scene[command.cfg.asset_name]
-    soccer_ball = base_env.scene["soccer_ball"]
-    pelvis_id = robot.body_names.index("pelvis")
-    pelvis_pos_w = robot.data.body_pos_w[:, pelvis_id, :]
-    pelvis_vel_w = robot.data.body_lin_vel_w[:, pelvis_id, :]
-    forward, _left = _command_frame_xy(command)
-
-    root_state = soccer_ball.data.root_state_w.clone()
-    root_state[:, :2] = pelvis_pos_w[:, :2] + float(forward_offset) * forward
-    root_state[:, 7:9] = pelvis_vel_w[:, :2]
-    root_state[:, 9] = 0.0
-    root_state[:, 10:13] = 0.0
-    soccer_ball.write_root_state_to_sim(root_state)
-
-    # The command caches a target-point copy of the physical ball. Refresh it
-    # after the root-state write so the next observation has no one-step lag.
-    refresh_target = getattr(command, "_update_target_points_from_sim", None)
-    if callable(refresh_target):
-        refresh_target()
-
-    base_env._evaluation_ball_mode = mode
-    base_env._evaluation_pelvis_locked_ball_offset = float(forward_offset)
-    return True
 
 
 def _apply_evaluation_initial_ball_offset(env, offset: list[float] | tuple[float, float]) -> None:
@@ -963,7 +846,6 @@ def _create_diagnostic(
     output_path: str | None = None,
     evaluation_case_id: str = "",
     evaluation_seed: int | None = None,
-    evaluation_ball_mode: str = "physical",
 ) -> dict:
     """Prepare a per-step arm, waist, and trunk-motion trace for one playback env."""
     if stride <= 0:
@@ -1042,7 +924,6 @@ def _create_diagnostic(
         "path": output_path,
         "evaluation_case_id": str(evaluation_case_id),
         "evaluation_seed": -1 if evaluation_seed is None else int(evaluation_seed),
-        "evaluation_ball_mode": str(evaluation_ball_mode),
         "stride": int(stride),
         "joint_ids": torch.as_tensor(joint_ids, dtype=torch.long, device=base_env.device),
         "joint_names": np.asarray(_ARM_DIAGNOSTIC_JOINT_NAMES),
@@ -1186,8 +1067,6 @@ def _create_diagnostic(
         "ball_speed_excess_penalty": [],
         "ball_closing_speed": [],
         "pelvis_xy_speed": [],
-        "pelvis_command_forward_speed": [],
-        "pelvis_command_lateral_speed": [],
         "recovery_gate_raw": [],
         "recovery_gate": [],
         "pelvis_command_target_velocity_xy": [],
@@ -1458,14 +1337,7 @@ def _append_diagnostic(
     diagnostic["ball_velocity_heading_error"].append(
         float(torch.atan2(ball_lateral_speed, ball_forward_speed).item())
     )
-    pelvis_vel_xy = robot.data.body_lin_vel_w[0, pelvis_id, :2]
-    diagnostic["pelvis_xy_speed"].append(float(torch.norm(pelvis_vel_xy).item()))
-    diagnostic["pelvis_command_forward_speed"].append(
-        float(torch.dot(pelvis_vel_xy, command_dir).item())
-    )
-    diagnostic["pelvis_command_lateral_speed"].append(
-        float(torch.dot(pelvis_vel_xy, command_lateral_dir).item())
-    )
+    diagnostic["pelvis_xy_speed"].append(float(torch.norm(robot.data.body_lin_vel_w[0, pelvis_id, :2]).item()))
 
     body_force_magnitudes, body_names, filtered_available = (
         soccer_ball_body_contact_force_magnitudes(
@@ -1848,7 +1720,7 @@ def _save_diagnostic(diagnostic: dict) -> None:
         print("[WARN] Diagnostic requested but no samples were recorded.")
         return
     metadata_keys = {
-        "path", "evaluation_case_id", "evaluation_seed", "evaluation_ball_mode", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names",
+        "path", "evaluation_case_id", "evaluation_seed", "stride", "joint_ids", "joint_names", "action_ids", "reward_term_names",
         "reward_term_weights", "reward_term_step_weights", "reward_step_dt", "task_state_names",
         "ball_contact_body_names", "ball_contact_collision_names", "ball_contact_filter_available",
         "ball_contact_filter_count", "ball_contact_expected_filter_count",
@@ -1868,7 +1740,6 @@ def _save_diagnostic(diagnostic: dict) -> None:
     arrays["joint_names"] = diagnostic["joint_names"]
     arrays["evaluation_case_id"] = np.asarray(diagnostic["evaluation_case_id"])
     arrays["evaluation_seed"] = np.asarray(diagnostic["evaluation_seed"])
-    arrays["evaluation_ball_mode"] = np.asarray(diagnostic["evaluation_ball_mode"])
     arrays["trunk_joint_names"] = diagnostic["trunk_joint_names"]
     arrays["trunk_body_names"] = diagnostic["trunk_body_names"]
     arrays["reward_term_names"] = diagnostic["reward_term_names"]
@@ -2561,8 +2432,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             events.push_robot = None
             print("[INFO] Controlled evaluation: random interval robot pushes disabled.")
 
-    _configure_evaluation_ball_mode(env_cfg, args_cli.evaluation_ball_mode)
-
     env_cfg.viewer.origin_type = None
     env_cfg.viewer.asset_name = None
 
@@ -2746,7 +2615,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             output_path=args_cli.diagnostic_path,
             evaluation_case_id=args_cli.evaluation_case_id,
             evaluation_seed=agent_cfg.seed,
-            evaluation_ball_mode=args_cli.evaluation_ball_mode,
         )
         print("[INFO] Diagnostic scope: arms + waist + pelvis/torso motion.")
         print(f"[INFO] Diagnostic enabled (stride={diagnostic['stride']}) → {diagnostic['path']}")
@@ -2841,16 +2709,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset environment
     global _LAST_TERM_REASON
     _LAST_TERM_REASON = "-"
-    ghost_ball_active = _sync_pelvis_locked_evaluation_ball(
-        env,
-        args_cli.evaluation_ball_mode,
-        args_cli.evaluation_pelvis_locked_ball_offset,
-    )
-    if ghost_ball_active:
-        print(
-            "[INFO] Pelvis-locked ghost ball initialized at "
-            f"{args_cli.evaluation_pelvis_locked_ball_offset:.3f} m forward offset."
-        )
     obs, _ = env.get_observations()
     base_env = _resolve_base_env(env)
     timestep = 0
@@ -2858,14 +2716,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     while simulation_app.is_running():
         # run everything in inference mode
         with torch.inference_mode():
-            if timestep > 0 and _sync_pelvis_locked_evaluation_ball(
-                env,
-                args_cli.evaluation_ball_mode,
-                args_cli.evaluation_pelvis_locked_ball_offset,
-            ):
-                # env.step() returns observations before the play-only ghost
-                # state is restored. Refresh them for policy inference.
-                obs, _ = env.get_observations()
             if _apply_evaluation_ball_perturbation(env, args_cli, timestep):
                 # The root-state write occurs between control steps. Refresh the
                 # policy observation so the response starts from the perturbed state.

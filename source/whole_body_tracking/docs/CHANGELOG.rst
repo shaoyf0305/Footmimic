@@ -1,10 +1,12 @@
 Changelog
 ---------
 
-0.1.0 (2024-01-29)
+0.1.0 (2026-08-31)
 ~~~~~~~~~~~~~~~~~~
 
 Added
 ^^^^^
 
-* Created an initial template for building an extension or project based on Isaac Lab
+* Added the two-stage FootMimic training pipeline for Unitree G1.
+* Added command-conditioned physical-ball dribbling and diagnostic export.
+* Added the four configuration-controlled ablations reported in the paper.

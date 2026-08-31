@@ -65,3 +65,10 @@ msc_essay/
 logs/
 *.pt
 .codex_tmp/
+.tmp/
+
+# Large local evidence and presentation artifacts.  The compact diagnostics
+# required to reproduce the reported tables remain trackable under paper_data/.
+paper_data/supporting_suite/
+paper_data/video/
+paper_data/unused_or_auxiliary/

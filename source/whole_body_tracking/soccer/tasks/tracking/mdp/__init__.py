@@ -2,9 +2,6 @@
 
 from isaaclab.envs.mdp import *  # noqa: F401, F403
 
-from soccer.tasks.tracking.mdp import *  # noqa: F401, F403
-
-# from .commands import *  # noqa: F401, F403
 from .actions import *  # noqa: F401, F403
 from .events import *  # noqa: F401, F403
 from .observations import *  # noqa: F401, F403
@@ -14,4 +11,3 @@ from .terminations import *  # noqa: F401, F403
 
 from .commands_multi_motion_soccer import *  # noqa: F401, F403
 from .commands_dribble_cg import DribbleCGMotionCommand, DribbleCGMotionCommandCfg  # noqa: F401
-# from .commands import *

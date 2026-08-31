@@ -2,7 +2,7 @@
 
 # Apply the same Essay13 evaluation suite to a table of trained ablations.
 
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_REL="scripts/rsl_rl/run_essay13_ablation_evaluation.sh"
 SUITE_REL="scripts/rsl_rl/run_essay13_baseline_suite.sh"
@@ -90,14 +90,9 @@ mkdir -p "$RESULT_DIR"
 declare -A TASK_BY_VARIANT=(
     [full]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-Full"
     [no_ball_velocity]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBallVelocity"
-    [no_ball_velocity_observation]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBallVelocityObservation"
-    [no_ball_velocity_reward]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBallVelocityReward"
     [no_recovery]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoRecovery"
     [no_stage1]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoStage1"
-    [no_dense_distance]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoDenseDistance"
-    [no_touch_timing]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoTouchTiming"
     [no_interaction_reference]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoInteractionReference"
-    [no_body_foot_reference]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBodyFootReference"
 )
 
 SUMMARY="$RESULT_DIR/evaluation_manifest.tsv"
@@ -135,8 +130,11 @@ while read -r variant load_run checkpoint extra; do
     [[ "$DRY_RUN" -eq 1 ]] && cmd+=(--dry-run --no-archive)
 
     printf '[EVAL] variant=%s run=%s checkpoint=%s\n' "$variant" "$load_run" "$checkpoint"
-    "${cmd[@]}"
-    exit_code=$?
+    if "${cmd[@]}"; then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
     if [[ "$exit_code" -eq 0 ]]; then
         status="passed"
     else

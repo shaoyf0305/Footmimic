@@ -88,7 +88,7 @@ extraPaths = [
     "/path/to/IsaacLab/source/isaaclab_assets",
     "/path/to/IsaacLab/source/isaaclab_mimic",
     "/path/to/IsaacLab/source/isaaclab_rl",
-    "/path/to/HumanoidSoccer/source/whole_body_tracking"
+    "/path/to/Footmimic/source/whole_body_tracking"
 ]
 
 

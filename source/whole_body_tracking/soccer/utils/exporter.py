@@ -44,7 +44,6 @@ class _OnnxMotionPolicyExporter(_OnnxPolicyExporter):
             getattr(actor_critic, "_bounded_mean_limit", math.atanh(0.95))
         )
         cmd: MotionCommand = env.command_manager.get_term("motion")
-        # import ipdb; ipdb.set_trace()
         if len(cmd.motion.joint_pos.shape) == 2:  # Single motion.
             self.joint_pos = cmd.motion.joint_pos.to("cpu")
             self.joint_vel = cmd.motion.joint_vel.to("cpu")

@@ -2,7 +2,7 @@
 
 # One-command launcher for configuration-controlled Essay13 ablation training.
 
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_REL="scripts/rsl_rl/run_essay13_ablation_training.sh"
 PROJECT_IN_CONTAINER="/workspace/projects/Footmimic"
@@ -26,7 +26,6 @@ STAGE1_EXPERIMENT_NAME="g1_dribbling_essay"
 STAGE1_LOAD_RUN=""
 STAGE1_CHECKPOINT=""
 STAGE1_MIGRATION=""
-PROFILE="core"
 VARIANTS_CSV=""
 SEEDS_CSV="13"
 NUM_ENVS=4096
@@ -41,14 +40,13 @@ usage() {
 Usage:
   bash scripts/rsl_rl/run_essay13_ablation_training.sh [options]
 
-Required for every profile containing a Stage-I-initialized variant:
+Required when training any variant except no_stage1:
   --stage1-load-run RUN
   --stage1-checkpoint FILE
   --stage1-migration none|legacy-residual|bounded-policy
 
 Selection:
-  --profile core|extended
-  --variants NAME,NAME     Override the profile selection.
+  --variants NAME,NAME     Train a subset of the five reported conditions.
   --seeds 13,23,37
 
 Training:
@@ -63,19 +61,14 @@ Training:
   --continue-on-error
   -h, --help
 
-Core variants:
-  full, no_ball_velocity, no_recovery, no_stage1, no_dense_distance,
-  no_touch_timing, no_interaction_reference
-
-Extended-only variants:
-  no_ball_velocity_observation, no_ball_velocity_reward,
-  no_body_foot_reference
+Reported conditions:
+  full, no_ball_velocity, no_recovery, no_stage1,
+  no_interaction_reference
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --profile) PROFILE="$2"; shift 2 ;;
         --variants) VARIANTS_CSV="$2"; shift 2 ;;
         --seeds) SEEDS_CSV="$2"; shift 2 ;;
         --motion-path) MOTION_PATH="$2"; shift 2 ;;
@@ -95,10 +88,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-case "$PROFILE" in
-    core|extended) ;;
-    *) echo "[ERROR] --profile must be core or extended." >&2; exit 2 ;;
-esac
 case "$STAGE1_MIGRATION" in
     ""|none|legacy-residual|bounded-policy) ;;
     *) echo "[ERROR] Invalid --stage1-migration value." >&2; exit 2 ;;
@@ -115,38 +104,23 @@ fi
 declare -A TASK_BY_VARIANT=(
     [full]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-Full"
     [no_ball_velocity]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBallVelocity"
-    [no_ball_velocity_observation]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBallVelocityObservation"
-    [no_ball_velocity_reward]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBallVelocityReward"
     [no_recovery]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoRecovery"
     [no_stage1]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoStage1"
-    [no_dense_distance]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoDenseDistance"
-    [no_touch_timing]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoTouchTiming"
     [no_interaction_reference]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoInteractionReference"
-    [no_body_foot_reference]="Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBodyFootReference"
 )
 
-CORE_VARIANTS=(
+FORMAL_VARIANTS=(
     full
     no_ball_velocity
     no_recovery
     no_stage1
-    no_dense_distance
-    no_touch_timing
     no_interaction_reference
-)
-EXTENDED_VARIANTS=(
-    "${CORE_VARIANTS[@]}"
-    no_ball_velocity_observation
-    no_ball_velocity_reward
-    no_body_foot_reference
 )
 
 if [[ -n "$VARIANTS_CSV" ]]; then
     IFS=',' read -r -a VARIANTS <<< "$VARIANTS_CSV"
-elif [[ "$PROFILE" == "core" ]]; then
-    VARIANTS=("${CORE_VARIANTS[@]}")
 else
-    VARIANTS=("${EXTENDED_VARIANTS[@]}")
+    VARIANTS=("${FORMAL_VARIANTS[@]}")
 fi
 IFS=',' read -r -a SEEDS <<< "$SEEDS_CSV"
 
@@ -241,8 +215,10 @@ for seed in "${SEEDS[@]}"; do
             continue
         fi
 
+        set +o pipefail
         "${cmd[@]}" 2>&1 | tee "$log_path"
         exit_code=${PIPESTATUS[0]}
+        set -o pipefail
         if [[ "$exit_code" -eq 0 ]]; then
             status="passed"
         else

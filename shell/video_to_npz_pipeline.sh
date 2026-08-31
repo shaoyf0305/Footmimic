@@ -10,17 +10,17 @@
 #   npz/              final .npz for Isaac training / replay
 #
 # One-liner (4 steps: GVHMR -> GMR -> compatible pkl -> npz via pkl_to_npz.py):
-#   bash /data/Footmimic/shell/video_to_npz_pipeline.sh --batch 0522
+#   bash shell/video_to_npz_pipeline.sh --batch 0522
 #
 # T1 retarget, videos already in GVHMR usage folder:
-#   bash /data/Footmimic/shell/video_to_npz_pipeline.sh --batch 0522 \
-#     --robot booster_t1 --video-dir /data/GVHMR/usage/0522
+#   bash shell/video_to_npz_pipeline.sh --batch 0522 \
+#     --robot booster_t1 --video-dir /path/to/videos
 #
 # Re-run from GMR only (GVHMR already done):
-#   bash .../video_to_npz_pipeline.sh --batch 0522 --from gmr
+#   bash shell/video_to_npz_pipeline.sh --batch 0522 --from gmr
 #
 # Copy final npz into motions/ for training:
-#   bash .../video_to_npz_pipeline.sh --batch 0522 --publish motions/my_batch
+#   bash shell/video_to_npz_pipeline.sh --batch 0522 --publish motions/my_batch
 #
 
 set -euo pipefail

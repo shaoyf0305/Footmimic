@@ -7,12 +7,12 @@ version = "0.1.0"
 category = "isaaclab"
 readme  = "README.md"
 
-title = "Extension Template"
-author = "Isaac Lab Project Developers"
-maintainer = "Isaac Lab Project Developers"
-description="Extension Template for Isaac Lab"
-repository = "https://github.com/isaac-sim/IsaacLabExtensionTemplate.git"
-keywords = ["extension", "template", "isaaclab"]
+title = "FootMimic"
+author = "FootMimic Authors"
+maintainer = "FootMimic Authors"
+description = "Reference-guided command-conditioned humanoid football dribbling in Isaac Lab"
+repository = "https://github.com/shaoyf0305/Footmimic.git"
+keywords = ["isaaclab", "humanoid", "reinforcement-learning", "dribbling"]
 
 [dependencies]
 "isaaclab" = {}

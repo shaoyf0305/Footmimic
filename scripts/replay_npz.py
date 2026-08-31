@@ -67,7 +67,6 @@ class ReplayMotionsSceneCfg(InteractiveSceneCfg):
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Extract scene entities
     robot: Articulation = scene["robot"]
-    # breakpoint()
     # Define simulation stepping
     sim_dt = sim.get_physics_dt()
     frame_dt = sim_dt

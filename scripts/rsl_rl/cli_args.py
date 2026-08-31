@@ -40,7 +40,7 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
         help=(
             "One-time migration for a pre-reference-residual Stage-2 checkpoint: preserve the "
             "lower body and reset only the 14 arm output rows. Never use for a checkpoint saved "
-            "after migration. This temporary compatibility flag can be removed with the legacy loader."
+            "after the one-time Stage-I to Stage-II action-interface migration."
         ),
     )
     arg_group.add_argument(

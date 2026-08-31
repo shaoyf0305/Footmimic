@@ -29,15 +29,10 @@ import gymnasium as gym
 import soccer.tasks  # noqa: F401 - registers tasks
 from soccer.tasks.tracking.config.g1.soccer_dribbling_ablation_env_cfg import (
     G1Essay13AblationFullEnvCfg,
-    G1Essay13NoBallVelocityObservationEnvCfg,
-    G1Essay13NoBallVelocityRewardEnvCfg,
-    G1Essay13NoBodyFootReferenceEnvCfg,
-    G1Essay13NoDenseDistanceEnvCfg,
     G1Essay13NoExplicitBallVelocityEnvCfg,
     G1Essay13NoInteractionReferenceEnvCfg,
     G1Essay13NoRecoveryBlendingEnvCfg,
     G1Essay13NoStage1InitializationEnvCfg,
-    G1Essay13NoTouchTimingEnvCfg,
 )
 from soccer.tasks.tracking.config.g1.soccer_dribbling_env_cfg import (
     G1FlatCGDribblingControlEnvCfg,
@@ -48,14 +43,9 @@ from soccer.tasks.tracking.mdp import observations_anchor as obs_anchor
 TASK_IDS = (
     "Tracking-CG-G1-Dribbling-RNN-control-Ablation-Full",
     "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBallVelocity",
-    "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBallVelocityObservation",
-    "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBallVelocityReward",
     "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoRecovery",
     "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoStage1",
-    "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoDenseDistance",
-    "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoTouchTiming",
     "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoInteractionReference",
-    "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBodyFootReference",
 )
 
 CLOSED_LOOP_TERMS = (
@@ -130,27 +120,16 @@ def _assert_full_matches_baseline() -> None:
     )
 
 
-def _assert_velocity_variants() -> None:
+def _assert_velocity_variant() -> None:
     full = G1Essay13AblationFullEnvCfg()
-    no_obs = G1Essay13NoBallVelocityObservationEnvCfg()
-    no_reward = G1Essay13NoBallVelocityRewardEnvCfg()
     no_velocity = G1Essay13NoExplicitBallVelocityEnvCfg()
 
-    for cfg in (no_obs, no_velocity):
-        for group_name in ("policy", "critic"):
-            term = getattr(cfg.observations, group_name).anchor_ball_velocity_polar_cmd
-            _assert(
-                term.func is obs_anchor.zero_anchor_ball_velocity_polar_command,
-                f"{cfg.ablation_variant} did not zero {group_name} velocity input.",
-            )
-    _assert(
-        no_obs.rewards.dribbling_ball_velocity_tracking is not None,
-        "Observation-only variant also removed the velocity reward.",
-    )
-    _assert(
-        no_reward.rewards.dribbling_ball_velocity_tracking is None,
-        "Reward-only variant kept the velocity reward.",
-    )
+    for group_name in ("policy", "critic"):
+        term = getattr(no_velocity.observations, group_name).anchor_ball_velocity_polar_cmd
+        _assert(
+            term.func is obs_anchor.zero_anchor_ball_velocity_polar_command,
+            f"{no_velocity.ablation_variant} did not zero {group_name} velocity input.",
+        )
     _assert(
         no_velocity.rewards.dribbling_ball_velocity_tracking is None,
         "Combined velocity variant kept the velocity reward.",
@@ -160,8 +139,6 @@ def _assert_velocity_variants() -> None:
         "observations.critic.anchor_ball_velocity_polar_cmd.func",
     }
     reward_paths = {"rewards.dribbling_ball_velocity_tracking"}
-    _assert_only_paths(full, no_obs, observation_paths)
-    _assert_only_paths(full, no_reward, reward_paths)
     _assert_only_paths(full, no_velocity, observation_paths | reward_paths)
 
 
@@ -199,36 +176,11 @@ def _assert_recovery_variant() -> None:
 def _assert_reference_variants() -> None:
     full = G1Essay13AblationFullEnvCfg()
     no_stage1 = G1Essay13NoStage1InitializationEnvCfg()
-    no_dense = G1Essay13NoDenseDistanceEnvCfg()
-    no_timing = G1Essay13NoTouchTimingEnvCfg()
     no_interaction = G1Essay13NoInteractionReferenceEnvCfg()
-    no_body_foot = G1Essay13NoBodyFootReferenceEnvCfg()
 
     _assert(
         no_stage1.requires_stage1_initialization is False,
         "No-Stage-I variant did not disable checkpoint initialization.",
-    )
-    _assert(
-        no_dense.rewards.dribbling_cg_foot_ball_distance is None,
-        "No-dense variant kept the dense reference reward.",
-    )
-    _assert(
-        no_dense.rewards.dribbling_useful_foot_touch.params[
-            "off_window_reward_scale"
-        ]
-        == 0.35,
-        "No-dense variant changed touch timing.",
-    )
-    _assert(
-        no_timing.rewards.dribbling_cg_foot_ball_distance is not None,
-        "No-timing variant also removed dense distance.",
-    )
-    _assert(
-        no_timing.rewards.dribbling_useful_foot_touch.params[
-            "off_window_reward_scale"
-        ]
-        == 1.0,
-        "No-timing variant did not neutralize window scaling.",
     )
     _assert(
         no_interaction.rewards.dribbling_cg_foot_ball_distance is None
@@ -238,31 +190,19 @@ def _assert_reference_variants() -> None:
         == 1.0,
         "Joint interaction-reference variant is incomplete.",
     )
-    _assert(
-        no_body_foot.rewards.motion_body_pos is None
-        and no_body_foot.rewards.motion_foot_pos is None,
-        "No-body/foot variant did not remove both regularizers.",
-    )
     dense_path = {"rewards.dribbling_cg_foot_ball_distance"}
     timing_path = {
         "rewards.dribbling_useful_foot_touch.params.off_window_reward_scale"
     }
     _assert_only_paths(full, no_stage1, set())
-    _assert_only_paths(full, no_dense, dense_path)
-    _assert_only_paths(full, no_timing, timing_path)
     _assert_only_paths(full, no_interaction, dense_path | timing_path)
-    _assert_only_paths(
-        full,
-        no_body_foot,
-        {"rewards.motion_body_pos", "rewards.motion_foot_pos"},
-    )
 
 
 def main() -> None:
     for task_id in TASK_IDS:
         gym.spec(task_id)
     _assert_full_matches_baseline()
-    _assert_velocity_variants()
+    _assert_velocity_variant()
     _assert_recovery_variant()
     _assert_reference_variants()
     print("[PASS] Essay13 ablation registrations and single-factor contracts are valid.")

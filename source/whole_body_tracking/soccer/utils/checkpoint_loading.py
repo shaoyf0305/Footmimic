@@ -244,10 +244,10 @@ def _migrate_direct_latent_action_output(
     return migrated
 
 
-# TEMPORARY LEGACY MIGRATION -------------------------------------------------
-# Remove this block, its CLI flags, and the call sites once every retained
-# Stage-2 baseline checkpoint has been converted to bounded_reference_residual_v2.
-# The runtime residual action term does not depend on this compatibility code.
+# STAGE-I TO STAGE-II ACTION MIGRATION --------------------------------------
+# A Stage-I checkpoint has no residual-action marker. Initializing the Stage-II
+# controller therefore keeps the compatible network state and resets only the
+# 14 output rows whose semantics change to bounded reference-relative residuals.
 def _is_legacy_joint_action_output(
     key: str,
     old: torch.Tensor,
@@ -281,7 +281,7 @@ def _migrate_legacy_upper_body_output_to_residual(
     else:
         migrated[upper_action_ids, :] = 0.0
     return migrated
-# END TEMPORARY LEGACY MIGRATION ---------------------------------------------
+# END STAGE-I TO STAGE-II ACTION MIGRATION ----------------------------------
 
 
 def _maybe_expand_normalizer_entry(loaded_dict: dict[str, Any], key: str, current_sd: dict[str, torch.Tensor]) -> bool:

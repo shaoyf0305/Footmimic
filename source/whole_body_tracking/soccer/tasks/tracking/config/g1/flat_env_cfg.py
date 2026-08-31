@@ -2,7 +2,7 @@ from isaaclab.utils import configclass
 
 from soccer.robots.g1 import G1_ACTION_SCALE, G1_CYLINDER_CFG
 from soccer.tasks.tracking.tracking_env_cfg import TrackingEnvCfg
-from soccer.tasks.tracking.mdp import commands_multi_motion as motion_cmds
+from soccer.tasks.tracking.mdp import commands_multi_motion_soccer as motion_cmds
 
 
 @configclass

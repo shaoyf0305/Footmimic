@@ -44,29 +44,14 @@ _ABLATION_TASKS = {
     "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBallVelocity": (
         soccer_dribbling_ablation_env_cfg.G1Essay13NoExplicitBallVelocityEnvCfg
     ),
-    "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBallVelocityObservation": (
-        soccer_dribbling_ablation_env_cfg.G1Essay13NoBallVelocityObservationEnvCfg
-    ),
-    "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBallVelocityReward": (
-        soccer_dribbling_ablation_env_cfg.G1Essay13NoBallVelocityRewardEnvCfg
-    ),
     "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoRecovery": (
         soccer_dribbling_ablation_env_cfg.G1Essay13NoRecoveryBlendingEnvCfg
     ),
     "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoStage1": (
         soccer_dribbling_ablation_env_cfg.G1Essay13NoStage1InitializationEnvCfg
     ),
-    "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoDenseDistance": (
-        soccer_dribbling_ablation_env_cfg.G1Essay13NoDenseDistanceEnvCfg
-    ),
-    "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoTouchTiming": (
-        soccer_dribbling_ablation_env_cfg.G1Essay13NoTouchTimingEnvCfg
-    ),
     "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoInteractionReference": (
         soccer_dribbling_ablation_env_cfg.G1Essay13NoInteractionReferenceEnvCfg
-    ),
-    "Tracking-CG-G1-Dribbling-RNN-control-Ablation-NoBodyFootReference": (
-        soccer_dribbling_ablation_env_cfg.G1Essay13NoBodyFootReferenceEnvCfg
     ),
 }
 
